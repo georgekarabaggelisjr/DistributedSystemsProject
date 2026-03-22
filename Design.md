@@ -22,7 +22,7 @@
 Επιλέον, στο σύνολο του project αξιοποιούμε τα παρακάτω libraries:
 * **kubernetes**
 * **FastAPI + Uvicorn**
-* **Boto3**
+* **MinIO**
 * **python-keycloak**
 * **PyJWT**
 * **asyncpg**
