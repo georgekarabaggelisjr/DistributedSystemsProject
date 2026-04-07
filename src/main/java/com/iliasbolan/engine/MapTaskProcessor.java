@@ -2,6 +2,8 @@ package com.iliasbolan.engine;
 
 import com.iliasbolan.core.KeyValuePair;
 import com.iliasbolan.core.Mapper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -30,7 +32,7 @@ import java.util.concurrent.RecursiveTask;
  * </p>
  *
  * @author Ilias Bolanakis
- * @version 1.2
+ * @version 1.3
  * @see java.util.concurrent.RecursiveTask
  * @see java.util.concurrent.ForkJoinPool
  * @see com.iliasbolan.core.Mapper
@@ -38,7 +40,11 @@ import java.util.concurrent.RecursiveTask;
  */
 public class MapTaskProcessor extends RecursiveTask<List<KeyValuePair>> {
 
-    /** * The dynamically calculated maximum number of records a single thread should process sequentially.
+    // Instantiate the SLF4J Logger specific to this class
+    private static final Logger logger = LoggerFactory.getLogger(MapTaskProcessor.class);
+
+    /**
+     * The dynamically calculated maximum number of records a single thread should process sequentially.
      * If the assigned workload exceeds this limit, the task will be split.
      */
     private final int threshold;
@@ -79,6 +85,9 @@ public class MapTaskProcessor extends RecursiveTask<List<KeyValuePair>> {
         // Dynamically calculate the threshold based on the total records and available K8s CPU limits
         int cores = Runtime.getRuntime().availableProcessors();
         this.threshold = Math.max(100, records.size() / (cores * 15));
+
+        logger.info("Initialized ROOT MapTaskProcessor. Total Records: {}, Detected Cores: {}, Calculated Threshold: {}",
+                records.size(), cores, this.threshold);
     }
 
     /**

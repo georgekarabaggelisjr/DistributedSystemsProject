@@ -2,6 +2,8 @@ package com.iliasbolan.engine;
 
 import com.iliasbolan.core.KeyValuePair;
 import com.iliasbolan.core.Reducer;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -27,13 +29,16 @@ import java.util.concurrent.RecursiveTask;
  * </p>
  *
  * @author Ilias Bolanakis
- * @version 1.1
+ * @version 1.2
  * @see java.util.concurrent.RecursiveTask
  * @see java.util.concurrent.ForkJoinPool
  * @see com.iliasbolan.core.Reducer
  * @since 2026-03-30
  */
 public class ReduceTaskProcessor extends RecursiveTask<List<KeyValuePair>> {
+
+    // Instantiate the SLF4J Logger specific to this class
+    private static final Logger logger = LoggerFactory.getLogger(ReduceTaskProcessor.class);
 
     /** The dynamically calculated maximum number of distinct keys a single thread should process sequentially. */
     private final int threshold;
@@ -74,6 +79,9 @@ public class ReduceTaskProcessor extends RecursiveTask<List<KeyValuePair>> {
         // Dynamically calculate the threshold based on total grouped records and available K8s CPU limits
         int cores = Runtime.getRuntime().availableProcessors();
         this.threshold = Math.max(50, groupedRecords.size() / (cores * 15));
+
+        logger.info("Initialized ROOT ReduceTaskProcessor. Unique Keys: {}, Detected Cores: {}, Calculated Threshold: {}",
+                groupedRecords.size(), cores, this.threshold);
     }
 
     /**

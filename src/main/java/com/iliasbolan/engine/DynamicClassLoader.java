@@ -2,6 +2,8 @@ package com.iliasbolan.engine;
 
 import com.iliasbolan.core.Mapper;
 import com.iliasbolan.core.Reducer;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.File;
 import java.io.IOException;
@@ -20,10 +22,13 @@ import java.net.URLClassLoader;
  * </p>
  *
  * @author Ilias Bolanakis
- * @version 1.0
+ * @version 1.1
  * @since 2026-03-30
  */
 public class DynamicClassLoader {
+
+    // Instantiate the SLF4J Logger specific to this class
+    private static final Logger logger = LoggerFactory.getLogger(DynamicClassLoader.class);
 
     /**
      * Dynamically loads a Java class from a specified file path and attempts to instantiate it
@@ -35,15 +40,21 @@ public class DynamicClassLoader {
      * @throws Exception If the file cannot be found, the class cannot be loaded, or it does not implement {@link Mapper}.
      */
     public static Mapper loadMapper(String directoryPath, String className) throws Exception {
+        logger.info("Attempting to load Mapper class '{}' from directory: {}", className, directoryPath);
+
         Class<?> loadedClass = loadClassFromFile(directoryPath, className);
 
         // Ensure the user's class actually implements our Mapper interface
         if (!Mapper.class.isAssignableFrom(loadedClass)) {
+            logger.error("Validation failed: Class '{}' does not implement the core Mapper interface.", className);
             throw new IllegalArgumentException("The provided class does not implement the Mapper interface.");
         }
 
         // Instantiate and cast
-        return (Mapper) loadedClass.getDeclaredConstructor().newInstance();
+        Mapper mapperInstance = (Mapper) loadedClass.getDeclaredConstructor().newInstance();
+        logger.info("Successfully instantiated Mapper: {}", className);
+
+        return mapperInstance;
     }
 
     /**
@@ -56,15 +67,21 @@ public class DynamicClassLoader {
      * @throws Exception If the file cannot be found, the class cannot be loaded, or it does not implement {@link Reducer}.
      */
     public static Reducer loadReducer(String directoryPath, String className) throws Exception {
+        logger.info("Attempting to load Reducer class '{}' from directory: {}", className, directoryPath);
+
         Class<?> loadedClass = loadClassFromFile(directoryPath, className);
 
         // Ensure the user's class actually implements our Reducer interface
         if (!Reducer.class.isAssignableFrom(loadedClass)) {
+            logger.error("Validation failed: Class '{}' does not implement the core Reducer interface.", className);
             throw new IllegalArgumentException("The provided class does not implement the Reducer interface.");
         }
 
         // Instantiate and cast
-        return (Reducer) loadedClass.getDeclaredConstructor().newInstance();
+        Reducer reducerInstance = (Reducer) loadedClass.getDeclaredConstructor().newInstance();
+        logger.info("Successfully instantiated Reducer: {}", className);
+
+        return reducerInstance;
     }
 
     /**
@@ -82,6 +99,10 @@ public class DynamicClassLoader {
 
         File file = new File(directoryPath);
 
+        if (!file.exists() || !file.isDirectory()) {
+            logger.warn("The directory '{}' does not exist or is not a valid directory. Class loading may fail.", directoryPath);
+        }
+
         // Convert the file path to a URL format required by URLClassLoader
         URL url = file.toURI().toURL();
         URL[] urls = new URL[]{url};
@@ -90,6 +111,9 @@ public class DynamicClassLoader {
         try (URLClassLoader classLoader = new URLClassLoader(urls, DynamicClassLoader.class.getClassLoader())) {
             // Load the class into the JVM
             return classLoader.loadClass(className);
+        } catch (ClassNotFoundException e) {
+            logger.error("Failed to find class '{}' inside directory '{}'", className, directoryPath, e);
+            throw e;
         }
     }
 }

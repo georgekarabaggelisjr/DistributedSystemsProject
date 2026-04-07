@@ -8,6 +8,9 @@ import com.rabbitmq.client.DefaultConsumer;
 import com.rabbitmq.client.Envelope;
 import com.rabbitmq.client.AMQP;
 import org.jetbrains.annotations.NotNull;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.slf4j.MDC;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -16,24 +19,27 @@ import java.util.concurrent.atomic.AtomicLong;
 /**
  * Manages the connection to the Message Broker (RabbitMQ) and consumes task assignments.
  * <p>
- * This class serves as the primary lifecycle controller for the Worker node. It connects 
- * to the specified RabbitMQ queue and consumes messages asynchronously (e.g., 64MB chunk assignments). 
- * To guarantee At-Least-Once delivery and fault tolerance, it uses manual Acknowledgments (ACKs)[cite: 262]. 
- * If the worker successfully processes the task and writes to MinIO, it sends an ACK. 
- * If the worker crashes, the unacknowledged message is automatically re-queued[cite: 262].
+ * This class serves as the primary lifecycle controller for the Worker node. It connects
+ * to the specified RabbitMQ queue and consumes messages asynchronously (e.g., 64MB chunk assignments).
+ * To guarantee At-Least-Once delivery and fault tolerance, it uses manual Acknowledgments (ACKs).
+ * If the worker successfully processes the task and writes to MinIO, it sends an ACK.
+ * If the worker crashes, the unacknowledged message is automatically re-queued.
  * </p>
  * <p>
- * <b>Graceful Termination:</b> Because Workers run as Kubernetes Jobs, they must not run forever[cite: 112, 457]. 
- * This consumer implements an idle timeout. If no messages are received for a sustained period, 
- * it assumes the job phase is complete and intentionally exits the JVM with status 0, 
- * signaling completion to Kubernetes[cite: 457, 473].
+ * <b>Graceful Termination:</b> Because Workers run as Kubernetes Jobs, they must not run forever.
+ * This consumer implements an idle timeout. If no messages are received for a sustained period,
+ * it assumes the job phase is complete and intentionally exits the JVM with status 0,
+ * signaling completion to Kubernetes.
  * </p>
  *
  * @author Ilias Bolankis
- * @version 1.1
+ * @version 1.2
  * @since 2026-03-30
  */
 public class RabbitMqConsumer {
+
+    // Instantiate the SLF4J Logger specific to this class
+    private static final Logger logger = LoggerFactory.getLogger(RabbitMqConsumer.class);
 
     private final String host;
     private final String queueName;
@@ -50,13 +56,16 @@ public class RabbitMqConsumer {
         this.host = host;
         this.queueName = queueName;
         this.idleTimeoutMillis = idleTimeoutMillis;
+
+        logger.info("Initialized RabbitMqConsumer. Host: {}, Target Queue: {}, Idle Timeout: {}ms",
+                host, queueName, idleTimeoutMillis);
     }
 
     /**
      * Starts the event-driven consumption to consume messages from the queue.
      * <p>
-     * This method sets up an asynchronous consumer using {@link Channel#basicConsume(String, boolean, Consumer)}. 
-     * It registers a callback that handles incoming messages, processes them, and sends manual ACKs. 
+     * This method sets up an asynchronous consumer using {@link Channel#basicConsume(String, boolean, Consumer)}.
+     * It registers a callback that handles incoming messages, processes them, and sends manual ACKs.
      * If no messages are received for the idle timeout period, the worker terminates gracefully.
      * </p>
      *
@@ -74,13 +83,12 @@ public class RabbitMqConsumer {
              Channel channel = connection.createChannel()) {
 
             // Ensure the queue exists before trying to consume from it.
-            // (queueName, durable, exclusive, autoDelete, arguments)
             channel.queueDeclare(queueName, true, false, false, null);
 
             // Prefetch count: tells RabbitMQ not to give more than 1 message at a time to this worker
             channel.basicQos(1);
 
-            System.out.println(" [*] Waiting for messages. To exit press CTRL+C");
+            logger.info("Successfully connected to RabbitMQ. Waiting for messages on queue: '{}'.", queueName);
 
             // Thread-safe wrapper for tracking the last time we got a message
             AtomicLong lastActivity = new AtomicLong(System.currentTimeMillis());
@@ -94,27 +102,31 @@ public class RabbitMqConsumer {
                     String messageBody = new String(body, StandardCharsets.UTF_8);
                     long deliveryTag = envelope.getDeliveryTag();
 
-                    System.out.println(" [x] Received Task: '" + messageBody + "'");
+                    // Inject the deliveryTag into MDC so all subsequent logs in this thread include it
+                    try (MDC.MDCCloseable mdc = MDC.putCloseable("deliveryTag", String.valueOf(deliveryTag))) {
 
-                    try {
-                        // ==========================================================
-                        // TODO: THIS IS WHERE YOU CALL YOUR ENGINE!
-                        // 1. Parse the JSON message to get the S3 bucket/object info
-                        // 2. Download the user code using S3ClientService
-                        // 3. Run MapTaskProcessor or ReduceTaskProcessor
-                        // 4. Run ShufflePartitioner (if Map task)
-                        // ==========================================================
+                        logger.info("Received Task Payload: {}", messageBody);
 
-                        simulateWork(messageBody);
+                        try {
+                            // ==========================================================
+                            // TODO: THIS IS WHERE YOU CALL YOUR ENGINE!
+                            // 1. Parse the JSON message to get the S3 bucket/object info
+                            // 2. Download the user code using S3ClientService
+                            // 3. Run MapTaskProcessor or ReduceTaskProcessor
+                            // 4. Run ShufflePartitioner (if Map task)
+                            // ==========================================================
 
-                        // If the work finishes without throwing an exception, send the ACK
-                        channel.basicAck(deliveryTag, false);
-                        System.out.println(" [v] Task Acknowledged.");
+                            simulateWork(messageBody);
 
-                    } catch (Exception e) {
-                        System.err.println(" [!] Error processing task: " + e.getMessage());
-                        // NACK the message so RabbitMQ re-queues it for another worker
-                        channel.basicNack(deliveryTag, false, true);
+                            // If the work finishes without throwing an exception, send the ACK
+                            channel.basicAck(deliveryTag, false);
+                            logger.info("Task successfully processed and acknowledged.");
+
+                        } catch (Exception e) {
+                            logger.error("Critical error processing task. Sending NACK to requeue message.", e);
+                            // NACK the message so RabbitMQ re-queues it for another worker
+                            channel.basicNack(deliveryTag, false, true);
+                        }
                     }
                 }
             };
@@ -129,6 +141,7 @@ public class RabbitMqConsumer {
             try {
                 Thread.currentThread().join();
             } catch (InterruptedException e) {
+                logger.warn("Main consumer thread interrupted.", e);
                 Thread.currentThread().interrupt();
             }
         }
@@ -153,7 +166,7 @@ public class RabbitMqConsumer {
 
                     if (remainingToWait <= 0) {
                         // The timeout has been reached or exceeded
-                        System.out.println(" [-] No messages for " + (idleTimeoutMillis / 1000) + " seconds. Gracefully terminating.");
+                        logger.info("No messages received for {} seconds. Gracefully terminating worker phase.", (idleTimeoutMillis / 1000));
                         System.exit(0);
                     } else {
                         // Sleep for the exact remaining time instead of polling every second
@@ -161,6 +174,7 @@ public class RabbitMqConsumer {
                     }
                 }
             } catch (InterruptedException e) {
+                logger.warn("Idle checker thread interrupted.", e);
                 Thread.currentThread().interrupt();
             }
         });
@@ -174,6 +188,7 @@ public class RabbitMqConsumer {
      */
     private void simulateWork(String task) throws InterruptedException {
         // Simulating the Fork/Join framework doing heavy lifting
+        logger.debug("Simulating computational work...");
         Thread.sleep(3000);
     }
 }

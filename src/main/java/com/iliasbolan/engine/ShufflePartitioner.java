@@ -2,6 +2,8 @@ package com.iliasbolan.engine;
 
 import com.iliasbolan.core.KeyValuePair;
 import com.iliasbolan.storage.S3ClientService;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -23,13 +25,16 @@ import java.util.Map;
  * strictly deterministic S3 object paths to ensure idempotence.
  * </p>
  *
- * @author Ilias (Compute Engine Lead)
- * @version 1.0
+ * @author Ilias Bolanakis
+ * @version 1.1
  * @see com.iliasbolan.engine.MapTaskProcessor
  * @see com.iliasbolan.storage.S3ClientService
  * @since 2026-03-30
  */
 public class ShufflePartitioner {
+
+    // Instantiate the SLF4J Logger specific to this class
+    private static final Logger logger = LoggerFactory.getLogger(ShufflePartitioner.class);
 
     private final S3ClientService s3ClientService;
     private final String bucketName;
@@ -52,6 +57,9 @@ public class ShufflePartitioner {
         this.jobId = jobId;
         this.mapTaskId = mapTaskId;
         this.numReducers = numReducers;
+
+        logger.info("Initialized ShufflePartitioner. JobId: {}, MapTaskId: {}, Target Reducers: {}",
+                jobId, mapTaskId, numReducers);
     }
 
     /**
@@ -67,6 +75,7 @@ public class ShufflePartitioner {
      * @throws Exception If an error occurs during the MinIO upload process.
      */
     public void partitionAndUpload(List<KeyValuePair> intermediateData) throws Exception {
+        logger.info("Starting partition and upload phase. Total intermediate pairs to route: {}", intermediateData.size());
 
         // Step 1: Initialize in-memory buckets for each partition
         Map<Integer, List<KeyValuePair>> partitions = new HashMap<>();
@@ -75,11 +84,14 @@ public class ShufflePartitioner {
         }
 
         // Step 2: Route each KeyValuePair to the correct partition based on its key's hash
+        // PERFORMANCE CRITICAL: Absolutely no logging inside this loop!
         for (KeyValuePair pair : intermediateData) {
             // Use Math.abs to ensure the hash is positive before the modulo operation
             int partitionIndex = Math.abs(pair.key.hashCode()) % numReducers;
             partitions.get(partitionIndex).add(pair);
         }
+
+        int uploadedPartitionsCount = 0;
 
         // Step 3: Serialize and upload each partition to MinIO
         for (Map.Entry<Integer, List<KeyValuePair>> entry : partitions.entrySet()) {
@@ -88,6 +100,7 @@ public class ShufflePartitioner {
 
             // Skip empty partitions to save MinIO I/O and storage
             if (partitionData.isEmpty()) {
+                logger.debug("Skipping partition {} as it contains no data.", partitionIndex);
                 continue;
             }
 
@@ -100,8 +113,20 @@ public class ShufflePartitioner {
             // Generate the deterministic S3 object name (e.g., job_1/intermediate/map_1_part_0.txt)
             String objectName = String.format("%s/intermediate/%s_part_%d.txt", jobId, mapTaskId, partitionIndex);
 
-            // Upload to MinIO
-            s3ClientService.writeData(bucketName, objectName, serializedData.toString());
+            logger.debug("Uploading partition {} ({} pairs) to S3 object: {}",
+                    partitionIndex, partitionData.size(), objectName);
+
+            try {
+                // Upload to MinIO
+                s3ClientService.writeData(bucketName, objectName, serializedData.toString());
+                uploadedPartitionsCount++;
+            } catch (Exception e) {
+                logger.error("Failed to upload partition {} to MinIO path: {}", partitionIndex, objectName, e);
+                throw e; // Rethrow to ensure the task fails and is retried by the Manager
+            }
         }
+
+        logger.info("Successfully completed Shuffle phase. Uploaded {} active partitions to MinIO for MapTask: {}",
+                uploadedPartitionsCount, mapTaskId);
     }
 }
