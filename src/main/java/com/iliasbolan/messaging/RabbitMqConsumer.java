@@ -1,5 +1,6 @@
 package com.iliasbolan.messaging;
 
+import com.iliasbolan.engine.TaskExecutor;
 import com.rabbitmq.client.Channel;
 import com.rabbitmq.client.Connection;
 import com.rabbitmq.client.ConnectionFactory;
@@ -32,8 +33,8 @@ import java.util.concurrent.atomic.AtomicLong;
  * signaling completion to Kubernetes.
  * </p>
  *
- * @author Ilias Bolankis
- * @version 1.2
+ * @author Ilias Bolanakis
+ * @version 1.3
  * @since 2026-03-30
  */
 public class RabbitMqConsumer {
@@ -44,6 +45,7 @@ public class RabbitMqConsumer {
     private final String host;
     private final String queueName;
     private final int idleTimeoutMillis;
+    private final TaskExecutor taskExecutor;
 
     /**
      * Initializes the RabbitMQ Consumer configuration.
@@ -51,11 +53,13 @@ public class RabbitMqConsumer {
      * @param host              The hostname of the RabbitMQ server (e.g., "rabbitmq" or "localhost").
      * @param queueName         The name of the queue to consume from (e.g., "map_tasks_queue").
      * @param idleTimeoutMillis The maximum time (in milliseconds) to wait for a new message before shutting down.
+     * @param taskExecutor      The central orchestration engine for executing Map-Reduce tasks.
      */
-    public RabbitMqConsumer(String host, String queueName, int idleTimeoutMillis) {
+    public RabbitMqConsumer(String host, String queueName, int idleTimeoutMillis, TaskExecutor taskExecutor) {
         this.host = host;
         this.queueName = queueName;
         this.idleTimeoutMillis = idleTimeoutMillis;
+        this.taskExecutor = taskExecutor;
 
         logger.info("Initialized RabbitMqConsumer. Host: {}, Target Queue: {}, Idle Timeout: {}ms",
                 host, queueName, idleTimeoutMillis);
@@ -108,15 +112,8 @@ public class RabbitMqConsumer {
                         logger.info("Received Task Payload: {}", messageBody);
 
                         try {
-                            // ==========================================================
-                            // TODO: THIS IS WHERE YOU CALL YOUR ENGINE!
-                            // 1. Parse the JSON message to get the S3 bucket/object info
-                            // 2. Download the user code using S3ClientService
-                            // 3. Run MapTaskProcessor or ReduceTaskProcessor
-                            // 4. Run ShufflePartitioner (if Map task)
-                            // ==========================================================
-
-                            simulateWork(messageBody);
+                            // Execute the actual engine logic
+                            taskExecutor.executeTask(messageBody);
 
                             // If the work finishes without throwing an exception, send the ACK
                             channel.basicAck(deliveryTag, false);
@@ -181,14 +178,5 @@ public class RabbitMqConsumer {
 
         idleChecker.setDaemon(true);
         return idleChecker;
-    }
-
-    /**
-     * A temporary helper method to simulate processing delay.
-     */
-    private void simulateWork(String task) throws InterruptedException {
-        // Simulating the Fork/Join framework doing heavy lifting
-        logger.debug("Simulating computational work...");
-        Thread.sleep(3000);
     }
 }

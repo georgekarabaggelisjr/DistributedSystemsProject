@@ -1,6 +1,8 @@
 package com.iliasbolan;
 
+import com.iliasbolan.engine.TaskExecutor;
 import com.iliasbolan.messaging.RabbitMqConsumer;
+import com.iliasbolan.storage.S3ClientService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -14,12 +16,11 @@ import org.slf4j.LoggerFactory;
  * </p>
  *
  * @author Ilias Bolanakis
- * @version 1.1
+ * @version 1.2
  * @since 2026-03-30
  */
 public class App {
 
-    // Instantiate the SLF4J Logger for this specific class
     private static final Logger logger = LoggerFactory.getLogger(App.class);
 
     public static void main(String[] args) {
@@ -33,22 +34,24 @@ public class App {
         // 2. Load MinIO (S3) Configuration
         String minioEndpoint = System.getenv().getOrDefault("MINIO_ENDPOINT", "http://localhost:9000");
         String minioUser = System.getenv().getOrDefault("MINIO_ROOT_USER", "minioadmin");
-        // String minioPass = System.getenv().getOrDefault("MINIO_ROOT_PASSWORD", "minioadmin");
+        String minioPass = System.getenv().getOrDefault("MINIO_ROOT_PASSWORD", "minioadmin");
 
         try {
-            // Logback will automatically format these variables into the JSON output!
             logger.info("Loaded configuration. RabbitMQ Host: {}, Target Queue: {}, MinIO Host: {}",
                     rabbitHost, queueName, minioEndpoint);
 
-            // 3. Initialize the Consumer
-            RabbitMqConsumer consumer = new RabbitMqConsumer(rabbitHost, queueName, idleTimeout);
+            // 3. Initialize the Core Services
+            S3ClientService s3ClientService = new S3ClientService(minioEndpoint, minioUser, minioPass);
+            TaskExecutor taskExecutor = new TaskExecutor(s3ClientService);
 
-            // 4. Start the event-driven listening loop
+            // 4. Initialize the Consumer with the TaskExecutor
+            RabbitMqConsumer consumer = new RabbitMqConsumer(rabbitHost, queueName, idleTimeout, taskExecutor);
+
+            // 5. Start the event-driven listening loop
             logger.info("Starting RabbitMQ consumer loop...");
             consumer.startConsuming();
 
         } catch (Exception e) {
-            // Use logger.error and pass the exception to get a full, JSON-formatted stack trace
             logger.error("Worker failed to start due to a critical error.", e);
             System.exit(1);
         }
