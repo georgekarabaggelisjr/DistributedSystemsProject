@@ -1,0 +1,29 @@
+services:
+  minio:
+    image: minio/minio:latest
+    container_name: local-minio
+    ports:
+      - "9000:9000" # S3 API Port
+      - "9001:9001" # Web Console Port
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: local-rabbitmq
+    ports:
+      - "5672:5672"   # AMQP protocol port (Java Worker connects here)
+      - "15672:15672" # Web Management UI port
+    environment:
+      - RABBITMQ_DEFAULT_USER=guest
+      - RABBITMQ_DEFAULT_PASS=guest
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+
+volumes:
+  minio_data:
+  rabbitmq_data:
