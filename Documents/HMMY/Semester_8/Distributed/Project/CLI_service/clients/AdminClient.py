@@ -1,5 +1,8 @@
 from core.LocalStateManager import LocalStateManager
 
+import requests
+import typer
+from core.LocalStateManager import LocalStateManager
 
 class AdminClient:
     """
@@ -10,7 +13,15 @@ class AdminClient:
     """
 
     def __init__(self, state_manager: LocalStateManager):
-        pass
+        self.state_manager = state_manager
+        self.base_url = self.state_manager.get_ui_service_url()
+
+    def _get_auth_header(self):
+        token = self.state_manager.get_token()
+        if not token:
+            typer.secho("❌ Error: Admin session expired. Please login.", fg=typer.colors.RED)
+            raise typer.Exit(code=1)
+        return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
     def create_user(self, user_details: dict) -> str:
         """
@@ -26,7 +37,27 @@ class AdminClient:
         Returns:
             str: The newly created Keycloak User ID.
         """
-        pass
+        url = f"{self.base_url}/admin/users"
+        headers = self._get_auth_header()
+
+        try:
+            # Αποστολή των στοιχείων του χρήστη ως JSON
+            response = requests.post(url, headers=headers, json=user_details)
+
+            # Αν ο χρήστης δεν είναι admin, το UI Service θα γυρίσει 403 Forbidden
+            if response.status_code == 403:
+                typer.secho("🚫 Access Denied: Admin privileges required.", fg=typer.colors.RED)
+                raise typer.Exit(code=1)
+
+            response.raise_for_status()
+
+            # Επιστροφή του Keycloak User ID
+            data = response.json()
+            return data.get("id", "User created successfully")
+
+        except requests.exceptions.RequestException as e:
+            typer.secho(f"❌ Failed to create user: {e}", fg=typer.colors.RED)
+            raise typer.Exit(code=1)
 
     def configure_workers(self, worker_count: int) -> bool:
         """
@@ -42,4 +73,22 @@ class AdminClient:
         Returns:
             bool: True if the configuration was successfully applied and broadcasted.
         """
-        pass
+        url = f"{self.base_url}/admin/config"
+        headers = self._get_auth_header()
+
+        # Το payload που περιμένει το FastAPI (βλ. ConfigUpdateRequest στα schemas)
+        payload = {"max_workers": worker_count}
+
+        try:
+            response = requests.post(url, headers=headers, json=payload)
+
+            if response.status_code == 403:
+                typer.secho("🚫 Access Denied: Cannot modify system configuration.", fg=typer.colors.RED)
+                return False
+
+            response.raise_for_status()
+            return True
+
+        except requests.exceptions.RequestException as e:
+            typer.secho(f"❌ Configuration broadcast failed: {e}", fg=typer.colors.RED)
+            return False

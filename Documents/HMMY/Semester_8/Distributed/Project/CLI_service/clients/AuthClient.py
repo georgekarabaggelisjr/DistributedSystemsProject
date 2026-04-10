@@ -29,4 +29,9 @@ class AuthClient:
         Returns:
             bool: True if authentication is successful, False otherwise.
         """
-        pass
+
+        # Mock
+        if username == "iason" and password == "1":
+            return True
+        else:
+            False

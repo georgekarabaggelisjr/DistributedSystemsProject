@@ -1,22 +1,11 @@
 import typer
+from clients.JobClient import JobClient
+from clients.AdminClient import AdminClient
+from core.LocalStateManager import LocalStateManager
+state_manager = LocalStateManager()
 
-# Initialize sub-apps
-app = typer.Typer(help="Map-Reduce Kubernetes CLI")
 jobs_app = typer.Typer(help="Manage Map-Reduce Jobs")
 admin_app = typer.Typer(help="System Administration")
-
-app.add_typer(jobs_app, name="jobs")
-app.add_typer(admin_app, name="admin")
-
-@app.command("login")
-def login_command(
-    username: str = typer.Argument(..., help="Your Keycloak username"),
-    password: str = typer.Option(..., prompt=True, hide_input=True, help="Your password")
-):
-    """
-    Authenticates the user with the Keycloak Auth Service and stores the JWT locally.
-    """
-    pass
 
 @jobs_app.command("submit")
 def submit_command(
@@ -26,7 +15,14 @@ def submit_command(
     """
     Uploads files to MinIO and schedules a new Map-Reduce job.
     """
-    pass
+    client = JobClient(state_manager)
+    typer.echo(f"📤 Submitting files: {data} and {code}...")
+
+    try:
+        job_id = client.submit_job(data, code)
+        typer.secho(f"✅ Success! Job ID: {job_id}", fg=typer.colors.GREEN, bold=True)
+    except Exception as e:
+        typer.secho(f"❌ Error: {e}", fg=typer.colors.RED)
 
 @jobs_app.command("status")
 def status_command(
@@ -35,7 +31,17 @@ def status_command(
     """
     Retrieves the execution status of a specific job or all owned jobs.
     """
-    pass
+    client = JobClient(state_manager)
+    result = client.get_job_status(job_id)
+
+    if isinstance(result, list):
+        typer.secho("\n📋 Jobs list:", bold=True)
+        for job in result:
+            typer.echo(f"ID: {job['id']} | Status: {job['status']}")
+    else:
+        typer.secho(f"\n🔍 Job Status {job_id}:", bold=True)
+        typer.echo(f"Status: {result.get('status')}")
+        typer.echo(f"Created: {result.get('created_at')}")
 
 @jobs_app.command("result")
 def result_command(
@@ -45,23 +51,28 @@ def result_command(
     """
     Downloads the final Output File from MinIO (Requires job status to be COMPLETED).
     """
-    pass
+    client = JobClient(state_manager)
+    typer.echo(f"⬇️ Λήψη αποτελεσμάτων για το job {job_id}...")
+    client.download_result(job_id, output)
+
+# --- ADMIN COMMANDS ---
 
 @admin_app.command("users-create")
 def admin_create_user_command(
-    username: str = typer.Argument(...),
-    password: str = typer.Option(..., prompt=True, hide_input=True)
+        username: str = typer.Argument(..., help="The username for the new user"),
+        email: str = typer.Argument(..., help="The email for the new user"),
+        password: str = typer.Option(..., prompt=True, hide_input=True)
 ):
-    """
-    [ADMIN ONLY] Provisions a new user in the Keycloak Auth Service.
-    """
-    pass
+    client = AdminClient(state_manager)
+    details = {"username": username, "email": email, "password": password}
+
+    user_id = client.create_user(details)
+    typer.secho(f"✅ User created! Keycloak ID: {user_id}", fg=typer.colors.GREEN)
+
 
 @admin_app.command("config-workers")
-def admin_config_workers_command(
-    count: int = typer.Option(..., "--count", help="Maximum number of parallel workers")
-):
-    """
-    [ADMIN ONLY] Updates the DDS configuration and broadcasts changes to Manager instances.
-    """
-    pass
+def admin_config_workers_command(count: int):
+    client = AdminClient(state_manager)
+    if client.configure_workers(count):
+        typer.secho(f"⚙️ System updated to {count} workers.", fg=typer.colors.GREEN)
+        typer.secho("✅ Setting configured (Mock)", fg=typer.colors.GREEN)
