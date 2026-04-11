@@ -3,7 +3,6 @@ package com.iliasbolan.messaging;
 import com.iliasbolan.engine.TaskExecutor;
 import com.rabbitmq.client.Channel;
 import com.rabbitmq.client.Connection;
-import com.rabbitmq.client.ConnectionFactory;
 import com.rabbitmq.client.Consumer;
 import com.rabbitmq.client.DefaultConsumer;
 import com.rabbitmq.client.Envelope;
@@ -21,7 +20,8 @@ import java.util.concurrent.atomic.AtomicLong;
  * Manages the connection to the Message Broker (RabbitMQ) and consumes task assignments.
  * <p>
  * This class serves as the primary lifecycle controller for the Worker node. It connects
- * to the specified RabbitMQ queue and consumes messages asynchronously (e.g., 64MB chunk assignments).
+ * to the specified RabbitMQ queue using the provided {@link RabbitMqConnectionManager}
+ * and consumes messages asynchronously (e.g., 64MB chunk assignments).
  * To guarantee At-Least-Once delivery and fault tolerance, it uses manual Acknowledgments (ACKs).
  * If the worker successfully processes the task and writes to MinIO, it sends an ACK.
  * If the worker crashes, the unacknowledged message is automatically re-queued.
@@ -34,16 +34,14 @@ import java.util.concurrent.atomic.AtomicLong;
  * </p>
  *
  * @author Ilias Bolanakis
- * @version 1.5
+ * @version 1.6
  * @since 2026-03-30
  */
 public class RabbitMqConsumer {
 
     private static final Logger logger = LoggerFactory.getLogger(RabbitMqConsumer.class);
 
-    private final String host;
-    private final String username;
-    private final String password;
+    private final RabbitMqConnectionManager connectionManager;
     private final String queueName;
     private final int idleTimeoutMillis;
     private final TaskExecutor taskExecutor;
@@ -51,26 +49,21 @@ public class RabbitMqConsumer {
     private Thread mainThread;
 
     /**
-     * Initializes the RabbitMQ Consumer configuration with secure credentials.
+     * Initializes the RabbitMQ Consumer configuration.
      *
-     * @param host              The hostname of the RabbitMQ server.
-     * @param username          The RabbitMQ authentication username.
-     * @param password          The RabbitMQ authentication password.
+     * @param connectionManager The manager responsible for providing secure RabbitMQ connections.
      * @param queueName         The name of the queue to consume from.
      * @param idleTimeoutMillis The maximum time (in milliseconds) to wait for a new message before shutting down.
      * @param taskExecutor      The central orchestration engine for executing Map-Reduce tasks.
      */
-    public RabbitMqConsumer(String host, String username, String password, String queueName, int idleTimeoutMillis, TaskExecutor taskExecutor) {
-        this.host = host;
-        this.username = username;
-        this.password = password;
+    public RabbitMqConsumer(RabbitMqConnectionManager connectionManager, String queueName, int idleTimeoutMillis, TaskExecutor taskExecutor) {
+        this.connectionManager = connectionManager;
         this.queueName = queueName;
         this.idleTimeoutMillis = idleTimeoutMillis;
         this.taskExecutor = taskExecutor;
 
-        // We purposefully DO NOT log the password here for security reasons!
-        logger.info("Initialized RabbitMqConsumer. Host: {}, User: {}, Target Queue: {}, Idle Timeout: {}ms",
-                host, username, queueName, idleTimeoutMillis);
+        logger.info("Initialized RabbitMqConsumer. Target Queue: {}, Idle Timeout: {}ms",
+                queueName, idleTimeoutMillis);
     }
 
     public void stopConsuming() {
@@ -83,14 +76,8 @@ public class RabbitMqConsumer {
     public void startConsuming() throws Exception {
         this.mainThread = Thread.currentThread();
 
-        ConnectionFactory factory = new ConnectionFactory();
-        factory.setHost(host);
-
-        // Dynamically apply the credentials injected by the Environment Variables
-        factory.setUsername(username);
-        factory.setPassword(password);
-
-        try (Connection connection = factory.newConnection();
+        // We now ask the manager for the connection, keeping this class totally unaware of passwords!
+        try (Connection connection = connectionManager.createConnection();
              Channel channel = connection.createChannel()) {
 
             channel.queueDeclare(queueName, true, false, false, null);

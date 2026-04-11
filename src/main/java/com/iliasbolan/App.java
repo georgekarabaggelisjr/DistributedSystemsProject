@@ -1,7 +1,9 @@
 package com.iliasbolan;
 
 import com.iliasbolan.engine.TaskExecutor;
+import com.iliasbolan.messaging.RabbitMqConnectionManager;
 import com.iliasbolan.messaging.RabbitMqConsumer;
+import com.iliasbolan.storage.MinioConnectionManager;
 import com.iliasbolan.storage.S3ClientService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -21,7 +23,7 @@ import org.slf4j.LoggerFactory;
  * </p>
  *
  * @author Ilias Bolanakis
- * @version 1.4
+ * @version 1.5
  * @since 2026-03-30
  */
 public class App {
@@ -31,14 +33,13 @@ public class App {
     public static void main(String[] args) {
         logger.info("====== [ Map-Reduce Worker Initializing ] ======");
 
-        // 1. Load RabbitMQ Configuration
+        // 1. Load Configurations
         String rabbitHost = System.getenv().getOrDefault("RABBITMQ_HOST", "localhost");
         String rabbitUser = System.getenv().getOrDefault("RABBITMQ_USER", "guest");
         String rabbitPass = System.getenv().getOrDefault("RABBITMQ_PASS", "guest");
         String queueName = System.getenv().getOrDefault("RABBITMQ_QUEUE", "map_tasks_queue");
         int idleTimeout = Integer.parseInt(System.getenv().getOrDefault("IDLE_TIMEOUT_MILLIS", "60000"));
 
-        // 2. Load MinIO (S3) Configuration
         String minioEndpoint = System.getenv().getOrDefault("MINIO_ENDPOINT", "http://localhost:9000");
         String minioUser = System.getenv().getOrDefault("MINIO_ROOT_USER", "minioadmin");
         String minioPass = System.getenv().getOrDefault("MINIO_ROOT_PASSWORD", "minioadmin");
@@ -47,12 +48,14 @@ public class App {
             logger.info("Loaded configuration. RabbitMQ Host: {}, Target Queue: {}, MinIO Host: {}",
                     rabbitHost, queueName, minioEndpoint);
 
-            // 3. Initialize the Core Services
-            S3ClientService s3ClientService = new S3ClientService(minioEndpoint, minioUser, minioPass);
-            TaskExecutor taskExecutor = new TaskExecutor(s3ClientService);
+            // 2. Initialize the Infrastructure Connection Managers
+            RabbitMqConnectionManager rabbitManager = new RabbitMqConnectionManager(rabbitHost, rabbitUser, rabbitPass);
+            MinioConnectionManager minioManager = new MinioConnectionManager(minioEndpoint, minioUser, minioPass);
 
-            // 4. Initialize the Consumer with the TaskExecutor and Dynamic Credentials
-            RabbitMqConsumer consumer = new RabbitMqConsumer(rabbitHost, rabbitUser, rabbitPass, queueName, idleTimeout, taskExecutor);
+            // 3. Initialize the Core Services (Dependency Injection)
+            S3ClientService s3ClientService = new S3ClientService(minioManager);
+            TaskExecutor taskExecutor = new TaskExecutor(s3ClientService);
+            RabbitMqConsumer consumer = new RabbitMqConsumer(rabbitManager, queueName, idleTimeout, taskExecutor);
 
             // --- GRACEFUL SHUTDOWN HOOK ---
             Runtime.getRuntime().addShutdownHook(new Thread(() -> {
@@ -68,7 +71,7 @@ public class App {
                 logger.info("Worker node shut down successfully. Goodbye!");
             }));
 
-            // 5. Start the event-driven listening loop
+            // 4. Start the event-driven listening loop
             logger.info("Starting RabbitMQ consumer loop...");
             consumer.startConsuming();
 

@@ -25,30 +25,23 @@ import java.nio.file.StandardCopyOption;
  * </p>
  *
  * @author Ilias Bolanakis
- * @version 1.1
+ * @version 1.2
  * @since 2026-03-30
  */
 public class S3ClientService {
 
-    // Instantiate the SLF4J Logger specific to this class
     private static final Logger logger = LoggerFactory.getLogger(S3ClientService.class);
 
     private final MinioClient minioClient;
 
     /**
-     * Initializes the S3 Client connection to the MinIO server.
+     * Initializes the service with a pre-configured MinIO connection.
      *
-     * @param endpoint  The URL of the MinIO server (e.g., "http://localhost:9000").
-     * @param accessKey The root user or access key.
-     * @param secretKey The root password or secret key.
+     * @param connectionManager The manager providing the secure MinioClient.
      */
-    public S3ClientService(String endpoint, String accessKey, String secretKey) {
-        this.minioClient = MinioClient.builder()
-                .endpoint(endpoint)
-                .credentials(accessKey, secretKey)
-                .build();
-
-        logger.info("Initialized S3ClientService. Connected to MinIO endpoint: {}", endpoint);
+    public S3ClientService(MinioConnectionManager connectionManager) {
+        this.minioClient = connectionManager.getClient();
+        logger.info("Initialized S3ClientService using injected MinioConnectionManager.");
     }
 
     /**
@@ -65,7 +58,6 @@ public class S3ClientService {
         logger.info("Downloading user code from s3://{}/{} to local path: {}", bucketName, objectName, destinationPath);
 
         try {
-            // Ensure the parent directories exist
             Files.createDirectories(targetPath.getParent());
 
             try (InputStream stream = minioClient.getObject(
@@ -74,7 +66,6 @@ public class S3ClientService {
                             .object(objectName)
                             .build())) {
 
-                // Copy the S3 stream directly to the local file system
                 Files.copy(stream, targetPath, StandardCopyOption.REPLACE_EXISTING);
                 logger.info("Successfully downloaded user code to: {}", targetPath.toAbsolutePath());
             }
@@ -86,11 +77,6 @@ public class S3ClientService {
 
     /**
      * Reads a specific chunk of data from a large input file.
-     * <p>
-     * Rather than downloading the entire file, this method requests a specific byte-range.
-     * This is essential for the Map phase, where the Manager assigns 64MB chunks
-     * to individual workers for parallel processing.
-     * </p>
      *
      * @param bucketName The name of the bucket containing the input data.
      * @param objectName The S3 object key of the input file.
@@ -110,7 +96,6 @@ public class S3ClientService {
                         .length(length)
                         .build())) {
 
-            // Convert the input stream to a String
             String chunkData = new String(stream.readAllBytes(), StandardCharsets.UTF_8);
             logger.debug("Successfully read data chunk from MinIO.");
             return chunkData;
@@ -123,12 +108,6 @@ public class S3ClientService {
 
     /**
      * Writes intermediate Map output or final Reduce output back to MinIO.
-     * <p>
-     * To ensure Idempotence (At-Least-Once delivery semantics), the objectName
-     * must be deterministic (e.g., "s3://bucket/job_1/intermediate/map_1_part_0.json").
-     * If this method is called multiple times for the same task due to a Worker crash,
-     * it will safely overwrite the existing object without data corruption.
-     * </p>
      *
      * @param bucketName The destination bucket.
      * @param objectName The deterministic S3 object key for the output file.
@@ -145,7 +124,7 @@ public class S3ClientService {
                             .bucket(bucketName)
                             .object(objectName)
                             .stream(inputStream, dataBytes.length, -1)
-                            .contentType("application/json") // Adjust depending on your final format
+                            .contentType("application/json")
                             .build());
 
             logger.debug("Successfully wrote object to s3://{}/{}", bucketName, objectName);
