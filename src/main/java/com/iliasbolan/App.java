@@ -5,8 +5,12 @@ import com.iliasbolan.messaging.RabbitMqConnectionManager;
 import com.iliasbolan.messaging.RabbitMqConsumer;
 import com.iliasbolan.storage.MinioConnectionManager;
 import com.iliasbolan.storage.S3ClientService;
+import com.sun.net.httpserver.HttpServer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import java.io.OutputStream;
+import java.net.InetSocketAddress;
 
 /**
  * The main entry point for the Map-Reduce Worker application.
@@ -23,7 +27,7 @@ import org.slf4j.LoggerFactory;
  * </p>
  *
  * @author Ilias Bolanakis
- * @version 1.5
+ * @version 1.6
  * @since 2026-03-30
  */
 public class App {
@@ -57,14 +61,33 @@ public class App {
             TaskExecutor taskExecutor = new TaskExecutor(s3ClientService);
             RabbitMqConsumer consumer = new RabbitMqConsumer(rabbitManager, queueName, idleTimeout, taskExecutor);
 
+            /* --------------------------------*/
+            /* --- KUBERNETES HEALTH PROBE --- */
+            /* --------------------------------*/
+            // Start a lightweight, native HTTP server on port 8080 so K8s knows the pod is alive
+            HttpServer healthServer = HttpServer.create(new InetSocketAddress(8080), 0);
+            healthServer.createContext("/health", exchange -> {
+                String response = "OK";
+                exchange.sendResponseHeaders(200, response.length());
+                try (OutputStream os = exchange.getResponseBody()) {
+                    os.write(response.getBytes());
+                }
+            });
+            healthServer.setExecutor(null);
+            healthServer.start();
+            logger.info("Health check server listening on port 8080 (/health)...");
+
             // --- GRACEFUL SHUTDOWN HOOK ---
             Runtime.getRuntime().addShutdownHook(new Thread(() -> {
                 logger.warn(">>> OS Termination Signal (SIGTERM) received! <<<");
                 logger.warn("Initiating graceful shutdown of Worker node to prevent data corruption...");
 
+                // Stop the network services cleanly
+                healthServer.stop(0);
                 consumer.stopConsuming();
 
                 try {
+                    // Give active Map/Reduce tasks a brief moment to finish current execution
                     Thread.sleep(2000);
                 } catch (InterruptedException ignored) {}
 
