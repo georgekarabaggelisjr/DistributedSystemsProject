@@ -7,7 +7,8 @@ A highly concurrent, cloud-native worker node designed to execute dynamic Map-Re
 Unlike monolithic processing scripts, this worker operates as a stateless compute engine. It dynamically downloads user-defined logic and data chunks at runtime, executes the computation, and gracefully shuts down.
 
 ### The Execution Pipeline
-1. **Task Consumption (2-Queue Architecture):** Listens to a **RabbitMQ** Work Queue for structured JSON task assignments, while concurrently publishing real-time telemetry (success/fail states) to an **Event/Audit Queue** for downstream orchestration.2. **Resource Acquisition:** Uses the **MinIO S3 Client** to download the designated 64MB data chunk and the user's compiled `.class` code.
+1. **Task Consumption (2-Queue Architecture):** Listens to a **RabbitMQ** Work Queue for structured JSON task assignments, while concurrently publishing real-time telemetry (success/fail states) to an **Event/Audit Queue** for downstream orchestration.
+2. **Resource Acquisition:** Uses the **MinIO S3 Client** to download the designated 64MB data chunk and the user's compiled `.class` code.
 3. **Dynamic Reflection:** Instantiates the user's custom `Mapper` or `Reducer` securely at runtime using a custom `URLClassLoader`.
 4. **Parallel Computation:** Bypasses legacy thread pools in favor of Java's **Fork/Join Framework**, dynamically calculating optimal split thresholds to utilize work-stealing across all available CPU cores.
 5. **Shuffle & Sort (Reduce Phase):** Enforces strict deterministic routing via Hash-Modulo math and guarantees "Total Order" semantics by sorting keys alphabetically before final reduction.
