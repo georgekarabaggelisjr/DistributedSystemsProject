@@ -1,5 +1,7 @@
 package com.iliasbolan.messaging;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.iliasbolan.engine.TaskExecutor;
 import com.rabbitmq.client.Channel;
 import com.rabbitmq.client.Connection;
@@ -20,50 +22,35 @@ import java.util.concurrent.atomic.AtomicLong;
  * Manages the connection to the Message Broker (RabbitMQ) and consumes task assignments.
  * <p>
  * This class serves as the primary lifecycle controller for the Worker node. It connects
- * to the specified RabbitMQ queue using the provided {@link RabbitMqConnectionManager}
- * and consumes messages asynchronously (e.g., 64MB chunk assignments).
- * To guarantee At-Least-Once delivery and fault tolerance, it uses manual Acknowledgments (ACKs).
- * If the worker successfully processes the task and writes to MinIO, it sends an ACK.
- * If the worker crashes, the unacknowledged message is automatically re-queued.
+ * to the specified RabbitMQ queue, consumes messages asynchronously, and now implements
+ * an Enterprise 2-Queue Architecture:
+ * 1. Consumes from the Work Queue.
+ * 2. Publishes real-time status events to the Audit/Status Queue.
  * </p>
- * <p>
- * <b>Graceful Termination:</b> Because Workers run as Kubernetes Jobs, they must not run forever.
- * This consumer implements an idle timeout. If no messages are received for a sustained period,
- * it assumes the job phase is complete and intentionally exits the JVM with status 0,
- * signaling completion to Kubernetes.
- * </p>
- *
- * @author Ilias Bolanakis
- * @version 1.6
- * @since 2026-03-30
  */
 public class RabbitMqConsumer {
 
     private static final Logger logger = LoggerFactory.getLogger(RabbitMqConsumer.class);
+    private static final ObjectMapper objectMapper = new ObjectMapper();
 
     private final RabbitMqConnectionManager connectionManager;
     private final String queueName;
     private final int idleTimeoutMillis;
     private final TaskExecutor taskExecutor;
 
+    // The designated queue for broadcasting progress to George's Master Node
+    private final String statusQueueName = "job_events_queue";
+
     private Thread mainThread;
 
-    /**
-     * Initializes the RabbitMQ Consumer configuration.
-     *
-     * @param connectionManager The manager responsible for providing secure RabbitMQ connections.
-     * @param queueName         The name of the queue to consume from.
-     * @param idleTimeoutMillis The maximum time (in milliseconds) to wait for a new message before shutting down.
-     * @param taskExecutor      The central orchestration engine for executing Map-Reduce tasks.
-     */
     public RabbitMqConsumer(RabbitMqConnectionManager connectionManager, String queueName, int idleTimeoutMillis, TaskExecutor taskExecutor) {
         this.connectionManager = connectionManager;
         this.queueName = queueName;
         this.idleTimeoutMillis = idleTimeoutMillis;
         this.taskExecutor = taskExecutor;
 
-        logger.info("Initialized RabbitMqConsumer. Target Queue: {}, Idle Timeout: {}ms",
-                queueName, idleTimeoutMillis);
+        logger.info("Initialized RabbitMqConsumer. Target Queue: {}, Status Queue: {}, Idle Timeout: {}ms",
+                queueName, statusQueueName, idleTimeoutMillis);
     }
 
     public void stopConsuming() {
@@ -76,11 +63,12 @@ public class RabbitMqConsumer {
     public void startConsuming() throws Exception {
         this.mainThread = Thread.currentThread();
 
-        // We now ask the manager for the connection, keeping this class totally unaware of passwords!
         try (Connection connection = connectionManager.createConnection();
              Channel channel = connection.createChannel()) {
 
+            // 1. Declare both the Work Queue and the Status Queue
             channel.queueDeclare(queueName, true, false, false, null);
+            channel.queueDeclare(statusQueueName, true, false, false, null);
             channel.basicQos(1);
 
             logger.info("Successfully connected to RabbitMQ. Waiting for messages on queue: '{}'.", queueName);
@@ -94,14 +82,41 @@ public class RabbitMqConsumer {
                     String messageBody = new String(body, StandardCharsets.UTF_8);
                     long deliveryTag = envelope.getDeliveryTag();
 
+                    // Safely extract identifying info for our status updates
+                    String jobId = "UNKNOWN";
+                    String taskId = "UNKNOWN";
+                    try {
+                        JsonNode jsonNode = objectMapper.readTree(messageBody);
+                        jobId = jsonNode.path("jobId").asText("UNKNOWN");
+                        taskId = jsonNode.path("taskId").asText("UNKNOWN");
+                    } catch (Exception e) {
+                        logger.warn("Could not parse JSON payload to extract Job/Task IDs for status reporting.", e);
+                    }
+
                     try (MDC.MDCCloseable mdc = MDC.putCloseable("deliveryTag", String.valueOf(deliveryTag))) {
                         logger.info("Received Task Payload: {}", messageBody);
+
                         try {
+                            // 1. Execute the actual Map/Reduce Work
                             taskExecutor.executeTask(messageBody);
+
+                            // 2. Publish the "COMPLETED" Event to the Status Queue
+                            String successEvent = String.format("{\"jobId\": \"%s\", \"taskId\": \"%s\", \"state\": \"COMPLETED\"}", jobId, taskId);
+                            channel.basicPublish("", statusQueueName, null, successEvent.getBytes(StandardCharsets.UTF_8));
+
+                            // 3. ACK the Work Queue
                             channel.basicAck(deliveryTag, false);
-                            logger.info("Task successfully processed and acknowledged.");
+                            logger.info("Task successfully processed, event broadcasted, and ACK sent.");
+
                         } catch (Exception e) {
-                            logger.error("Critical error processing task. Sending NACK to requeue message.", e);
+                            logger.error("Critical error processing task. Sending FAILED event and NACKing.", e);
+
+                            // 2. Publish the "FAILED" Event to the Status Queue
+                            String failedEvent = String.format("{\"jobId\": \"%s\", \"taskId\": \"%s\", \"state\": \"FAILED\", \"error\": \"%s\"}",
+                                    jobId, taskId, e.getClass().getSimpleName());
+                            channel.basicPublish("", statusQueueName, null, failedEvent.getBytes(StandardCharsets.UTF_8));
+
+                            // 3. NACK the Work Queue
                             channel.basicNack(deliveryTag, false, true);
                         }
                     }
@@ -132,9 +147,8 @@ public class RabbitMqConsumer {
 
                     if (remainingToWait <= 0) {
                         logger.info("No messages received for {} seconds. Gracefully terminating worker phase.", (idleTimeoutMillis / 1000));
-                        // Tell the main thread to stop, allowing try-with-resources to close the network cleanly
                         stopConsuming();
-                        break; // Exit the loop so this daemon thread dies peacefully
+                        break;
                     } else {
                         Thread.sleep(remainingToWait);
                     }
