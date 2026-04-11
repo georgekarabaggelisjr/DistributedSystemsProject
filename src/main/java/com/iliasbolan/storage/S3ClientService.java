@@ -1,8 +1,7 @@
 package com.iliasbolan.storage;
 
-import io.minio.GetObjectArgs;
-import io.minio.MinioClient;
-import io.minio.PutObjectArgs;
+import io.minio.*;
+import io.minio.messages.Item;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -13,6 +12,8 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * A service class responsible for all direct communications between the Worker node
@@ -131,6 +132,65 @@ public class S3ClientService {
         } catch (Exception e) {
             logger.error("Failed to write data to s3://{}/{}", bucketName, objectName, e);
             throw e;
+        }
+    }
+
+    /**
+     * Scans the intermediate storage directory to identify all partition fragments
+     * produced by various Map tasks that belong to a specific Reducer.
+     * <p>
+     * This method is essential for the Shuffle/Sort boundary. It looks for files
+     * following the deterministic naming convention: <code>[jobId]/intermediate/*_part_[index].txt</code>.
+     * </p>
+     *
+     * @param bucketName     The MinIO bucket containing intermediate job data.
+     * @param jobId          The unique identifier for the current job.
+     * @param partitionIndex The specific partition (0 to R-1) this worker is assigned to reduce.
+     * @return A {@link List} of S3 object keys representing the fragments to be reduced.
+     * @throws Exception If a network error occurs during the listing process.
+     */
+    public List<String> listIntermediateFiles(String bucketName, String jobId, int partitionIndex) throws Exception {
+        String prefix = jobId + "/intermediate/";
+        String suffix = "_part_" + partitionIndex + ".txt";
+        List<String> matchingObjects = new ArrayList<>();
+
+        // We use a recursive listing to capture all map outputs regardless of sub-folder structure
+        Iterable<Result<Item>> results = minioClient.listObjects(
+                ListObjectsArgs.builder()
+                        .bucket(bucketName)
+                        .prefix(prefix)
+                        .recursive(true)
+                        .build());
+
+        for (Result<Item> result : results) {
+            String name = result.get().objectName();
+            if (name.endsWith(suffix)) {
+                matchingObjects.add(name);
+            }
+        }
+
+        logger.info("Discovery phase complete. Found {} intermediate fragments for partition {} in job {}.",
+                matchingObjects.size(), partitionIndex, jobId);
+        return matchingObjects;
+    }
+
+    /**
+     * Downloads and reads an entire S3 object into memory as a UTF-8 String.
+     * <p>
+     * <b>Note:</b> This is intended for intermediate files which are typically
+     * significantly smaller than the original 64MB input chunks.
+     * </p>
+     *
+     * @param bucketName The source MinIO bucket.
+     * @param objectName The deterministic S3 object key.
+     * @return The raw text content of the intermediate file.
+     * @throws Exception If the file cannot be retrieved or read.
+     */
+    public String readObject(String bucketName, String objectName) throws Exception {
+        try (InputStream stream = minioClient.getObject(
+                GetObjectArgs.builder().bucket(bucketName).object(objectName).build())) {
+
+            return new String(stream.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
         }
     }
 }

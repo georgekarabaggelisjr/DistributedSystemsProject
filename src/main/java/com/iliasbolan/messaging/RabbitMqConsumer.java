@@ -132,7 +132,9 @@ public class RabbitMqConsumer {
 
                     if (remainingToWait <= 0) {
                         logger.info("No messages received for {} seconds. Gracefully terminating worker phase.", (idleTimeoutMillis / 1000));
-                        System.exit(0);
+                        // Tell the main thread to stop, allowing try-with-resources to close the network cleanly
+                        stopConsuming();
+                        break; // Exit the loop so this daemon thread dies peacefully
                     } else {
                         Thread.sleep(remainingToWait);
                     }

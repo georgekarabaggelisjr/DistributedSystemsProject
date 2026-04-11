@@ -83,17 +83,17 @@ public class ShufflePartitioner {
             partitions.put(i, new ArrayList<>());
         }
 
-        // Step 2: Route each KeyValuePair to the correct partition based on its key's hash
+        // Step 2: Route each KeyValuePair using the record method pair.key()
         // PERFORMANCE CRITICAL: Absolutely no logging inside this loop!
         for (KeyValuePair pair : intermediateData) {
             // Use Math.abs to ensure the hash is positive before the modulo operation
-            int partitionIndex = Math.abs(pair.key.hashCode()) % numReducers;
+            int partitionIndex = Math.abs(pair.key().hashCode()) % numReducers;
             partitions.get(partitionIndex).add(pair);
         }
 
         int uploadedPartitionsCount = 0;
 
-        // Step 3: Serialize and upload each partition to MinIO
+        // Step 3: Serialize and upload each partition
         for (Map.Entry<Integer, List<KeyValuePair>> entry : partitions.entrySet()) {
             int partitionIndex = entry.getKey();
             List<KeyValuePair> partitionData = entry.getValue();
@@ -107,14 +107,11 @@ public class ShufflePartitioner {
             // Serialize data into a simple "key\value\n" text format
             StringBuilder serializedData = new StringBuilder();
             for (KeyValuePair pair : partitionData) {
-                serializedData.append(pair.key).append("\t").append(pair.value).append("\n");
+                serializedData.append(pair.key()).append("\t").append(pair.value()).append("\n");
             }
 
             // Generate the deterministic S3 object name (e.g., job_1/intermediate/map_1_part_0.txt)
             String objectName = String.format("%s/intermediate/%s_part_%d.txt", jobId, mapTaskId, partitionIndex);
-
-            logger.debug("Uploading partition {} ({} pairs) to S3 object: {}",
-                    partitionIndex, partitionData.size(), objectName);
 
             try {
                 // Upload to MinIO
@@ -122,11 +119,10 @@ public class ShufflePartitioner {
                 uploadedPartitionsCount++;
             } catch (Exception e) {
                 logger.error("Failed to upload partition {} to MinIO path: {}", partitionIndex, objectName, e);
-                throw e; // Rethrow to ensure the task fails and is retried by the Manager
+                throw e;
             }
         }
 
-        logger.info("Successfully completed Shuffle phase. Uploaded {} active partitions to MinIO for MapTask: {}",
-                uploadedPartitionsCount, mapTaskId);
+        logger.info("Successfully completed Shuffle phase. Uploaded {} active partitions.", uploadedPartitionsCount);
     }
 }

@@ -3,6 +3,7 @@ package com.iliasbolan.engine;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.iliasbolan.core.KeyValuePair;
 import com.iliasbolan.core.Mapper;
+import com.iliasbolan.core.Reducer;
 import com.iliasbolan.core.TaskPayload;
 import com.iliasbolan.storage.S3ClientService;
 import org.slf4j.Logger;
@@ -141,17 +142,74 @@ public class TaskExecutor {
     }
 
     /**
-     * Orchestrates the complete lifecycle of a REDUCE task.
+     * Orchestrates the complete lifecycle of a REDUCE task with an integrated Sort phase.
+     * <p>
+     * <b>Architectural Upgrade:</b><br>
+     * This implementation introduces a deterministic Sort phase between the Data Ingestion
+     * and Parallel Execution stages. By sorting the intermediate keys, we provide
+     * "Total Order" semantics, ensuring the final output files are alphabetically
+     * organized—a requirement for many downstream analytical tools.
+     * </p>
      *
      * @param payload The structured data containing all routing and execution metadata.
-     * @throws Exception If any operational boundary fails.
+     * @throws Exception If any operational boundary fails (I/O, Reflection, or Network).
      */
     private void executeReducePhase(TaskPayload payload) throws Exception {
-        logger.info("--- [ STARTING REDUCE PHASE: Task {} ] ---", payload.taskId());
+        logger.info("--- [ STARTING REDUCE PHASE: Partition {} for Job {} ] ---", payload.taskId(), payload.jobId());
 
-        // TODO: Implement Reduce orchestration (Download intermediate files, group by key, run ReduceTaskProcessor)
-        logger.warn("Reduce phase orchestration is not yet fully implemented in TaskExecutor.");
+        // Step 1: Resource Acquisition (User Code)
+        String localCodeDir = "/tmp/mapreduce/usercode/" + payload.jobId() + "/";
+        String localCodePath = localCodeDir + payload.className() + ".class";
+        s3ClientService.downloadUserCode(payload.userCodeBucket(), payload.userCodeObject(), localCodePath);
 
-        logger.info("--- [ SUCCESSFULLY COMPLETED REDUCE PHASE: Task {} ] ---", payload.taskId());
+        Reducer reducer = DynamicClassLoader.loadReducer(localCodeDir, payload.className());
+
+        // Step 2: Fragment Discovery
+        int partitionIndex = Integer.parseInt(payload.taskId());
+        List<String> files = s3ClientService.listIntermediateFiles(payload.bucketName(), payload.jobId(), partitionIndex);
+
+        // Step 3: Data Ingestion & Grouping
+        // We use a HashMap for initial grouping as it provides O(1) insertion performance.
+        java.util.Map<String, List<String>> groupedData = new java.util.HashMap<>();
+        for (String fileName : files) {
+            String content = s3ClientService.readObject(payload.bucketName(), fileName);
+            for (String line : content.split("\\n")) {
+                if (line.isBlank()) continue;
+
+                String[] parts = line.split("\\t");
+                if (parts.length == 2) {
+                    groupedData.computeIfAbsent(parts[0], k -> new java.util.ArrayList<>()).add(parts[1]);
+                }
+            }
+        }
+
+        // Step 4: Deterministic Sorting
+        // To enable parallel processing, we convert the map to an ArrayList.
+        // We then apply a Sort to the entire keyset to satisfy Map-Reduce sorting requirements.
+        logger.info("Sorting {} unique intermediate keys for partition {}...", groupedData.size(), partitionIndex);
+
+        List<java.util.Map.Entry<String, List<String>>> sortedEntries = new java.util.ArrayList<>(groupedData.entrySet());
+
+        // Perform an in-place sort using the key's natural (alphabetical) order
+        sortedEntries.sort(java.util.Map.Entry.comparingByKey());
+
+        // Step 5: Parallel Execution
+        // The sorted list is now passed to the Fork/Join pool.
+        // Since the list is sorted, each sub-task in the pool handles a contiguous "range" of keys.
+        ReduceTaskProcessor rootReduceTask = new ReduceTaskProcessor(sortedEntries, 0, sortedEntries.size(), reducer);
+        List<com.iliasbolan.core.KeyValuePair> finalResults = forkJoinPool.invoke(rootReduceTask);
+
+        logger.info("Parallel Reduction complete. Results remain in sorted order.");
+
+        // Step 6: Final Persistence (Output will now be alphabetically sorted by key)
+        StringBuilder outputBuilder = new StringBuilder();
+        for (com.iliasbolan.core.KeyValuePair pair : finalResults) {
+            outputBuilder.append(pair.key()).append("\t").append(pair.value()).append("\n");
+        }
+
+        String finalPath = String.format("%s/output/result_part_%d.txt", payload.jobId(), partitionIndex);
+        s3ClientService.writeData(payload.bucketName(), finalPath, outputBuilder.toString());
+
+        logger.info("--- [ SUCCESSFULLY COMPLETED REDUCE PHASE: Output saved to {} ] ---", finalPath);
     }
 }

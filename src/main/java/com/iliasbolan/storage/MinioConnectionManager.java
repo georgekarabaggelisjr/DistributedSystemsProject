@@ -31,7 +31,7 @@ public class MinioConnectionManager {
                 .credentials(accessKey, secretKey)
                 .build();
 
-        // We do NOT log the secret key!
+        // DO NOT log the secret key!
         logger.info("MinioConnectionManager initialized securely for endpoint: {}", endpoint);
     }
 
