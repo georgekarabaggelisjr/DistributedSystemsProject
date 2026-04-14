@@ -101,12 +101,18 @@ public class TaskExecutor {
     private void executeMapPhase(TaskPayload payload) throws Exception {
         logger.info("--- [ STARTING MAP PHASE: Task {} ] ---", payload.taskId());
 
-        // Step 1: Download User Code
+        // Step 1: Download User Code and reconstruct package directories
+        String packagePath = payload.className().replace(".", "/");
         String localCodeDir = "/tmp/mapreduce/usercode/" + payload.jobId() + "/";
-        String localCodePath = localCodeDir + payload.className() + ".class";
+        String localCodePath = localCodeDir + packagePath + ".class";
+
+        // Ensure the nested directories exist before downloading!
+        java.io.File fileObj = new java.io.File(localCodePath);
+        fileObj.getParentFile().mkdirs();
+
         s3ClientService.downloadUserCode(payload.userCodeBucket(), payload.userCodeObject(), localCodePath);
 
-        // Step 2: Dynamically load the Mapper
+        // Step 2: Dynamically load the Mapper (pointing ClassLoader to the root code dir)
         Mapper mapper = DynamicClassLoader.loadMapper(localCodeDir, payload.className());
 
         // Step 3: Fetch the data chunk from MinIO
@@ -157,11 +163,18 @@ public class TaskExecutor {
     private void executeReducePhase(TaskPayload payload) throws Exception {
         logger.info("--- [ STARTING REDUCE PHASE: Partition {} for Job {} ] ---", payload.taskId(), payload.jobId());
 
-        // Step 1: Resource Acquisition (User Code)
+        // Step 1: Resource Acquisition (User Code) and reconstruct package directories
+        String packagePath = payload.className().replace(".", "/");
         String localCodeDir = "/tmp/mapreduce/usercode/" + payload.jobId() + "/";
-        String localCodePath = localCodeDir + payload.className() + ".class";
+        String localCodePath = localCodeDir + packagePath + ".class";
+
+        // Ensure the nested directories exist before downloading!
+        java.io.File fileObj = new java.io.File(localCodePath);
+        fileObj.getParentFile().mkdirs();
+
         s3ClientService.downloadUserCode(payload.userCodeBucket(), payload.userCodeObject(), localCodePath);
 
+        // Load Reducer (pointing ClassLoader to the root code dir)
         Reducer reducer = DynamicClassLoader.loadReducer(localCodeDir, payload.className());
 
         // Step 2: Fragment Discovery
