@@ -31,6 +31,14 @@ Unlike monolithic processing scripts, this worker operates as a stateless comput
 * **Logging:** SLF4J + Logback
 * **Testing:** JUnit 5 + Mockito 5.x + Byte Buddy
 
+
+## Important Constraints
+### Encoding Requirements
+This engine is optimized for high-performance distributed processing and strictly supports **UTF-16** encoded input files.
+* Ensure all data uploaded to MinIO is saved as UTF-16.
+* Data encoded in other formats (e.g., UTF-8, ASCII) may result in character corruption or word fragmentation errors during the Map phase.
+
+
 ## Testing Pyramid & Quality Assurance
 
 This project maintains a rigorous, Enterprise-grade testing suite designed to prove mathematical correctness and network resilience:

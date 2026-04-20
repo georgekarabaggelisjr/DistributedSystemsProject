@@ -95,6 +95,7 @@ public class TaskExecutor {
      * </ol>
      * </p>
      *
+     * @apiNote Input data files must be encoded in UTF-16. Files with other encodings may result in unexpected character mapping or fragmentation errors.
      * @param payload The structured data containing all routing and execution metadata.
      * @throws Exception If any operational boundary fails.
      */
