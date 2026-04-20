@@ -39,8 +39,13 @@ class ShufflePartitionerTest {
         );
     }
 
+    /**
+     * Verifies that the partitioner correctly groups identical keys and skips
+     * generating files for partitions that receive no data.
+     * * @throws Throwable to accommodate Resilience4j-powered S3 signatures.
+     */
     @Test
-    void testPartitionAndUpload_CorrectlyGroupsKeysAndSkipsEmptyPartitions() throws Exception {
+    void testPartitionAndUpload_CorrectlyGroupsKeysAndSkipsEmptyPartitions() throws Throwable {
         // Arrange: "apple" and "banana" will hash to specific partitions.
         // Include "apple" twice to ensure they end up in the same file.
         List<KeyValuePair> intermediateData = List.of(
@@ -70,8 +75,13 @@ class ShufflePartitionerTest {
         assertTrue(foundGroupedApples, "Identical keys were not grouped into the same partition file.");
     }
 
+    /**
+     * Verifies that the partitioner adheres to the deterministic S3 naming
+     * convention required for the subsequent Shuffle/Sort phase.
+     * * @throws Throwable to accommodate Resilience4j-powered S3 signatures.
+     */
     @Test
-    void testPartitionAndUpload_DeterministicNamingConvention() throws Exception {
+    void testPartitionAndUpload_DeterministicNamingConvention() throws Throwable {
         // Arrange
         List<KeyValuePair> intermediateData = List.of(new KeyValuePair("test", "1"));
 

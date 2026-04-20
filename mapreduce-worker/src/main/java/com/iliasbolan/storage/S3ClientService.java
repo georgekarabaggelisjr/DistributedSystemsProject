@@ -1,5 +1,9 @@
 package com.iliasbolan.storage;
 
+import io.github.resilience4j.core.IntervalFunction;
+import io.github.resilience4j.retry.Retry;
+import io.github.resilience4j.retry.RetryConfig;
+import io.github.resilience4j.retry.RetryRegistry;
 import io.minio.*;
 import io.minio.messages.Item;
 import org.slf4j.Logger;
@@ -17,49 +21,78 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * A service class responsible for all direct communications between the Worker node
- * and the Shared File System (MinIO).
+ * High-performance I/O service for distributed storage orchestration.
  * <p>
- * In this Map-Reduce architecture, Workers bypass the Manager Service for data
- * transfer to avoid network congestion. This class utilizes the MinIO Java SDK
- * to perform idempotent writes, fetch specific byte-ranges of input files (chunks),
- * and download user-provided execution code.
+ * This service encapsulates all interactions between the Worker node and the S3-compatible
+ * storage layer (MinIO). It is engineered to handle massive data throughput while
+ * maintaining strict record-level consistency during parallel file reads.
  * </p>
+ * * <h3>Key Architectural Features:</h3>
+ * <ul>
+ * <li><b>Resilience:</b> Implements {@code Resilience4j} retries with exponential backoff
+ * and random jitter to survive transient network partitions.</li>
+ * <li><b>Boundary Correction:</b> Implements a specialized synchronization algorithm
+ * to ensure UTF-16 records are never bifurcated across Map chunks.</li>
+ * <li><b>Idempotent Operations:</b> Ensures that task retries do not result in corrupted
+ * or duplicated intermediate data.</li>
+ * </ul>
  *
  * @author Ilias Bolanakis
- * @version 1.2
+ * @version 1.4
+ * @see <a href="https://resilience4j.readme.io/">Resilience4j Documentation</a>
  * @since 2026-03-30
  */
 public class S3ClientService {
 
+    /** Logger for storage events and retry lifecycle tracking. */
     private static final Logger logger = LoggerFactory.getLogger(S3ClientService.class);
 
+    /** The underlying MinIO client for protocol-level communication. */
     private final MinioClient minioClient;
 
+    /** Resilience4j context for managing retry state and backoff intervals. */
+    private final Retry retryContext;
+
     /**
-     * Initializes the service with a pre-configured MinIO connection.
+     * Constructs the service and configures the fault-tolerance registry.
+     * <p>
+     * The retry policy is configured for 3 attempts with an exponential random
+     * backoff (Base: 1s, Multiplier: 2.0).
+     * </p>
      *
-     * @param connectionManager The manager providing the secure MinioClient.
+     * @param connectionManager Provider for the authenticated MinioClient.
      */
     public S3ClientService(MinioConnectionManager connectionManager) {
         this.minioClient = connectionManager.getClient();
-        logger.info("Initialized S3ClientService using injected MinioConnectionManager.");
+
+        // Fault tolerance configuration
+        RetryConfig config = RetryConfig.custom()
+                .maxAttempts(3)
+                .intervalFunction(IntervalFunction.ofExponentialRandomBackoff(1000, 2.0, 0.5))
+                .retryExceptions(Exception.class)
+                .build();
+
+        this.retryContext = RetryRegistry.of(config).retry("minio-communication-retry");
+        logger.info("Initialized S3ClientService with Resilience4j Fault-Tolerance.");
     }
 
     /**
-     * Downloads the user's compiled Java code (.class or .jar) from MinIO to the
-     * Worker's local file system so it can be dynamically loaded via Reflection.
+     * Downloads executable bytecode from the shared storage to the local runtime environment.
+     * <p>
+     * This is a critical step in the worker lifecycle, enabling the dynamic loading of
+     * user-provided {@code .class} or {@code .jar} files via the {@code TaskExecutor}.
+     * </p>
      *
-     * @param bucketName      The name of the bucket where the code resides.
-     * @param objectName      The S3 object key (e.g., "jobs/job_1/MyMapper.class").
-     * @param destinationPath The local directory path where the file should be saved.
-     * @throws Exception If a network error occurs or the file cannot be written.
+     * @param bucketName      S3 bucket containing the code artifacts.
+     * @param objectName      S3 key for the specific bytecode file.
+     * @param destinationPath Local file system path for temporary storage.
+     * @throws Throwable if the artifact cannot be retrieved or the local disk is write-protected.
      */
-    public void downloadUserCode(String bucketName, String objectName, String destinationPath) throws Exception {
-        Path targetPath = Paths.get(destinationPath);
-        logger.info("Downloading user code from s3://{}/{} to local path: {}", bucketName, objectName, destinationPath);
+    public void downloadUserCode(String bucketName, String objectName, String destinationPath) throws Throwable {
+        Retry.decorateCheckedRunnable(retryContext, () -> {
+            Path targetPath = Paths.get(destinationPath);
+            logger.info("Downloading user code from s3://{}/{} to local path: {}", bucketName, objectName, destinationPath);
 
-        try {
             Files.createDirectories(targetPath.getParent());
 
             try (InputStream stream = minioClient.getObject(
@@ -71,179 +104,181 @@ public class S3ClientService {
                 Files.copy(stream, targetPath, StandardCopyOption.REPLACE_EXISTING);
                 logger.info("Successfully downloaded user code to: {}", targetPath.toAbsolutePath());
             }
-        } catch (Exception e) {
-            logger.error("Failed to download user code from s3://{}/{}", bucketName, objectName, e);
-            throw e;
-        }
+        }).run();
     }
 
     /**
-     * Reads a specific chunk of data from a large UTF-16 input file, applying MapReduce
-     * boundary-correction rules to prevent splitting words across chunks.
+     * Reads a boundary-corrected chunk of data from a large file.
+     * <p>
+     * <b>Algorithm Detail:</b>
+     * To support parallel processing of a single large file, this method implements
+     * "Record Synchronization":
+     * <ol>
+     * <li>If the chunk starts mid-file (offset > 0), it discards the leading fragment
+     * until the first newline (0x0A) is reached.</li>
+     * <li>It reads the requested {@code length}, but continues reading until the
+     * current line is finalized.</li>
+     * </ol>
+     * This ensures the <i>preceding</i> worker handles the fragment we skipped,
+     * and <i>we</i> handle the fragment that the <i>following</i> worker will skip.
+     * </p>
      *
-     * @param bucketName The name of the bucket containing the input data.
-     * @param objectName The S3 object key of the input file.
-     * @param offset     The starting byte position of the chunk.
-     * @param length     The total target bytes to read.
-     * @return A List of perfectly aligned text records.
-     * @throws Exception If the stream fails.
+     * @param bucketName S3 bucket containing the input data.
+     * @param objectName S3 key of the source file.
+     * @param offset     The logical starting byte (from the Manager).
+     * @param length     The target chunk size (typically 64MB).
+     * @return A {@link List} of UTF-16 encoded, sanitized text records.
+     * @throws Throwable if the stream is interrupted or the data cannot be decoded.
      */
-    public List<String> readDataChunk(String bucketName, String objectName, long offset, long length) throws Exception {
-        // Verify this appears in your 'kubectl logs' to ensure new code is running
-        logger.info(" Offset: {}, Target Length: {} bytes", offset, length);
+    public List<String> readDataChunk(String bucketName, String objectName, long offset, long length) throws Throwable {
+        return Retry.decorateCheckedSupplier(retryContext, () -> {
+            logger.info(" Offset: {}, Target Length: {} bytes", offset, length);
 
-        List<String> cleanRecords = new ArrayList<>();
+            List<String> cleanRecords = new ArrayList<>();
 
-        try (InputStream stream = minioClient.getObject(
-                GetObjectArgs.builder()
-                        .bucket(bucketName)
-                        .object(objectName)
-                        .offset(offset)
-                        .build())) {
-
-            // --- SYNCHRONIZE AND DISCARD FRAGMENT ---
-            // If offset > 0, we are likely mid-word or mid-character.
-            // We skip every byte until we hit 0x0A (the newline anchor).
-            if (offset > 0) {
-                int b;
-                long skipCount = 0;
-                while ((b = stream.read()) != -1) {
-                    skipCount++;
-                    if (b == 0x0A) break;
-                }
-                logger.debug("Skipped {} bytes to reach first clean boundary.", skipCount);
-            }
-
-            // --- READ UNTIL LENGTH FULFILLED AND LINE FINISHED ---
-            ByteArrayOutputStream lineBuffer = new ByteArrayOutputStream();
-            long bytesProcessedInChunk = 0;
-            int b;
-
-            while ((b = stream.read()) != -1) {
-                bytesProcessedInChunk++;
-                lineBuffer.write(b);
-
-                // We treat 0x0A as the definitive end-of-line marker
-                if (b == 0x0A) {
-                    // Decode the buffer. StandardCharsets.UTF_16 handles the BOM if present,
-                    // but since we skipped the start of the file, it will rely on default endianness.
-                    String line = new String(lineBuffer.toByteArray(), StandardCharsets.UTF_16).trim();
-
-                    if (!line.isEmpty()) {
-                        cleanRecords.add(line);
-                    }
-                    lineBuffer.reset();
-
-                    // STOPPING CONDITION:
-                    // We must have read at least 'length' bytes AND finished a full line.
-                    if (bytesProcessedInChunk >= length) {
-                        logger.info("Fulfilled quota ({} bytes). Closing stream.", bytesProcessedInChunk);
-                        break;
-                    }
-                }
-            }
-
-            // Handle the final line if the file doesn't end with a newline
-            if (lineBuffer.size() > 0) {
-                String lastLine = new String(lineBuffer.toByteArray(), StandardCharsets.UTF_16).trim();
-                if (!lastLine.isEmpty()) {
-                    cleanRecords.add(lastLine);
-                }
-            }
-
-            logger.info("Processing complete. Records parsed: {}", cleanRecords.size());
-            return cleanRecords;
-
-        } catch (Exception e) {
-            logger.error("Reader Failure at offset {}: {}", offset, e.getMessage());
-            throw e;
-        }
-    }
-
-    /**
-     * Writes intermediate Map output or final Reduce output back to MinIO.
-     *
-     * @param bucketName The destination bucket.
-     * @param objectName The deterministic S3 object key for the output file.
-     * @param data       The JSON or text data to be written.
-     * @throws Exception If the upload fails.
-     */
-    public void writeData(String bucketName, String objectName, String data) throws Exception {
-        byte[] dataBytes = data.getBytes(StandardCharsets.UTF_16);
-        logger.debug("Writing {} bytes to s3://{}/{}", dataBytes.length, bucketName, objectName);
-
-        try (InputStream inputStream = new ByteArrayInputStream(dataBytes)) {
-            minioClient.putObject(
-                    PutObjectArgs.builder()
+            try (InputStream stream = minioClient.getObject(
+                    GetObjectArgs.builder()
                             .bucket(bucketName)
                             .object(objectName)
-                            .stream(inputStream, dataBytes.length, -1)
-                            .contentType("application/json")
+                            .offset(offset)
+                            .build())) {
+
+                // SYNC PHASE: Seek to the first valid record start (newline)
+                if (offset > 0) {
+                    int b;
+                    while ((b = stream.read()) != -1 && b != 0x0A);
+                }
+
+                // EXTRACTION PHASE: Read target length + finish current line
+                ByteArrayOutputStream lineBuffer = new ByteArrayOutputStream();
+                long bytesProcessedInChunk = 0;
+                int b;
+
+                while ((b = stream.read()) != -1) {
+                    bytesProcessedInChunk++;
+                    lineBuffer.write(b);
+
+                    // UTF-16 records are separated by standard LF (0x0A)
+                    if (b == 0x0A) {
+                        String line = new String(lineBuffer.toByteArray(), StandardCharsets.UTF_16).trim();
+
+                        if (!line.isEmpty()) {
+                            cleanRecords.add(line);
+                        }
+                        lineBuffer.reset();
+
+                        // Termination condition: Quota reached AND record completed
+                        if (bytesProcessedInChunk >= length) {
+                            logger.info("Fulfilled quota ({} bytes). Closing stream.", bytesProcessedInChunk);
+                            break;
+                        }
+                    }
+                }
+
+                // Edge Case: Handle file trailing bytes missing a newline
+                if (lineBuffer.size() > 0) {
+                    String lastLine = new String(lineBuffer.toByteArray(), StandardCharsets.UTF_16).trim();
+                    if (!lastLine.isEmpty()) {
+                        cleanRecords.add(lastLine);
+                    }
+                }
+
+                logger.info("Processing complete. Records parsed: {}", cleanRecords.size());
+                return cleanRecords;
+            }
+        }).get();
+    }
+
+    /**
+     * Persists computational output to the shared storage layer.
+     * <p>
+     * This is used for both intermediate Map partitions and final Reduce results.
+     * Data is encoded in UTF-16 to maintain character set consistency across the cluster.
+     * </p>
+     *
+     * @param bucketName  Target S3 bucket.
+     * @param objectName  Deterministic path (e.g., job_id/intermediate/part_n.txt).
+     * @param data        Raw text results to be uploaded.
+     * @throws Throwable if the upload is rejected by the storage cluster.
+     */
+    public void writeData(String bucketName, String objectName, String data) throws Throwable {
+        Retry.decorateCheckedRunnable(retryContext, () -> {
+            byte[] dataBytes = data.getBytes(StandardCharsets.UTF_16);
+            logger.debug("Writing {} bytes to s3://{}/{}", dataBytes.length, bucketName, objectName);
+
+            try (InputStream inputStream = new ByteArrayInputStream(dataBytes)) {
+                minioClient.putObject(
+                        PutObjectArgs.builder()
+                                .bucket(bucketName)
+                                .object(objectName)
+                                .stream(inputStream, dataBytes.length, -1)
+                                .contentType("application/json")
+                                .build());
+
+                logger.debug("Successfully wrote object to s3://{}/{}", bucketName, objectName);
+            }
+        }).run();
+    }
+
+    /**
+     * Discovers all intermediate fragments associated with a specific Reduce partition.
+     * <p>
+     * This is the entry point for the <b>Shuffle phase</b>. It performs a recursive
+     * search for all files matching the partition-specific suffix created by
+     * the various Map tasks.
+     * </p>
+     *
+     * @param bucketName     Bucket containing intermediate results.
+     * @param jobId          UUID of the active job.
+     * @param partitionIndex The specific partition (Modulo ID) the worker is reducing.
+     * @return A {@link List} of object keys ready for ingestion.
+     * @throws Throwable if listing permissions are denied or network fails.
+     */
+    public List<String> listIntermediateFiles(String bucketName, String jobId, int partitionIndex) throws Throwable {
+        return Retry.decorateCheckedSupplier(retryContext, () -> {
+            String prefix = jobId + "/intermediate/";
+            String suffix = "_part_" + partitionIndex + ".txt";
+            List<String> matchingObjects = new ArrayList<>();
+
+            Iterable<Result<Item>> results = minioClient.listObjects(
+                    ListObjectsArgs.builder()
+                            .bucket(bucketName)
+                            .prefix(prefix)
+                            .recursive(true)
                             .build());
 
-            logger.debug("Successfully wrote object to s3://{}/{}", bucketName, objectName);
-        } catch (Exception e) {
-            logger.error("Failed to write data to s3://{}/{}", bucketName, objectName, e);
-            throw e;
-        }
-    }
-
-    /**
-     * Scans the intermediate storage directory to identify all partition fragments
-     * produced by various Map tasks that belong to a specific Reducer.
-     * <p>
-     * This method is essential for the Shuffle/Sort boundary. It looks for files
-     * following the deterministic naming convention: <code>[jobId]/intermediate/*_part_[index].txt</code>.
-     * </p>
-     *
-     * @param bucketName     The MinIO bucket containing intermediate job data.
-     * @param jobId          The unique identifier for the current job.
-     * @param partitionIndex The specific partition (0 to R-1) this worker is assigned to reduce.
-     * @return A {@link List} of S3 object keys representing the fragments to be reduced.
-     * @throws Exception If a network error occurs during the listing process.
-     */
-    public List<String> listIntermediateFiles(String bucketName, String jobId, int partitionIndex) throws Exception {
-        String prefix = jobId + "/intermediate/";
-        String suffix = "_part_" + partitionIndex + ".txt";
-        List<String> matchingObjects = new ArrayList<>();
-
-        // We use a recursive listing to capture all map outputs regardless of sub-folder structure
-        Iterable<Result<Item>> results = minioClient.listObjects(
-                ListObjectsArgs.builder()
-                        .bucket(bucketName)
-                        .prefix(prefix)
-                        .recursive(true)
-                        .build());
-
-        for (Result<Item> result : results) {
-            String name = result.get().objectName();
-            if (name.endsWith(suffix)) {
-                matchingObjects.add(name);
+            for (Result<Item> result : results) {
+                String name = result.get().objectName();
+                if (name.endsWith(suffix)) {
+                    matchingObjects.add(name);
+                }
             }
-        }
 
-        logger.info("Discovery phase complete. Found {} intermediate fragments for partition {} in job {}.",
-                matchingObjects.size(), partitionIndex, jobId);
-        return matchingObjects;
+            logger.info("Found {} intermediate fragments for partition {} in job {}.",
+                    matchingObjects.size(), partitionIndex, jobId);
+            return matchingObjects;
+        }).get();
     }
 
     /**
-     * Downloads and reads an entire S3 object into memory as a UTF-8 String.
+     * Retrieves an entire S3 object as a UTF-16 String.
      * <p>
-     * <b>Note:</b> This is intended for intermediate files which are typically
-     * significantly smaller than the original 64MB input chunks.
+     * <b>Warning:</b> This method loads the entire object into memory. It is suitable
+     * for intermediate partitions but should not be used for raw input files.
      * </p>
      *
-     * @param bucketName The source MinIO bucket.
-     * @param objectName The deterministic S3 object key.
-     * @return The raw text content of the intermediate file.
-     * @throws Exception If the file cannot be retrieved or read.
+     * @param bucketName Source bucket.
+     * @param objectName Specific object key.
+     * @return The full text content of the file.
+     * @throws Throwable if the object is too large for memory or retrieval fails.
      */
-    public String readObject(String bucketName, String objectName) throws Exception {
-        try (InputStream stream = minioClient.getObject(
-                GetObjectArgs.builder().bucket(bucketName).object(objectName).build())) {
+    public String readObject(String bucketName, String objectName) throws Throwable {
+        return Retry.decorateCheckedSupplier(retryContext, () -> {
+            try (InputStream stream = minioClient.getObject(
+                    GetObjectArgs.builder().bucket(bucketName).object(objectName).build())) {
 
-            return new String(stream.readAllBytes(), StandardCharsets.UTF_16);
-        }
+                return new String(stream.readAllBytes(), StandardCharsets.UTF_16);
+            }
+        }).get();
     }
 }

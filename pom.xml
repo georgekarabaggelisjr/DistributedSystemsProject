@@ -19,6 +19,7 @@
   <logback.version>1.5.3</logback.version>
   <logstash.version>7.4</logstash.version>
   <jackson.version>2.16.1</jackson.version>
+  <resilience4j.version>2.1.0</resilience4j.version>
   <mockito.version>5.11.0</mockito.version>
   <maven-shade-plugin.version>3.5.2</maven-shade-plugin.version>
 </properties>

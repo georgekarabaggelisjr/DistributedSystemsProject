@@ -27,7 +27,7 @@ import java.net.InetSocketAddress;
  * </p>
  *
  * @author Ilias Bolanakis
- * @version 1.6
+ * @version 1.7
  * @since 2026-03-30
  */
 public class App {
@@ -42,7 +42,7 @@ public class App {
         String rabbitUser = System.getenv().getOrDefault("RABBITMQ_USER", "guest");
         String rabbitPass = System.getenv().getOrDefault("RABBITMQ_PASS", "guest");
         String queueName = System.getenv().getOrDefault("RABBITMQ_QUEUE", "map_tasks_queue");
-        int idleTimeout = Integer.parseInt(System.getenv().getOrDefault("IDLE_TIMEOUT_MILLIS", "60000"));
+        int idleTimeout = Integer.parseInt(System.getenv().getOrDefault("IDLE_TIMEOUT_MILLIS", "5000"));
 
         String minioEndpoint = System.getenv().getOrDefault("MINIO_ENDPOINT", "http://localhost:9000");
         String minioUser = System.getenv().getOrDefault("MINIO_ROOT_USER", "minioadmin");
@@ -96,9 +96,18 @@ public class App {
 
             // 4. Start the event-driven listening loop
             logger.info("Starting RabbitMQ consumer loop...");
+            // The consumer is architected to return once the idle timeout expires
             consumer.startConsuming();
 
-        } catch (Exception e) {
+            // --- AUTONOMOUS TERMINATION ---
+            // Once the loop above finishes (queue empty), we clean up and exit with 0
+            logger.info("Queue empty for configured duration. Shutting down.");
+            healthServer.stop(0);
+
+            logger.info("====== [ Worker Process Complete: Signaling Kubernetes Success ] ======");
+            System.exit(0);
+
+        } catch (Throwable e) { // Catching Throwable to handle Resilience4j/S3 signatures
             logger.error("Worker failed to start due to a critical error.", e);
             System.exit(1);
         }

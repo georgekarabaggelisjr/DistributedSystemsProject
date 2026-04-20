@@ -1,7 +1,9 @@
 <configuration>
     <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
         <encoder class="net.logstash.logback.encoder.LogstashEncoder">
-            <includeMdcKeyName>taskId</includeMdcKeyName>
+            <includeMdcKeyName>job_id</includeMdcKeyName>
+            <includeMdcKeyName>task_id</includeMdcKeyName>
+            <includeMdcKeyName>phase</includeMdcKeyName>
         </encoder>
     </appender>
 
@@ -10,4 +12,5 @@
     </root>
 
     <logger name="com.rabbitmq" level="WARN"/>
+    <logger name="com.amazonaws" level="WARN"/>
 </configuration>

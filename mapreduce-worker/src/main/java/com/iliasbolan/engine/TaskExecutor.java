@@ -16,43 +16,51 @@ import java.util.concurrent.ForkJoinPool;
 /**
  * The central orchestration engine for executing Map-Reduce tasks on the Worker node.
  * <p>
- * This class acts as the bridge between the messaging layer and the computation layer.
- * It is responsible for:
+ * This class acts as the critical bridge between the messaging layer (RabbitMQ) and
+ * the computation layer (JVM Threads). It handles the full lifecycle of a task
+ * execution, ensuring that remote resources are localized and processed via
+ * parallel decomposition.
  * </p>
+ * * <h3>Core Responsibilities:</h3>
  * <ul>
- * <li><b>Deserialization:</b> Converting the raw JSON payload from RabbitMQ into a structured {@link TaskPayload} object using Jackson.</li>
- * <li><b>Resource Acquisition:</b> Utilizing the {@link S3ClientService} to download the designated data chunks and user-compiled code from MinIO.</li>
- * <li><b>Dynamic Execution:</b> Loading the user's logic via Reflection and dispatching the workload to the {@link ForkJoinPool}.</li>
- * <li><b>Output Routing:</b> Passing the intermediate results to the {@link ShufflePartitioner} for proper routing.</li>
+ * <li><b>Deserialization:</b> Converting raw JSON payloads into validated {@link TaskPayload} objects.</li>
+ * <li><b>Resource Acquisition:</b> Coordinating with {@link S3ClientService} to localize bytecode and data.</li>
+ * <li><b>Dynamic Execution:</b> Leveraging Reflection to instantiate user logic at runtime.</li>
+ * <li><b>Parallelism:</b> Dispatching workloads to a shared {@link ForkJoinPool} for multi-core utilization.</li>
  * </ul>
- * * <p>
- * <b>Thread Safety:</b> This executor is designed to be instantiated once per worker and can safely handle
- * sequential task execution within the RabbitMQ consumer's thread.
- * </p>
  *
  * @author Ilias Bolanakis
- * @version 1.0
+ * @version 1.4
+ * @since 2026-04-07
  * @see com.iliasbolan.core.TaskPayload
  * @see com.iliasbolan.engine.MapTaskProcessor
  * @see com.iliasbolan.engine.ShufflePartitioner
- * @since 2026-04-07
  */
 public class TaskExecutor {
 
+    /** Logger instance for tracking task execution and system health. */
     private static final Logger logger = LoggerFactory.getLogger(TaskExecutor.class);
+
+    /** High-performance JSON mapper for processing RabbitMQ message bodies. */
     private static final ObjectMapper objectMapper = new ObjectMapper();
 
+    /** Service for S3-compatible storage interactions. */
     private final S3ClientService s3ClientService;
+
+    /** Shared pool for executing parallelized Map and Reduce operations. */
     private final ForkJoinPool forkJoinPool;
 
     /**
-     * Constructs a new {@code TaskExecutor}.
+     * Constructs a new {@code TaskExecutor} with a shared parallel execution pool.
+     * <p>
+     * Note: This constructor initializes the common {@link ForkJoinPool}, which
+     * automatically scales based on the available processors in the container.
+     * </p>
      *
-     * @param s3ClientService The initialized service for interacting with the MinIO shared file system.
+     * @param s3ClientService The initialized service for S3 storage I/O.
      */
     public TaskExecutor(S3ClientService s3ClientService) {
         this.s3ClientService = s3ClientService;
-        // We use the common pool which automatically sizes itself to the container's available cores!
         this.forkJoinPool = ForkJoinPool.commonPool();
 
         logger.info("Initialized TaskExecutor with parallel ForkJoinPool (Parallelism level: {})",
@@ -60,18 +68,22 @@ public class TaskExecutor {
     }
 
     /**
-     * Parses the incoming JSON message and routes it to the appropriate execution phase (Map or Reduce).
+     * Parses the incoming JSON message and routes it to the correct execution phase.
+     * <p>
+     * This method acts as the primary entry point for the worker loop. It determines
+     * if the workload belongs to a {@code MAP} or {@code REDUCE} phase.
+     * </p>
      *
-     * @param jsonPayload The raw JSON string delivered by RabbitMQ.
-     * @throws Exception If any step of the execution fails (parsing, downloading, processing, or uploading).
-     * This exception is intended to bubble up to the consumer to trigger a NACK.
+     * @param jsonPayload The raw JSON task description delivered by RabbitMQ.
+     * @throws Throwable If any phase of the execution lifecycle fails (I/O, Reflection, or Logic).
+     * Throwing bubbles back to the consumer for message NACKing.
      */
-    public void executeTask(String jsonPayload) throws Exception {
-        // 1. Deserialize the JSON string into our Java Record
+    public void executeTask(String jsonPayload) throws Throwable {
+        // Deserialize the task definition sent by the Manager
         TaskPayload payload = objectMapper.readValue(jsonPayload, TaskPayload.class);
         logger.info("Successfully parsed task payload. JobId: {}, TaskType: {}", payload.jobId(), payload.taskType());
 
-        // 2. Route the task based on its type
+        // Routing logic for the two-phase MapReduce pipeline
         if ("MAP".equalsIgnoreCase(payload.taskType())) {
             executeMapPhase(payload);
         } else if ("REDUCE".equalsIgnoreCase(payload.taskType())) {
@@ -82,27 +94,25 @@ public class TaskExecutor {
     }
 
     /**
-     * Orchestrates the complete lifecycle of a MAP task.
+     * Orchestrates the complete lifecycle of a distributed MAP task.
      * <p>
-     * <b>Execution Flow:</b>
+     * <b>Phase Pipeline:</b>
      * <ol>
-     * <li>Downloads the user's compiled {@code .class} file to a local temporary directory.</li>
-     * <li>Loads the class dynamically using {@link DynamicClassLoader}.</li>
-     * <li>Fetches the exact byte-range (e.g., 64MB chunk) of the input data from MinIO.</li>
-     * <li>Splits the raw text into individual records (lines).</li>
-     * <li>Invokes the {@link MapTaskProcessor} to compute the chunk in parallel.</li>
-     * <li>Passes the results to the {@link ShufflePartitioner} to upload the intermediate files.</li>
+     * <li>Localization: Downloads user bytecode to a managed temporary directory.</li>
+     * <li>Reflection: Instantiates the {@link Mapper} via a custom ClassLoader.</li>
+     * <li>Data Streaming: Fetches boundary-corrected records from S3.</li>
+     * <li>Processing: Invokes {@link MapTaskProcessor} for parallel data transformation.</li>
+     * <li>Shuffle: Hands results to {@link ShufflePartitioner} for intermediate persistence.</li>
      * </ol>
      * </p>
      *
-     * @apiNote Input data files must be encoded in UTF-16. Files with other encodings may result in unexpected character mapping or fragmentation errors.
-     * @param payload The structured data containing all routing and execution metadata.
-     * @throws Exception If any operational boundary fails.
+     * @param payload The metadata required to execute the specific map chunk.
+     * @throws Throwable If an error occurs during resource acquisition or data processing.
      */
-    private void executeMapPhase(TaskPayload payload) throws Exception {
+    private void executeMapPhase(TaskPayload payload) throws Throwable {
         logger.info("--- [ STARTING MAP PHASE: Task {} ] ---", payload.taskId());
 
-        // Step 1: Download User Code (No changes here)
+        // Prepare the local file system for dynamic bytecode loading
         String packagePath = payload.className().replace(".", "/");
         String localCodeDir = "/tmp/mapreduce/usercode/" + payload.jobId() + "/";
         String localCodePath = localCodeDir + packagePath + ".class";
@@ -111,11 +121,10 @@ public class TaskExecutor {
         fileObj.getParentFile().mkdirs();
         s3ClientService.downloadUserCode(payload.userCodeBucket(), payload.userCodeObject(), localCodePath);
 
-        // Step 2: Dynamically load the Mapper (No changes here)
+        // Reflectively load user logic
         Mapper mapper = DynamicClassLoader.loadMapper(localCodeDir, payload.className());
 
-        // Step 3: Fetch the data chunk from MinIO
-        // CHANGE: The variable type is now List<String> instead of String!
+        // S3 Service handles boundary correction (ensuring lines aren't split across chunks)
         List<String> records = s3ClientService.readDataChunk(
                 payload.bucketName(),
                 payload.objectName(),
@@ -123,19 +132,15 @@ public class TaskExecutor {
                 payload.byteLength()
         );
 
-        // Step 4: [REMOVED]
-        // We no longer need to split rawChunkData manually because Step 3 already
-        // returned clean, boundary-corrected records!
         logger.info("Successfully received {} clean records from S3 service.", records.size());
 
-        // Step 5: Execute the Parallel Map Task
-        // We pass the 'records' list directly into the processor
+        // Parallel processing starts here
         MapTaskProcessor rootMapTask = new MapTaskProcessor(records, 0, records.size(), mapper);
         List<KeyValuePair> intermediateResults = forkJoinPool.invoke(rootMapTask);
 
         logger.info("Parallel Map processing complete. Generated {} intermediate pairs.", intermediateResults.size());
 
-        // Step 6: Shuffle and Partition (No changes here)
+        // Distribute results into partitions for the Reducers to pick up
         ShufflePartitioner partitioner = new ShufflePartitioner(
                 s3ClientService,
                 payload.bucketName(),
@@ -149,41 +154,37 @@ public class TaskExecutor {
     }
 
     /**
-     * Orchestrates the complete lifecycle of a REDUCE task with an integrated Sort phase.
+     * Orchestrates the REDUCE task lifecycle with an integrated Sort phase.
      * <p>
-     * <b>Architectural Upgrade:</b><br>
-     * This implementation introduces a deterministic Sort phase between the Data Ingestion
-     * and Parallel Execution stages. By sorting the intermediate keys, we provide
-     * "Total Order" semantics, ensuring the final output files are alphabetically
-     * organized—a requirement for many downstream analytical tools.
+     * Unlike the Map phase, the Reduce phase involves a "Grouping and Sorting" stage
+     * to provide "Total Order" semantics. This ensures that all values for a given
+     * key are processed together and the final output is alphabetically organized.
      * </p>
      *
-     * @param payload The structured data containing all routing and execution metadata.
-     * @throws Exception If any operational boundary fails (I/O, Reflection, or Network).
+     * @param payload The metadata required to aggregate the specific intermediate partition.
+     * @throws Throwable If aggregation or final output persistence fails.
      */
-    private void executeReducePhase(TaskPayload payload) throws Exception {
+    private void executeReducePhase(TaskPayload payload) throws Throwable {
         logger.info("--- [ STARTING REDUCE PHASE: Partition {} for Job {} ] ---", payload.taskId(), payload.jobId());
 
-        // Step 1: Resource Acquisition (User Code) and reconstruct package directories
+        // bytecode localization (standard procedure)
         String packagePath = payload.className().replace(".", "/");
         String localCodeDir = "/tmp/mapreduce/usercode/" + payload.jobId() + "/";
         String localCodePath = localCodeDir + packagePath + ".class";
 
-        // Ensure the nested directories exist before downloading!
         java.io.File fileObj = new java.io.File(localCodePath);
         fileObj.getParentFile().mkdirs();
 
         s3ClientService.downloadUserCode(payload.userCodeBucket(), payload.userCodeObject(), localCodePath);
 
-        // Load Reducer (pointing ClassLoader to the root code dir)
+        // Reflectively load user reducer logic
         Reducer reducer = DynamicClassLoader.loadReducer(localCodeDir, payload.className());
 
-        // Step 2: Fragment Discovery
+        // Identify all intermediate fragments produced by Map workers for this partition
         int partitionIndex = Integer.parseInt(payload.taskId());
         List<String> files = s3ClientService.listIntermediateFiles(payload.bucketName(), payload.jobId(), partitionIndex);
 
-        // Step 3: Data Ingestion & Grouping
-        // We use a HashMap for initial grouping as it provides O(1) insertion performance.
+        // Group intermediate data into a Key -> List<Value> structure
         java.util.Map<String, List<String>> groupedData = new java.util.HashMap<>();
         for (String fileName : files) {
             String content = s3ClientService.readObject(payload.bucketName(), fileName);
@@ -197,30 +198,24 @@ public class TaskExecutor {
             }
         }
 
-        // Step 4: Deterministic Sorting
-        // To enable parallel processing, we convert the map to an ArrayList.
-        // We then apply a Sort to the entire keyset to satisfy Map-Reduce sorting requirements.
+        // Apply a deterministic sort to satisfy standard MapReduce ordering requirements
         logger.info("Sorting {} unique intermediate keys for partition {}...", groupedData.size(), partitionIndex);
-
         List<java.util.Map.Entry<String, List<String>>> sortedEntries = new java.util.ArrayList<>(groupedData.entrySet());
-
-        // Perform an in-place sort using the key's natural (alphabetical) order
         sortedEntries.sort(java.util.Map.Entry.comparingByKey());
 
-        // Step 5: Parallel Execution
-        // The sorted list is now passed to the Fork/Join pool.
-        // Since the list is sorted, each sub-task in the pool handles a contiguous "range" of keys.
+        // Process keys in parallel via the recursive ReduceTaskProcessor
         ReduceTaskProcessor rootReduceTask = new ReduceTaskProcessor(sortedEntries, 0, sortedEntries.size(), reducer);
         List<com.iliasbolan.core.KeyValuePair> finalResults = forkJoinPool.invoke(rootReduceTask);
 
         logger.info("Parallel Reduction complete. Results remain in sorted order.");
 
-        // Step 6: Final Persistence (Output will now be alphabetically sorted by key)
+        // Serialize final results to a tab-delimited format
         StringBuilder outputBuilder = new StringBuilder();
         for (com.iliasbolan.core.KeyValuePair pair : finalResults) {
             outputBuilder.append(pair.key()).append("\t").append(pair.value()).append("\n");
         }
 
+        // Final output path is globally accessible to the Manager for job finalization
         String finalPath = String.format("%s/output/result_part_%d.txt", payload.jobId(), partitionIndex);
         s3ClientService.writeData(payload.bucketName(), finalPath, outputBuilder.toString());
 

@@ -27,6 +27,10 @@ import static org.mockito.Mockito.when;
  * Unit tests for the {@link TaskExecutor}.
  * This verifies the entire Worker orchestration pipeline from JSON deserialization
  * to MinIO interaction, bypassing actual file system and network I/O.
+ * <p>
+ * <b>Fault Tolerance:</b> These tests are updated to accommodate {@link Throwable} signatures
+ * introduced by the Resilience4j refactor in the underlying storage layer.
+ * </p>
  */
 class TaskExecutorTest {
 
@@ -40,8 +44,13 @@ class TaskExecutorTest {
         taskExecutor = new TaskExecutor(mockS3Service);
     }
 
+    /**
+     * Verifies that a successful MAP task correctly orchestrates the full pipeline:
+     * code download, data acquisition, parallel execution, and partitioned upload.
+     * * @throws Throwable to accommodate Resilience4j-wrapped S3 operations.
+     */
     @Test
-    void testExecuteTask_SuccessfulMapPhase_OrchestratesFullPipeline() throws Exception {
+    void testExecuteTask_SuccessfulMapPhase_OrchestratesFullPipeline() throws Throwable {
         // Arrange 1: The JSON Payload
         String jsonPayload = """
                 {
@@ -99,6 +108,10 @@ class TaskExecutorTest {
         verify(mockS3Service, atLeastOnce()).writeData(eq("input-bucket"), anyString(), anyString());
     }
 
+    /**
+     * Ensures that the engine immediately rejects payloads with unknown task types,
+     * allowing the error to bubble up to the messaging layer for proper NACK handling.
+     */
     @Test
     void testExecuteTask_UnknownTaskType_ThrowsException() {
         // Arrange: A payload with a typo in the task type
@@ -114,8 +127,13 @@ class TaskExecutorTest {
         assertThrows(IllegalArgumentException.class, () -> taskExecutor.executeTask(jsonPayload));
     }
 
+    /**
+     * Verifies that a successful REDUCE task correctly orchestrates the Sort phase,
+     * aggregates values by key, and persists the alphabetically ordered output.
+     * * @throws Throwable to accommodate Resilience4j-wrapped S3 operations.
+     */
     @Test
-    void testExecuteTask_SuccessfulReducePhase_OrchestratesFullPipeline() throws Exception {
+    void testExecuteTask_SuccessfulReducePhase_OrchestratesFullPipeline() throws Throwable {
         // Arrange 1: The JSON Payload for a REDUCE task
         String jsonPayload = """
                 {

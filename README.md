@@ -21,6 +21,7 @@ Unlike monolithic processing scripts, this worker operates as a stateless comput
 * **Cloud-Native Graceful Termination:** Implements a background Daemon thread that monitors RabbitMQ queue activity. If idle for a configurable timeout, it gracefully interrupts the main thread, closes TCP sockets, and exits with status 0, saving cloud compute costs.
 * **Idempotent Data Routing:** The `ShufflePartitioner` uses strict `Math.abs(hash) % R` logic to guarantee that identical keys consistently route to identical intermediate S3 objects across thousands of distributed nodes.
 * **Immutable Data Transfer:** Utilizes **Java 17 Records** (`TaskPayload`, `KeyValuePair`) to ensure absolute thread-safety and eliminate race conditions during high-speed parallel grouping.
+* **Worker Termination:** If the worker pod stays inactive for a few seconds it auto-terminates.
 
 ## Tech Stack
 

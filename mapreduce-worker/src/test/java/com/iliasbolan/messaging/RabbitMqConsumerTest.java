@@ -23,6 +23,10 @@ import static org.mockito.Mockito.when;
  * Unit tests for the {@link RabbitMqConsumer}.
  * This verifies the interaction with the RabbitMQ driver, including graceful
  * timeouts, manual acknowledgments (ACK), and error re-queuing (NACK).
+ * <p>
+ * <b>Note:</b> These tests are updated to handle {@link Throwable} signatures
+ * originating from the Resilience4j-wrapped TaskExecutor.
+ * </p>
  */
 class RabbitMqConsumerTest {
 
@@ -43,8 +47,13 @@ class RabbitMqConsumerTest {
         when(mockConnection.createChannel()).thenReturn(mockChannel);
     }
 
+    /**
+     * Verifies that the consumer correctly calculates its idle time and triggers
+     * a clean shutdown of the main thread once the timeout is exceeded.
+     * * @throws Throwable to accommodate the TaskExecutor's updated signatures.
+     */
     @Test
-    void testStartConsuming_IdleTimeout_TriggersCleanShutdown() throws Exception {
+    void testStartConsuming_IdleTimeout_TriggersCleanShutdown() throws Throwable {
         // Arrange: Set a very short timeout of 500ms
         RabbitMqConsumer consumer = new RabbitMqConsumer(mockManager, "test-queue", 500, mockTaskExecutor);
 
@@ -61,8 +70,13 @@ class RabbitMqConsumerTest {
                 "Consumer did not shut down within the expected idle timeout window!");
     }
 
+    /**
+     * Ensures that upon successful task completion, the consumer issues a
+     * positive acknowledgment (ACK) to the broker.
+     * * @throws Throwable to accommodate the TaskExecutor's updated signatures.
+     */
     @Test
-    void testHandleDelivery_SuccessfulTask_SendsAck() throws Exception {
+    void testHandleDelivery_SuccessfulTask_SendsAck() throws Throwable {
         // Arrange
         RabbitMqConsumer consumer = new RabbitMqConsumer(mockManager, "test-queue", 5000, mockTaskExecutor);
 
@@ -89,6 +103,7 @@ class RabbitMqConsumerTest {
         internalRabbitConsumer.handleDelivery("tag", envelope, new AMQP.BasicProperties(), body);
 
         // Assert: Verify it executed the task and sent a positive ACK
+        // verify() must account for executeTask now throwing Throwable
         verify(mockTaskExecutor).executeTask(anyString());
         verify(mockChannel).basicAck(eq(deliveryTag), eq(false));
 
@@ -97,12 +112,18 @@ class RabbitMqConsumerTest {
         consumerThread.join();
     }
 
+    /**
+     * Verifies that if a task fails or a Throwable is caught, the consumer
+     * issues a negative acknowledgment (NACK) with requeue=true.
+     * * @throws Throwable to accommodate the TaskExecutor's updated signatures.
+     */
     @Test
-    void testHandleDelivery_TaskFails_SendsNack() throws Exception {
+    void testHandleDelivery_TaskFails_SendsNack() throws Throwable {
         // Arrange
         RabbitMqConsumer consumer = new RabbitMqConsumer(mockManager, "test-queue", 5000, mockTaskExecutor);
 
         // Make the task executor throw a simulated exception
+        // doThrow handles Throwable appropriately here
         doThrow(new RuntimeException("Simulated processing crash!")).when(mockTaskExecutor).executeTask(anyString());
 
         Thread consumerThread = new Thread(() -> {

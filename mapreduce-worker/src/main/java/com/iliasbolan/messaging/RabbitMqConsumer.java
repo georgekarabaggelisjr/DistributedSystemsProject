@@ -19,30 +19,65 @@ import java.nio.charset.StandardCharsets;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * Manages the connection to the Message Broker (RabbitMQ) and consumes task assignments.
+ * Manages the connection to the Message Broker (RabbitMQ) and orchestrates task consumption.
  * <p>
- * This class serves as the primary lifecycle controller for the Worker node. It connects
- * to the specified RabbitMQ queue, consumes messages asynchronously, and now implements
- * an Enterprise 2-Queue Architecture:
- * 1. Consumes from the Work Queue.
- * 2. Publishes real-time status events to the Audit/Status Queue.
+ * This class serves as the primary lifecycle controller for the Worker node. It implements
+ * an <b>Enterprise 2-Queue Architecture</b>:
  * </p>
+ * <ul>
+ * <li><b>Work Queue (Ingress):</b> Consumes task assignments (Map/Reduce chunks).</li>
+ * <li><b>Status Queue (Egress):</b> Publishes real-time state transitions back to the Manager
+ * node (COMPLETED/FAILED).</li>
+ * </ul>
+ * <p>
+ * <b>Observability:</b> Utilizes SLF4J's Mapped Diagnostic Context (MDC) to ensure all logs
+ * are correlated with specific Job and Task IDs, mirroring the Manager's logging patterns.
+ * </p>
+ * <p>
+ * <b>Elasticity:</b> Features an integrated Idle Checker that monitors message throughput.
+ * If no messages are received within the {@code idleTimeoutMillis} threshold, the consumer
+ * initiates a self-termination sequence to support "Scale-to-Zero" infrastructure.
+ * </p>
+ *
+ * @author Ilias Bolanakis
+ * @version 1.2
+ * @see com.iliasbolan.engine.TaskExecutor
+ * @since 2026-04-07
  */
 public class RabbitMqConsumer {
 
+    /** Logger instance for distributed event tracking. */
     private static final Logger logger = LoggerFactory.getLogger(RabbitMqConsumer.class);
+
+    /** High-performance JSON mapper for metadata extraction. */
     private static final ObjectMapper objectMapper = new ObjectMapper();
 
+    /** Manages the underlying TCP connection to the RabbitMQ cluster. */
     private final RabbitMqConnectionManager connectionManager;
+
+    /** The name of the primary queue containing Map/Reduce task payloads. */
     private final String queueName;
+
+    /** Maximum allowable duration in milliseconds to remain idle before self-termination. */
     private final int idleTimeoutMillis;
+
+    /** The execution engine where consumed tasks are dispatched. */
     private final TaskExecutor taskExecutor;
 
-    // The designated queue for broadcasting progress to George's Master Node
+    /** The designated queue for broadcasting orchestration feedback to the Manager. */
     private final String statusQueueName = "job_events_queue";
 
+    /** Reference to the main thread to facilitate graceful interrupts. */
     private Thread mainThread;
 
+    /**
+     * Constructs a new {@code RabbitMqConsumer} with the specified connection parameters and execution engine.
+     *
+     * @param connectionManager Factory for creating RabbitMQ connections.
+     * @param queueName Target queue for incoming tasks.
+     * @param idleTimeoutMillis Threshold for inactivity-based shutdown.
+     * @param taskExecutor The computation engine for processing tasks.
+     */
     public RabbitMqConsumer(RabbitMqConnectionManager connectionManager, String queueName, int idleTimeoutMillis, TaskExecutor taskExecutor) {
         this.connectionManager = connectionManager;
         this.queueName = queueName;
@@ -53,6 +88,9 @@ public class RabbitMqConsumer {
                 queueName, statusQueueName, idleTimeoutMillis);
     }
 
+    /**
+     * Initiates a clean shutdown of the consumer by interrupting the main processing thread.
+     */
     public void stopConsuming() {
         if (this.mainThread != null) {
             logger.info("Interrupting main consumer thread to initiate clean shutdown...");
@@ -60,15 +98,31 @@ public class RabbitMqConsumer {
         }
     }
 
+    /**
+     * Establishes the message broker connection and enters the primary consumption loop.
+     * <p>
+     * This method:
+     * <ol>
+     * <li>Declares necessary queue topology.</li>
+     * <li>Configures Quality of Service (QoS) to prevent worker over-subscription.</li>
+     * <li>Registers an asynchronous callback for incoming deliveries.</li>
+     * <li>Launches a daemon thread to monitor for idle-based termination.</li>
+     * </ol>
+     * </p>
+     *
+     * @throws Exception If the broker is unreachable or queue declaration fails.
+     */
     public void startConsuming() throws Exception {
         this.mainThread = Thread.currentThread();
 
         try (Connection connection = connectionManager.createConnection();
              Channel channel = connection.createChannel()) {
 
-            // 1. Declare both the Work Queue and the Status Queue
+            // Ensure the messaging fabric is durable and ready
             channel.queueDeclare(queueName, true, false, false, null);
             channel.queueDeclare(statusQueueName, true, false, false, null);
+
+            // CRITICAL: Prefetch(1) ensures load balancing is fair and pods don't hoard messages
             channel.basicQos(1);
 
             logger.info("Successfully connected to RabbitMQ. Waiting for messages on queue: '{}'.", queueName);
@@ -82,53 +136,67 @@ public class RabbitMqConsumer {
                     String messageBody = new String(body, StandardCharsets.UTF_8);
                     long deliveryTag = envelope.getDeliveryTag();
 
-                    // Safely extract identifying info for our status updates
+                    // Extract correlation metadata for logging and status reporting
                     String jobId = "UNKNOWN";
                     String taskId = "UNKNOWN";
+                    String phase = "UNKNOWN";
                     try {
                         JsonNode jsonNode = objectMapper.readTree(messageBody);
                         jobId = jsonNode.path("jobId").asText("UNKNOWN");
                         taskId = jsonNode.path("taskId").asText("UNKNOWN");
+                        phase = jsonNode.path("taskType").asText("UNKNOWN");
                     } catch (Exception e) {
                         logger.warn("Could not parse JSON payload to extract Job/Task IDs for status reporting.", e);
                     }
 
-                    try (MDC.MDCCloseable mdc = MDC.putCloseable("deliveryTag", String.valueOf(deliveryTag))) {
+                    try {
+                        // Apply MDC tags for log correlation (EFK/Loki/Splunk compatible)
+                        MDC.put("job_id", jobId);
+                        MDC.put("task_id", taskId);
+                        MDC.put("phase", phase);
+                        MDC.put("delivery_tag", String.valueOf(deliveryTag));
+
                         logger.info("Received Task Payload: {}", messageBody);
 
                         try {
-                            // 1. Execute the actual Map/Reduce Work
+                            // Dispatch task to the execution engine
                             taskExecutor.executeTask(messageBody);
 
-                            // 2. Publish the "COMPLETED" Event to the Status Queue
+                            // Notify the Manager of a successful completion
                             String successEvent = String.format("{\"jobId\": \"%s\", \"taskId\": \"%s\", \"state\": \"COMPLETED\"}", jobId, taskId);
                             channel.basicPublish("", statusQueueName, null, successEvent.getBytes(StandardCharsets.UTF_8));
 
-                            // 3. ACK the Work Queue
+                            // Acknowledge the message only after successful persistence of results
                             channel.basicAck(deliveryTag, false);
                             logger.info("Task successfully processed, event broadcasted, and ACK sent.");
 
-                        } catch (Exception e) {
-                            logger.error("Critical error processing task. Sending FAILED event and NACKing.", e);
+                        } catch (Throwable t) {
+                            logger.error("Critical error processing task. Sending FAILED event and NACKing.", t);
 
-                            // 2. Publish the "FAILED" Event to the Status Queue
+                            // Notify the Manager of the failure to trigger remediation
                             String failedEvent = String.format("{\"jobId\": \"%s\", \"taskId\": \"%s\", \"state\": \"FAILED\", \"error\": \"%s\"}",
-                                    jobId, taskId, e.getClass().getSimpleName());
+                                    jobId, taskId, t.getClass().getSimpleName());
                             channel.basicPublish("", statusQueueName, null, failedEvent.getBytes(StandardCharsets.UTF_8));
 
-                            // 3. NACK the Work Queue
+                            // Negative Acknowledgment (NACK) with requeue=true
                             channel.basicNack(deliveryTag, false, true);
                         }
+                    } finally {
+                        // CRITICAL: Clear MDC context to prevent data bleeding between tasks
+                        MDC.clear();
                     }
                 }
             };
 
+            // Register the consumer with manual acknowledgments enabled
             channel.basicConsume(queueName, false, consumer);
 
+            // Startup the idle watcher daemon
             Thread idleChecker = getThread(lastActivity);
             idleChecker.start();
 
             try {
+                // Keep the main thread alive until interrupted
                 Thread.currentThread().join();
             } catch (InterruptedException e) {
                 logger.warn("Main consumer thread interrupted. Releasing RabbitMQ resources...", e);
@@ -137,6 +205,12 @@ public class RabbitMqConsumer {
         }
     }
 
+    /**
+     * Creates a daemon thread that monitors inactivity and triggers shutdown.
+     *
+     * @param lastActivity Atomic timestamp of the last message delivery.
+     * @return A configured daemon Thread.
+     */
     @NotNull
     private Thread getThread(AtomicLong lastActivity) {
         Thread idleChecker = new Thread(() -> {
@@ -150,6 +224,7 @@ public class RabbitMqConsumer {
                         stopConsuming();
                         break;
                     } else {
+                        // Adaptive sleep to reduce CPU polling overhead
                         Thread.sleep(remainingToWait);
                     }
                 }
@@ -159,7 +234,7 @@ public class RabbitMqConsumer {
             }
         });
 
-        idleChecker.setDaemon(true);
+        idleChecker.setDaemon(true); // Ensure this thread doesn't prevent JVM shutdown
         return idleChecker;
     }
 }
