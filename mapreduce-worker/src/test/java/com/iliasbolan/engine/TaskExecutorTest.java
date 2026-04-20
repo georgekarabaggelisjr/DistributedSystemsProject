@@ -11,6 +11,7 @@ import org.mockito.MockedStatic;
 import org.mockito.Mockito;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -58,10 +59,13 @@ class TaskExecutorTest {
                 }
                 """;
 
-        // Arrange 2: Tell the fake MinIO what to return when the engine asks for the 64MB chunk
-        String fakeFileChunk = "hello distributed systems\nhello george";
+        // Arrange 2: Tell the fake MinIO what to return
+        List<String> fakeFileRecords = Arrays.asList(
+                "hello distributed systems",
+                "hello george"
+        );
         when(mockS3Service.readDataChunk(eq("input-bucket"), eq("data.txt"), anyLong(), anyLong()))
-                .thenReturn(fakeFileChunk);
+                .thenReturn(fakeFileRecords);
 
         // Arrange 3: A dummy Mapper so we don't need a real .class file
         Mapper dummyMapper = (key, value) -> {

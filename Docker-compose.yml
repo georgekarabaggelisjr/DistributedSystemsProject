@@ -1,4 +1,18 @@
 services:
+  # 1. PostgreSQL (For the Manager Service)
+  postgres-service:
+    image: postgres:15-alpine
+    container_name: local-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: DisSami2026!
+      POSTGRES_DB: dds_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  # 2. MinIO (For both Manager and Worker)
   minio:
     image: minio/minio:latest
     container_name: local-minio
@@ -6,17 +20,19 @@ services:
       - "9000:9000" # S3 API Port
       - "9001:9001" # Web Console Port
     environment:
+      # Using the credentials expected by your Java Worker
       - MINIO_ROOT_USER=minioadmin
       - MINIO_ROOT_PASSWORD=minioadmin
     command: server /data --console-address ":9001"
     volumes:
       - minio_data:/data
 
+  # 3. RabbitMQ (For both Manager and Worker)
   rabbitmq:
     image: rabbitmq:3-management
     container_name: local-rabbitmq
     ports:
-      - "5672:5672"   # AMQP protocol port (Java Worker connects here)
+      - "5672:5672"   # AMQP protocol port
       - "15672:15672" # Web Management UI port
     environment:
       - RABBITMQ_DEFAULT_USER=guest
@@ -25,5 +41,6 @@ services:
       - rabbitmq_data:/var/lib/rabbitmq
 
 volumes:
+  postgres_data:
   minio_data:
   rabbitmq_data:

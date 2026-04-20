@@ -21,9 +21,13 @@ class MapTaskProcessorTest {
      */
     private final Mapper dummyWordCountMapper = (key, value) -> {
         List<KeyValuePair> results = new ArrayList<>();
-        String[] words = value.split("\\s+");
+        // Replace invalid characters with a space instead of deleting them to prevent empty outputs
+        String cleanValue = value.replaceAll("[^a-zA-Z0-9 ]", " ");
+        String[] words = cleanValue.split("\\s+");
         for (String word : words) {
-            results.add(new KeyValuePair(word, "1"));
+            if (!word.trim().isEmpty()) {
+                results.add(new KeyValuePair(word, "1"));
+            }
         }
         return results;
     };

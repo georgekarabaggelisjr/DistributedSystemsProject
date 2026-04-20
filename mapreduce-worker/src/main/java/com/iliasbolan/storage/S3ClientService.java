@@ -6,6 +6,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -77,32 +78,84 @@ public class S3ClientService {
     }
 
     /**
-     * Reads a specific chunk of data from a large input file.
+     * Reads a specific chunk of data from a large UTF-16 input file, applying MapReduce
+     * boundary-correction rules to prevent splitting words across chunks.
      *
      * @param bucketName The name of the bucket containing the input data.
      * @param objectName The S3 object key of the input file.
      * @param offset     The starting byte position of the chunk.
-     * @param length     The total number of bytes to read (e.g., 67108864 for 64MB).
-     * @return A {@link String} containing the raw text data of the chunk.
-     * @throws Exception If the byte-range request fails.
+     * @param length     The total target bytes to read.
+     * @return A List of perfectly aligned text records.
+     * @throws Exception If the stream fails.
      */
-    public String readDataChunk(String bucketName, String objectName, long offset, long length) throws Exception {
-        logger.debug("Requesting data chunk from s3://{}/{}. Offset: {}, Length: {} bytes", bucketName, objectName, offset, length);
+    public List<String> readDataChunk(String bucketName, String objectName, long offset, long length) throws Exception {
+        // Verify this appears in your 'kubectl logs' to ensure new code is running
+        logger.info(" Offset: {}, Target Length: {} bytes", offset, length);
+
+        List<String> cleanRecords = new ArrayList<>();
 
         try (InputStream stream = minioClient.getObject(
                 GetObjectArgs.builder()
                         .bucket(bucketName)
                         .object(objectName)
                         .offset(offset)
-                        .length(length)
                         .build())) {
 
-            String chunkData = new String(stream.readAllBytes(), StandardCharsets.UTF_8);
-            logger.debug("Successfully read data chunk from MinIO.");
-            return chunkData;
+            // --- SYNCHRONIZE AND DISCARD FRAGMENT ---
+            // If offset > 0, we are likely mid-word or mid-character.
+            // We skip every byte until we hit 0x0A (the newline anchor).
+            if (offset > 0) {
+                int b;
+                long skipCount = 0;
+                while ((b = stream.read()) != -1) {
+                    skipCount++;
+                    if (b == 0x0A) break;
+                }
+                logger.debug("Skipped {} bytes to reach first clean boundary.", skipCount);
+            }
+
+            // --- READ UNTIL LENGTH FULFILLED AND LINE FINISHED ---
+            ByteArrayOutputStream lineBuffer = new ByteArrayOutputStream();
+            long bytesProcessedInChunk = 0;
+            int b;
+
+            while ((b = stream.read()) != -1) {
+                bytesProcessedInChunk++;
+                lineBuffer.write(b);
+
+                // We treat 0x0A as the definitive end-of-line marker
+                if (b == 0x0A) {
+                    // Decode the buffer. StandardCharsets.UTF_16 handles the BOM if present,
+                    // but since we skipped the start of the file, it will rely on default endianness.
+                    String line = new String(lineBuffer.toByteArray(), StandardCharsets.UTF_16).trim();
+
+                    if (!line.isEmpty()) {
+                        cleanRecords.add(line);
+                    }
+                    lineBuffer.reset();
+
+                    // STOPPING CONDITION:
+                    // We must have read at least 'length' bytes AND finished a full line.
+                    if (bytesProcessedInChunk >= length) {
+                        logger.info("Fulfilled quota ({} bytes). Closing stream.", bytesProcessedInChunk);
+                        break;
+                    }
+                }
+            }
+
+            // Handle the final line if the file doesn't end with a newline
+            if (lineBuffer.size() > 0) {
+                String lastLine = new String(lineBuffer.toByteArray(), StandardCharsets.UTF_16).trim();
+                if (!lastLine.isEmpty()) {
+                    cleanRecords.add(lastLine);
+                }
+            }
+
+            logger.info("Processing complete. Records parsed: {}", cleanRecords.size());
+            return cleanRecords;
 
         } catch (Exception e) {
-            logger.error("Failed to read data chunk from s3://{}/{}. Offset: {}, Length: {}", bucketName, objectName, offset, length, e);
+            logger.error("Reader Failure at offset {}: {}", offset, e.getMessage());
             throw e;
         }
     }
@@ -116,7 +169,7 @@ public class S3ClientService {
      * @throws Exception If the upload fails.
      */
     public void writeData(String bucketName, String objectName, String data) throws Exception {
-        byte[] dataBytes = data.getBytes(StandardCharsets.UTF_8);
+        byte[] dataBytes = data.getBytes(StandardCharsets.UTF_16);
         logger.debug("Writing {} bytes to s3://{}/{}", dataBytes.length, bucketName, objectName);
 
         try (InputStream inputStream = new ByteArrayInputStream(dataBytes)) {
@@ -190,7 +243,7 @@ public class S3ClientService {
         try (InputStream stream = minioClient.getObject(
                 GetObjectArgs.builder().bucket(bucketName).object(objectName).build())) {
 
-            return new String(stream.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+            return new String(stream.readAllBytes(), StandardCharsets.UTF_16);
         }
     }
 }

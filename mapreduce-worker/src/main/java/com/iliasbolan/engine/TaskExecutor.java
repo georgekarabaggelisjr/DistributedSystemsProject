@@ -101,40 +101,40 @@ public class TaskExecutor {
     private void executeMapPhase(TaskPayload payload) throws Exception {
         logger.info("--- [ STARTING MAP PHASE: Task {} ] ---", payload.taskId());
 
-        // Step 1: Download User Code and reconstruct package directories
+        // Step 1: Download User Code (No changes here)
         String packagePath = payload.className().replace(".", "/");
         String localCodeDir = "/tmp/mapreduce/usercode/" + payload.jobId() + "/";
         String localCodePath = localCodeDir + packagePath + ".class";
 
-        // Ensure the nested directories exist before downloading!
         java.io.File fileObj = new java.io.File(localCodePath);
         fileObj.getParentFile().mkdirs();
-
         s3ClientService.downloadUserCode(payload.userCodeBucket(), payload.userCodeObject(), localCodePath);
 
-        // Step 2: Dynamically load the Mapper (pointing ClassLoader to the root code dir)
+        // Step 2: Dynamically load the Mapper (No changes here)
         Mapper mapper = DynamicClassLoader.loadMapper(localCodeDir, payload.className());
 
         // Step 3: Fetch the data chunk from MinIO
-        String rawChunkData = s3ClientService.readDataChunk(
+        // CHANGE: The variable type is now List<String> instead of String!
+        List<String> records = s3ClientService.readDataChunk(
                 payload.bucketName(),
                 payload.objectName(),
                 payload.byteOffset(),
                 payload.byteLength()
         );
 
-        // Step 4: Split the raw text into individual lines (records)
-        // Using \r?\n handles both Windows and Linux line endings safely
-        List<String> records = Arrays.asList(rawChunkData.split("\\r?\\n"));
-        logger.info("Successfully split chunk into {} records.", records.size());
+        // Step 4: [REMOVED]
+        // We no longer need to split rawChunkData manually because Step 3 already
+        // returned clean, boundary-corrected records!
+        logger.info("Successfully received {} clean records from S3 service.", records.size());
 
         // Step 5: Execute the Parallel Map Task
+        // We pass the 'records' list directly into the processor
         MapTaskProcessor rootMapTask = new MapTaskProcessor(records, 0, records.size(), mapper);
         List<KeyValuePair> intermediateResults = forkJoinPool.invoke(rootMapTask);
 
         logger.info("Parallel Map processing complete. Generated {} intermediate pairs.", intermediateResults.size());
 
-        // Step 6: Shuffle and Partition
+        // Step 6: Shuffle and Partition (No changes here)
         ShufflePartitioner partitioner = new ShufflePartitioner(
                 s3ClientService,
                 payload.bucketName(),

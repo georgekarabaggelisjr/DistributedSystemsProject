@@ -5,8 +5,9 @@ import io.minio.MinioClient;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertNotNull;
+import java.util.List;
+
+import static org.junit.jupiter.api.Assertions.*;
 
 /**
  * Integration tests for the {@link S3ClientService}.
@@ -40,20 +41,24 @@ class S3ClientServiceIntegrationTest {
 
     @Test
     void testWriteAndReadDataChunk_SuccessfulRoundTrip() throws Exception {
-        // Arrange
+        // Arrange: Use newlines so the Record Reader has boundaries to work with.
+        // In UTF-16, each character (including \n) is 2 bytes.
         String objectName = "test-job/chunk-test.txt";
-        // Write exactly 26 bytes (the alphabet)
-        String testData = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        String testData = "A\nB\nC\nD\nE\nF\nG\nH\nI\nJ\nK\nL";
 
         // Act 1: Write the data to MinIO
         s3ClientService.writeData(TEST_BUCKET, objectName, testData);
 
-        // Act 2: Read only a specific "chunk" back.
-        // Ask for 5 bytes starting at offset 5. (Should return "FGHIJ")
-        String chunk = s3ClientService.readDataChunk(TEST_BUCKET, objectName, 5, 5);
+        // Act 2: Read the chunk.
+        // Note: Rule #1 will skip everything until the first \n AFTER the offset.
+        // If we want to start at 'F', we set the offset to point into 'E'.
+        List<String> records = s3ClientService.readDataChunk(TEST_BUCKET, objectName, 18, 20);
 
         // Assert
-        assertNotNull(chunk);
-        assertEquals("FGHIJ", chunk, "The byte-range chunk downloaded from MinIO did not match the expected offset!");
+        assertNotNull(records);
+        assertFalse(records.isEmpty(), "No records were parsed from the chunk!");
+
+        // Check if the first clean record after our offset/skip logic is "F"
+        assertEquals("F", records.get(0), "The first record did not match expected alignment!");
     }
 }
