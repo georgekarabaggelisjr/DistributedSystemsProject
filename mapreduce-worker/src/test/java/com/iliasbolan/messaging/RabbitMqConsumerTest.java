@@ -148,4 +148,56 @@ class RabbitMqConsumerTest {
         consumer.stopConsuming();
         consumerThread.join();
     }
+
+    /**
+     * Verifies the Poison Pill protection mechanism. If a task exceeds the MAX_RETRIES
+     * threshold, it should be NACKed with requeue=false (sending it to the DLX)
+     * and a FAILED status event should be broadcasted to the Manager.
+     * * @throws Throwable to accommodate the TaskExecutor's updated signatures.
+     */
+    @Test
+    void testHandleDelivery_PoisonPill_SendsNackWithoutRequeue() throws Throwable {
+        // Arrange
+        RabbitMqConsumer consumer = new RabbitMqConsumer(mockManager, "test-queue", 5000, mockTaskExecutor);
+
+        Thread consumerThread = new Thread(() -> {
+            try { consumer.startConsuming(); } catch (Exception ignored) {}
+        });
+        consumerThread.start();
+        Thread.sleep(100);
+
+        ArgumentCaptor<Consumer> consumerCaptor = ArgumentCaptor.forClass(Consumer.class);
+        verify(mockChannel).basicConsume(eq("test-queue"), eq(false), consumerCaptor.capture());
+        Consumer internalRabbitConsumer = consumerCaptor.getValue();
+
+        long deliveryTag = 8888L;
+        Envelope envelope = new Envelope(deliveryTag, false, "exchange", "routingKey");
+        byte[] body = "{\"jobId\":\"poison-job\", \"taskId\":\"map-1\"}".getBytes(StandardCharsets.UTF_8);
+
+        // Simulate x-delivery-count header = 4 (Exceeding MAX_RETRIES = 3)
+        java.util.Map<String, Object> headers = new java.util.HashMap<>();
+        headers.put("x-delivery-count", 4);
+        AMQP.BasicProperties properties = new AMQP.BasicProperties.Builder()
+                .headers(headers)
+                .build();
+
+        // Act
+        internalRabbitConsumer.handleDelivery("tag", envelope, properties, body);
+
+        // Assert: Ensure it was NACKed with requeue=FALSE (to be routed to DLX)
+        verify(mockChannel).basicNack(eq(deliveryTag), eq(false), eq(false));
+
+        // Assert: Ensure a FAILED event was published back to the status queue
+        ArgumentCaptor<byte[]> publishCaptor = ArgumentCaptor.forClass(byte[].class);
+        verify(mockChannel).basicPublish(eq(""), eq("job_events_queue"), isNull(), publishCaptor.capture());
+        String publishedEvent = new String(publishCaptor.getValue(), StandardCharsets.UTF_8);
+        assertTrue(publishedEvent.contains("\"state\": \"FAILED\""));
+        assertTrue(publishedEvent.contains("MAX_RETRIES_EXCEEDED"));
+
+        // Assert: Ensure the TaskExecutor was completely bypassed for poison pills
+        verify(mockTaskExecutor, Mockito.never()).executeTask(anyString());
+
+        consumer.stopConsuming();
+        consumerThread.join();
+    }
 }
