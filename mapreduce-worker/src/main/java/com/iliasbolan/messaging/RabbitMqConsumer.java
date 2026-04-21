@@ -16,6 +16,7 @@ import org.slf4j.MDC;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -38,9 +39,14 @@ import java.util.concurrent.atomic.AtomicLong;
  * If no messages are received within the {@code idleTimeoutMillis} threshold, the consumer
  * initiates a self-termination sequence to support "Scale-to-Zero" infrastructure.
  * </p>
+ * <p>
+ * <b>Poison Pill Protection:</b> Implements a Max Retry Limit. If a specific data chunk causes
+ * repeated JVM failures or logic errors, the consumer will eventually discard the message
+ * after {@code MAX_RETRIES} to prevent infinite loops and resource exhaustion.
+ * </p>
  *
  * @author Ilias Bolanakis
- * @version 1.2
+ * @version 1.3
  * @see com.iliasbolan.engine.TaskExecutor
  * @since 2026-04-07
  */
@@ -51,6 +57,9 @@ public class RabbitMqConsumer {
 
     /** High-performance JSON mapper for metadata extraction. */
     private static final ObjectMapper objectMapper = new ObjectMapper();
+
+    /** Maximum number of times a task can be requeued before being discarded. */
+    private static final int MAX_RETRIES = 3;
 
     /** Manages the underlying TCP connection to the RabbitMQ cluster. */
     private final RabbitMqConnectionManager connectionManager;
@@ -136,6 +145,9 @@ public class RabbitMqConsumer {
                     String messageBody = new String(body, StandardCharsets.UTF_8);
                     long deliveryTag = envelope.getDeliveryTag();
 
+                    // 1. Determine current delivery attempt (supports Quorum Queues x-delivery-count)
+                    long deliveryCount = getDeliveryCount(properties);
+
                     // Extract correlation metadata for logging and status reporting
                     String jobId = "UNKNOWN";
                     String taskId = "UNKNOWN";
@@ -155,8 +167,21 @@ public class RabbitMqConsumer {
                         MDC.put("task_id", taskId);
                         MDC.put("phase", phase);
                         MDC.put("delivery_tag", String.valueOf(deliveryTag));
+                        MDC.put("retry_count", String.valueOf(deliveryCount));
 
-                        logger.info("Received Task Payload: {}", messageBody);
+                        // 2. CHECK FOR POISON PILL: If we exceeded max retries, fail terminal
+                        if (deliveryCount > MAX_RETRIES) {
+                            logger.error("Poison Pill Detected! Task exceeded MAX_RETRIES ({}). Discarding message.", MAX_RETRIES);
+
+                            String failedEvent = String.format("{\"jobId\": \"%s\", \"taskId\": \"%s\", \"state\": \"FAILED\", \"error\": \"MAX_RETRIES_EXCEEDED\"}", jobId, taskId);
+                            channel.basicPublish("", statusQueueName, null, failedEvent.getBytes(StandardCharsets.UTF_8));
+
+                            // NACK with requeue=false to remove it from the fabric
+                            channel.basicNack(deliveryTag, false, false);
+                            return;
+                        }
+
+                        logger.info("Received Task Payload (Attempt {}/{}): {}", deliveryCount, MAX_RETRIES, messageBody);
 
                         try {
                             // Dispatch task to the execution engine
@@ -171,14 +196,14 @@ public class RabbitMqConsumer {
                             logger.info("Task successfully processed, event broadcasted, and ACK sent.");
 
                         } catch (Throwable t) {
-                            logger.error("Critical error processing task. Sending FAILED event and NACKing.", t);
+                            logger.error("Critical error processing task. Sending FAILED event and NACKing for requeue.", t);
 
                             // Notify the Manager of the failure to trigger remediation
                             String failedEvent = String.format("{\"jobId\": \"%s\", \"taskId\": \"%s\", \"state\": \"FAILED\", \"error\": \"%s\"}",
                                     jobId, taskId, t.getClass().getSimpleName());
                             channel.basicPublish("", statusQueueName, null, failedEvent.getBytes(StandardCharsets.UTF_8));
 
-                            // Negative Acknowledgment (NACK) with requeue=true
+                            // Negative Acknowledgment (NACK) with requeue=true to allow another pod to try
                             channel.basicNack(deliveryTag, false, true);
                         }
                     } finally {
@@ -203,6 +228,19 @@ public class RabbitMqConsumer {
                 Thread.currentThread().interrupt();
             }
         }
+    }
+
+    /**
+     * Extracts the delivery count from RabbitMQ headers.
+     * * @param properties The message properties containing headers.
+     * @return The current delivery count, defaults to 1 if not present.
+     */
+    private long getDeliveryCount(AMQP.BasicProperties properties) {
+        Map<String, Object> headers = properties.getHeaders();
+        if (headers != null && headers.containsKey("x-delivery-count")) {
+            return ((Number) headers.get("x-delivery-count")).longValue();
+        }
+        return 1;
     }
 
     /**
