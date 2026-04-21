@@ -127,6 +127,10 @@ public class RabbitMqConsumer {
         try (Connection connection = connectionManager.createConnection();
              Channel channel = connection.createChannel()) {
 
+            // Match the DLX arguments from the manager service
+            java.util.Map<String, Object> queueArgs = new java.util.HashMap<>();
+            queueArgs.put("x-dead-letter-exchange", "dead_letter_exchange");
+
             // Ensure the messaging fabric is durable and ready
             channel.queueDeclare(queueName, true, false, false, null);
             channel.queueDeclare(statusQueueName, true, false, false, null);
