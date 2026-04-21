@@ -132,7 +132,8 @@ public class RabbitMqConsumer {
             queueArgs.put("x-dead-letter-exchange", "dead_letter_exchange");
 
             // Ensure the messaging fabric is durable and ready
-            channel.queueDeclare(queueName, true, false, false, null);
+            // Pass queueArgs to the main queue
+            channel.queueDeclare(queueName, true, false, false, queueArgs);
             channel.queueDeclare(statusQueueName, true, false, false, null);
 
             // CRITICAL: Prefetch(1) ensures load balancing is fair and pods don't hoard messages
