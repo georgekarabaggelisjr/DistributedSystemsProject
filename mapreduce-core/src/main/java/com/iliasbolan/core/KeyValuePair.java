@@ -17,7 +17,7 @@ package com.iliasbolan.core;
  *
  * @param key   The key associated with the intermediate or final data record.
  * @param value The value associated with the intermediate or final data record.
- * * @author Ilias Bolanakis
+ * @author Ilias Bolanakis
  * @version 1.1
  * @since 2026-03-30
  */
