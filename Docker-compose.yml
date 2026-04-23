@@ -11,6 +11,9 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      # --- Map the initialization script ---
+      # This assumes mapreduce-node and mapreduce-manager are in the same parent folder (IdeaProjects)
+      - ../mapreduce-manager/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql
 
   # 2. MinIO (For both Manager and Worker)
   minio:
@@ -39,6 +42,13 @@ services:
       - RABBITMQ_DEFAULT_PASS=guest
     volumes:
       - rabbitmq_data:/var/lib/rabbitmq
+
+  # 4. Redis (For high-throughput phase barrier counting)
+  local-redis:
+    image: redis:7-alpine
+    container_name: local-redis
+    ports:
+      - "6379:6379"
 
 volumes:
   postgres_data:

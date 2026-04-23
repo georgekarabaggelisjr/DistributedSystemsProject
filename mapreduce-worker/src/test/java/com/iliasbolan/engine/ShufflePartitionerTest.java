@@ -1,101 +1,120 @@
 package com.iliasbolan.engine;
 
 import com.iliasbolan.core.KeyValuePair;
-import com.iliasbolan.storage.S3ClientService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import org.mockito.ArgumentCaptor;
-import org.mockito.Mockito;
+import org.junit.jupiter.api.io.TempDir;
 
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.mockito.ArgumentMatchers.anyString;
-import static org.mockito.ArgumentMatchers.eq;
-import static org.mockito.Mockito.times;
-import static org.mockito.Mockito.verify;
 
 /**
  * Unit tests for the {@link ShufflePartitioner}.
- * This verifies that the intermediate data is correctly hashed, partitioned,
- * and serialized before being uploaded to the shared file system.
+ * <p>
+ * This suite verifies that intermediate data is correctly hashed, partitioned,
+ * and persisted to the local file system. It ensures the integrity of the
+ * directory structure and serialization format required for the P2P Shuffle phase.
+ * </p>
+ * <p>
+ * <b>Peer-to-Peer (P2P) Architecture Update:</b><br>
+ * These tests have been refactored to validate local disk persistence. Instead of
+ * mocking a remote S3 service, the suite utilizes JUnit 5's <code>@TempDir</code>
+ * to perform real I/O operations in a safe, isolated temporary environment.
+ * </p>
+ *
+ * @author Ilias Bolanakis
+ * @version 2.0
+ * @see com.iliasbolan.engine.ShufflePartitioner
  */
 class ShufflePartitionerTest {
 
-    private S3ClientService mockS3Service;
     private ShufflePartitioner partitioner;
-    private final String testBucket = "test-bucket";
     private final String testJobId = "job-123";
     private final String testMapId = "map-001";
+    private String baseShuffleDir;
+
+    /**
+     * Utilizes JUnit 5's {@code @TempDir} to provide a safe, isolated directory
+     * for testing local P2P shuffle persistence without manual cleanup.
+     */
+    @TempDir
+    Path tempDir;
 
     @BeforeEach
     void setUp() {
-        // Create a mock S3 service to avoid real network I/O
-        mockS3Service = Mockito.mock(S3ClientService.class);
+        // Set the base directory for local shuffle data
+        baseShuffleDir = tempDir.toString();
 
-        // Initialize the partitioner with 3 target Reducers
+        // Initialize the partitioner with 3 target Reducers (R=3)
+        // Constructor now accepts baseShuffleDir instead of S3ClientService
         partitioner = new ShufflePartitioner(
-                mockS3Service, testBucket, testJobId, testMapId, 3
+                baseShuffleDir, testJobId, testMapId, 3
         );
     }
 
     /**
      * Verifies that the partitioner correctly groups identical keys and skips
-     * generating files for partitions that receive no data.
-     * * @throws Throwable to accommodate Resilience4j-powered S3 signatures.
+     * generating directories for partitions that receive no data.
+     * * @throws IOException If a file system error occurs during the partitioning process.
      */
     @Test
-    void testPartitionAndUpload_CorrectlyGroupsKeysAndSkipsEmptyPartitions() throws Throwable {
+    void testPartitionAndWriteLocal_CorrectlyGroupsKeysAndSkipsEmptyPartitions() throws IOException {
         // Arrange: "apple" and "banana" will hash to specific partitions.
-        // Include "apple" twice to ensure they end up in the same file.
+        // Include "apple" twice to ensure they end up in the same local file.
         List<KeyValuePair> intermediateData = List.of(
                 new KeyValuePair("apple", "1"),
                 new KeyValuePair("banana", "1"),
                 new KeyValuePair("apple", "1")
         );
 
-        // Act
-        partitioner.partitionAndUpload(intermediateData);
+        // Act: Invoke the local write logic
+        partitioner.partitionAndWriteLocal(intermediateData);
 
         // Assert:
-        // 1. We have 3 reducers but only 2 unique keys.
-        // Verification: writeData should be called exactly 2 times (skipping the empty partition).
-        verify(mockS3Service, times(2)).writeData(eq(testBucket), anyString(), anyString());
+        // 1. Verify that only directories for active partitions were created
+        // We have 3 reducers, but we only expect directories for the partitions
+        // determined by the hash(key) % 3 logic.
+        int applePartition = Math.abs("apple".hashCode()) % 3;
+        int bananaPartition = Math.abs("banana".hashCode()) % 3;
 
-        // 2. Use ArgumentCaptor to inspect the serialized content sent to S3
-        ArgumentCaptor<String> contentCaptor = ArgumentCaptor.forClass(String.class);
-        verify(mockS3Service, times(2)).writeData(eq(testBucket), anyString(), contentCaptor.capture());
+        Path applePath = tempDir.resolve(testJobId).resolve(String.valueOf(applePartition)).resolve(testMapId + ".txt");
+        Path bananaPath = tempDir.resolve(testJobId).resolve(String.valueOf(bananaPartition)).resolve(testMapId + ".txt");
 
-        List<String> allUploadedContents = contentCaptor.getAllValues();
+        assertTrue(Files.exists(applePath), "Partition file for 'apple' should exist at: " + applePath);
+        assertTrue(Files.exists(bananaPath), "Partition file for 'banana' should exist at: " + bananaPath);
 
-        // One of the uploads must contain both 'apple' entries separated by a tab and newline
-        boolean foundGroupedApples = allUploadedContents.stream()
-                .anyMatch(content -> content.contains("apple\t1\napple\t1\n"));
-
-        assertTrue(foundGroupedApples, "Identical keys were not grouped into the same partition file.");
+        // 2. Verify identical keys were grouped into the same partition file
+        String appleContent = Files.readString(applePath);
+        assertTrue(appleContent.contains("apple\t1\napple\t1\n"),
+                "Identical keys were not grouped into the same local partition file.");
     }
 
     /**
-     * Verifies that the partitioner adheres to the deterministic S3 naming
-     * convention required for the subsequent Shuffle/Sort phase.
-     * * @throws Throwable to accommodate Resilience4j-powered S3 signatures.
+     * Verifies that the partitioner adheres to the deterministic local path
+     * naming convention required for the P2P embedded server to locate data.
+     * * @throws IOException If a file system error occurs.
      */
     @Test
-    void testPartitionAndUpload_DeterministicNamingConvention() throws Throwable {
-        // Arrange
-        List<KeyValuePair> intermediateData = List.of(new KeyValuePair("test", "1"));
+    void testPartitionAndWriteLocal_DeterministicPathConvention() throws IOException {
+        // Arrange: A single test key
+        String testKey = "p2p-test";
+        List<KeyValuePair> intermediateData = List.of(new KeyValuePair(testKey, "value"));
+        int expectedPartition = Math.abs(testKey.hashCode()) % 3;
 
         // Act
-        partitioner.partitionAndUpload(intermediateData);
+        partitioner.partitionAndWriteLocal(intermediateData);
 
-        // Assert: Verify the S3 path follows the standard Map-Reduce naming convention:
-        // [jobId]/intermediate/[taskId]_part_[partitionIndex].txt
-        ArgumentCaptor<String> pathCaptor = ArgumentCaptor.forClass(String.class);
-        verify(mockS3Service).writeData(eq(testBucket), pathCaptor.capture(), anyString());
+        // Assert: Verify the local path follows the required P2P convention:
+        // {baseDir}/{jobId}/{partitionIndex}/{mapTaskId}.txt
+        Path expectedPath = tempDir.resolve(testJobId)
+                .resolve(String.valueOf(expectedPartition))
+                .resolve(testMapId + ".txt");
 
-        String capturedPath = pathCaptor.getValue();
-        assertTrue(capturedPath.startsWith(testJobId + "/intermediate/" + testMapId + "_part_"),
-                "The S3 object path does not follow the required naming convention.");
-        assertTrue(capturedPath.endsWith(".txt"), "The intermediate file should have a .txt extension.");
+        assertTrue(Files.exists(expectedPath), "Local file does not follow the deterministic naming convention.");
+        assertTrue(expectedPath.toString().endsWith(".txt"), "The local file should have a .txt extension.");
     }
 }

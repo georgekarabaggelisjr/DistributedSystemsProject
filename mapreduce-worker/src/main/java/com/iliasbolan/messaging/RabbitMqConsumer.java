@@ -44,9 +44,15 @@ import java.util.concurrent.atomic.AtomicLong;
  * repeated JVM failures or logic errors, the consumer will eventually discard the message
  * after {@code MAX_RETRIES} to prevent infinite loops and resource exhaustion.
  * </p>
+ * <p>
+ * <b>Peer-to-Peer (P2P) Directory Service Hook:</b><br>
+ * When a Map task completes successfully, this class retrieves the container's internal network IP
+ * (provided via Kubernetes Downward API) and appends it to the completion payload. This allows
+ * the Python Orchestrator to construct the routing table needed for the Reduce phase data transfers.
+ * </p>
  *
  * @author Ilias Bolanakis
- * @version 1.3
+ * @version 1.4
  * @see com.iliasbolan.engine.TaskExecutor
  * @since 2026-04-07
  */
@@ -192,8 +198,23 @@ public class RabbitMqConsumer {
                             // Dispatch task to the execution engine
                             taskExecutor.executeTask(messageBody);
 
+                            // Construct the completion payload
+                            String successEvent;
+
+                            // P2P SHUFFLE HOOK: Only Map tasks host data, so only they need to report their IPs
+                            if ("MAP".equalsIgnoreCase(phase)) {
+                                // Fetch the Pod IP injected by Kubernetes. Default to localhost for local testing.
+                                String podIp = System.getenv().getOrDefault("POD_IP", "127.0.0.1");
+                                String workerBindAddress = podIp + ":8080";
+
+                                successEvent = String.format("{\"jobId\": \"%s\", \"taskId\": \"%s\", \"state\": \"COMPLETED\", \"workerBindAddress\": \"%s\"}",
+                                        jobId, taskId, workerBindAddress);
+                                logger.info("Broadcasting Map completion with P2P Address: {}", workerBindAddress);
+                            } else {
+                                successEvent = String.format("{\"jobId\": \"%s\", \"taskId\": \"%s\", \"state\": \"COMPLETED\"}", jobId, taskId);
+                            }
+
                             // Notify the Manager of a successful completion
-                            String successEvent = String.format("{\"jobId\": \"%s\", \"taskId\": \"%s\", \"state\": \"COMPLETED\"}", jobId, taskId);
                             channel.basicPublish("", statusQueueName, null, successEvent.getBytes(StandardCharsets.UTF_8));
 
                             // Acknowledge the message only after successful persistence of results

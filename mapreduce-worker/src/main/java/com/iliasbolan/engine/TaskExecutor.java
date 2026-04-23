@@ -9,7 +9,11 @@ import com.iliasbolan.storage.S3ClientService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.Arrays;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.time.Duration;
 import java.util.List;
 import java.util.concurrent.ForkJoinPool;
 
@@ -21,16 +25,17 @@ import java.util.concurrent.ForkJoinPool;
  * execution, ensuring that remote resources are localized and processed via
  * parallel decomposition.
  * </p>
- * * <h3>Core Responsibilities:</h3>
+ * <h3>Core Responsibilities:</h3>
  * <ul>
  * <li><b>Deserialization:</b> Converting raw JSON payloads into validated {@link TaskPayload} objects.</li>
  * <li><b>Resource Acquisition:</b> Coordinating with {@link S3ClientService} to localize bytecode and data.</li>
  * <li><b>Dynamic Execution:</b> Leveraging Reflection to instantiate user logic at runtime.</li>
  * <li><b>Parallelism:</b> Dispatching workloads to a shared {@link ForkJoinPool} for multi-core utilization.</li>
+ * <li><b>Peer-to-Peer (P2P) Fetching:</b> Utilizing native Java HTTP clients to stream intermediate shuffle data directly from sibling nodes, bypassing S3 bottlenecks.</li>
  * </ul>
  *
  * @author Ilias Bolanakis
- * @version 1.4
+ * @version 2.0
  * @since 2026-04-07
  * @see com.iliasbolan.core.TaskPayload
  * @see com.iliasbolan.engine.MapTaskProcessor
@@ -44,11 +49,14 @@ public class TaskExecutor {
     /** High-performance JSON mapper for processing RabbitMQ message bodies. */
     private static final ObjectMapper objectMapper = new ObjectMapper();
 
-    /** Service for S3-compatible storage interactions. */
+    /** Service for S3-compatible storage interactions (Used for Code/Final Output). */
     private final S3ClientService s3ClientService;
 
     /** Shared pool for executing parallelized Map and Reduce operations. */
     private final ForkJoinPool forkJoinPool;
+
+    /** The root directory for local P2P shuffle data persistence. */
+    private final String baseShuffleDir;
 
     /**
      * Constructs a new {@code TaskExecutor} with a shared parallel execution pool.
@@ -58,9 +66,11 @@ public class TaskExecutor {
      * </p>
      *
      * @param s3ClientService The initialized service for S3 storage I/O.
+     * @param baseShuffleDir  The local disk directory for hosting P2P intermediate data.
      */
-    public TaskExecutor(S3ClientService s3ClientService) {
+    public TaskExecutor(S3ClientService s3ClientService, String baseShuffleDir) {
         this.s3ClientService = s3ClientService;
+        this.baseShuffleDir = baseShuffleDir;
         this.forkJoinPool = ForkJoinPool.commonPool();
 
         logger.info("Initialized TaskExecutor with parallel ForkJoinPool (Parallelism level: {})",
@@ -69,21 +79,14 @@ public class TaskExecutor {
 
     /**
      * Parses the incoming JSON message and routes it to the correct execution phase.
-     * <p>
-     * This method acts as the primary entry point for the worker loop. It determines
-     * if the workload belongs to a {@code MAP} or {@code REDUCE} phase.
-     * </p>
      *
      * @param jsonPayload The raw JSON task description delivered by RabbitMQ.
-     * @throws Throwable If any phase of the execution lifecycle fails (I/O, Reflection, or Logic).
-     * Throwing bubbles back to the consumer for message NACKing.
+     * @throws Throwable If any phase of the execution lifecycle fails.
      */
     public void executeTask(String jsonPayload) throws Throwable {
-        // Deserialize the task definition sent by the Manager
         TaskPayload payload = objectMapper.readValue(jsonPayload, TaskPayload.class);
         logger.info("Successfully parsed task payload. JobId: {}, TaskType: {}", payload.jobId(), payload.taskType());
 
-        // Routing logic for the two-phase MapReduce pipeline
         if ("MAP".equalsIgnoreCase(payload.taskType())) {
             executeMapPhase(payload);
         } else if ("REDUCE".equalsIgnoreCase(payload.taskType())) {
@@ -95,16 +98,6 @@ public class TaskExecutor {
 
     /**
      * Orchestrates the complete lifecycle of a distributed MAP task.
-     * <p>
-     * <b>Phase Pipeline:</b>
-     * <ol>
-     * <li>Localization: Downloads user bytecode to a managed temporary directory.</li>
-     * <li>Reflection: Instantiates the {@link Mapper} via a custom ClassLoader.</li>
-     * <li>Data Streaming: Fetches boundary-corrected records from S3.</li>
-     * <li>Processing: Invokes {@link MapTaskProcessor} for parallel data transformation.</li>
-     * <li>Shuffle: Hands results to {@link ShufflePartitioner} for intermediate persistence.</li>
-     * </ol>
-     * </p>
      *
      * @param payload The metadata required to execute the specific map chunk.
      * @throws Throwable If an error occurs during resource acquisition or data processing.
@@ -112,7 +105,6 @@ public class TaskExecutor {
     private void executeMapPhase(TaskPayload payload) throws Throwable {
         logger.info("--- [ STARTING MAP PHASE: Task {} ] ---", payload.taskId());
 
-        // Prepare the local file system for dynamic bytecode loading
         String packagePath = payload.className().replace(".", "/");
         String localCodeDir = "/tmp/mapreduce/usercode/" + payload.jobId() + "/";
         String localCodePath = localCodeDir + packagePath + ".class";
@@ -121,10 +113,8 @@ public class TaskExecutor {
         fileObj.getParentFile().mkdirs();
         s3ClientService.downloadUserCode(payload.userCodeBucket(), payload.userCodeObject(), localCodePath);
 
-        // Reflectively load user logic
         Mapper mapper = DynamicClassLoader.loadMapper(localCodeDir, payload.className());
 
-        // S3 Service handles boundary correction (ensuring lines aren't split across chunks)
         List<String> records = s3ClientService.readDataChunk(
                 payload.bucketName(),
                 payload.objectName(),
@@ -134,88 +124,98 @@ public class TaskExecutor {
 
         logger.info("Successfully received {} clean records from S3 service.", records.size());
 
-        // Parallel processing starts here
         MapTaskProcessor rootMapTask = new MapTaskProcessor(records, 0, records.size(), mapper);
         List<KeyValuePair> intermediateResults = forkJoinPool.invoke(rootMapTask);
 
         logger.info("Parallel Map processing complete. Generated {} intermediate pairs.", intermediateResults.size());
 
-        // Distribute results into partitions for the Reducers to pick up
+        // P2P UPGRADE: Using local disk storage instead of S3 uploads
         ShufflePartitioner partitioner = new ShufflePartitioner(
-                s3ClientService,
-                payload.bucketName(),
+                baseShuffleDir,
                 payload.jobId(),
                 payload.taskId(),
                 payload.numReducers()
         );
-        partitioner.partitionAndUpload(intermediateResults);
+        partitioner.partitionAndWriteLocal(intermediateResults);
 
         logger.info("--- [ SUCCESSFULLY COMPLETED MAP PHASE: Task {} ] ---", payload.taskId());
     }
 
     /**
-     * Orchestrates the REDUCE task lifecycle with an integrated Sort phase.
+     * Orchestrates the REDUCE task lifecycle utilizing direct P2P data fetching.
      * <p>
-     * Unlike the Map phase, the Reduce phase involves a "Grouping and Sorting" stage
-     * to provide "Total Order" semantics. This ensures that all values for a given
-     * key are processed together and the final output is alphabetically organized.
+     * <b>P2P Shuffle Protocol:</b><br>
+     * This method retrieves the routing table ({@code payload.workerEndpoints()}) and initiates
+     * HTTP GET requests to sibling pods. It requests the entire partition directory, streaming
+     * the intermediate text data directly into memory for grouping and sorting.
      * </p>
      *
      * @param payload The metadata required to aggregate the specific intermediate partition.
-     * @throws Throwable If aggregation or final output persistence fails.
+     * @throws Throwable If P2P network fetching, aggregation, or final output persistence fails.
      */
     private void executeReducePhase(TaskPayload payload) throws Throwable {
         logger.info("--- [ STARTING REDUCE PHASE: Partition {} for Job {} ] ---", payload.taskId(), payload.jobId());
 
-        // bytecode localization (standard procedure)
         String packagePath = payload.className().replace(".", "/");
         String localCodeDir = "/tmp/mapreduce/usercode/" + payload.jobId() + "/";
         String localCodePath = localCodeDir + packagePath + ".class";
 
         java.io.File fileObj = new java.io.File(localCodePath);
         fileObj.getParentFile().mkdirs();
-
         s3ClientService.downloadUserCode(payload.userCodeBucket(), payload.userCodeObject(), localCodePath);
 
-        // Reflectively load user reducer logic
         Reducer reducer = DynamicClassLoader.loadReducer(localCodeDir, payload.className());
 
-        // Identify all intermediate fragments produced by Map workers for this partition
         int partitionIndex = Integer.parseInt(payload.taskId());
-        List<String> files = s3ClientService.listIntermediateFiles(payload.bucketName(), payload.jobId(), partitionIndex);
-
-        // Group intermediate data into a Key -> List<Value> structure
         java.util.Map<String, List<String>> groupedData = new java.util.HashMap<>();
-        for (String fileName : files) {
-            String content = s3ClientService.readObject(payload.bucketName(), fileName);
-            for (String line : content.split("\\n")) {
-                if (line.isBlank()) continue;
 
-                String[] parts = line.split("\\t");
-                if (parts.length == 2) {
-                    groupedData.computeIfAbsent(parts[0], k -> new java.util.ArrayList<>()).add(parts[1]);
+        // P2P SHUFFLE PHASE: Fetch data directly from Map worker endpoints
+        HttpClient httpClient = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build();
+        List<String> endpoints = payload.workerEndpoints();
+
+        logger.info("Initiating P2P data transfer. Fetching partition {} from {} active Map workers...", partitionIndex, endpoints.size());
+
+        for (String endpoint : endpoints) {
+            String url = String.format("http://%s/shuffle/%s/%d", endpoint, payload.jobId(), partitionIndex);
+            try {
+                HttpRequest request = HttpRequest.newBuilder().uri(URI.create(url)).GET().build();
+                HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+
+                if (response.statusCode() == 200) {
+                    String content = response.body();
+                    for (String line : content.split("\\n")) {
+                        if (line.isBlank()) continue;
+                        String[] parts = line.split("\\t");
+                        if (parts.length == 2) {
+                            groupedData.computeIfAbsent(parts[0], k -> new java.util.ArrayList<>()).add(parts[1]);
+                        }
+                    }
+                } else if (response.statusCode() == 404) {
+                    logger.debug("Worker node {} does not contain data for partition {}.", endpoint, partitionIndex);
+                } else {
+                    logger.warn("Received unexpected status code {} from P2P node: {}", response.statusCode(), url);
                 }
+            } catch (Exception e) {
+                logger.error("P2P Network Error: Failed to fetch partition data from node {}", endpoint, e);
+                throw new RuntimeException("Critical P2P network failure during Reduce phase.", e);
             }
         }
 
-        // Apply a deterministic sort to satisfy standard MapReduce ordering requirements
         logger.info("Sorting {} unique intermediate keys for partition {}...", groupedData.size(), partitionIndex);
         List<java.util.Map.Entry<String, List<String>>> sortedEntries = new java.util.ArrayList<>(groupedData.entrySet());
         sortedEntries.sort(java.util.Map.Entry.comparingByKey());
 
-        // Process keys in parallel via the recursive ReduceTaskProcessor
         ReduceTaskProcessor rootReduceTask = new ReduceTaskProcessor(sortedEntries, 0, sortedEntries.size(), reducer);
         List<com.iliasbolan.core.KeyValuePair> finalResults = forkJoinPool.invoke(rootReduceTask);
 
         logger.info("Parallel Reduction complete. Results remain in sorted order.");
 
-        // Serialize final results to a tab-delimited format
         StringBuilder outputBuilder = new StringBuilder();
         for (com.iliasbolan.core.KeyValuePair pair : finalResults) {
             outputBuilder.append(pair.key()).append("\t").append(pair.value()).append("\n");
         }
 
-        // Final output path is globally accessible to the Manager for job finalization
+        // Final output is still pushed to S3 so the user can download their result
         String finalPath = String.format("%s/output/result_part_%d.txt", payload.jobId(), partitionIndex);
         s3ClientService.writeData(payload.bucketName(), finalPath, outputBuilder.toString());
 
