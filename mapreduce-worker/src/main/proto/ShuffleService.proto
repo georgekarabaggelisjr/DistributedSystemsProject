@@ -1,0 +1,38 @@
+syntax = "proto3";
+
+// These options tell the Protobuf compiler how to generate the Java classes
+option java_multiple_files = true;
+option java_package = "com.iliasbolan.grpc.shuffle";
+option java_outer_classname = "ShuffleServiceProto";
+
+package shuffle;
+
+/**
+ * The peer-to-peer data transfer service hosted by Map workers.
+ */
+service ShuffleService {
+  // A Server-Streaming RPC.
+  // The Reducer requests a specific partition, and the Map worker
+  // streams the intermediate data back in chunks.
+  rpc GetPartition (PartitionRequest) returns (stream PartitionChunk);
+}
+
+/**
+ * The request sent by the Reduce worker.
+ */
+message PartitionRequest {
+  // The UUID of the overarching MapReduce job.
+  string job_id = 1;
+
+  // The ID of the partition the Reducer is assigned to (e.g., 0, 1, 2).
+  // This typically corresponds to the Reducer's Task ID.
+  int32 partition_id = 2;
+}
+
+/**
+ * A binary chunk of the intermediate data payload.
+ */
+message PartitionChunk {
+  // The raw byte data for this chunk.
+  bytes content = 1;
+}

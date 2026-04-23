@@ -1,21 +1,27 @@
 package com.iliasbolan.engine;
 
+import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.iliasbolan.core.KeyValuePair;
 import com.iliasbolan.core.Mapper;
 import com.iliasbolan.core.Reducer;
 import com.iliasbolan.core.TaskPayload;
+import com.iliasbolan.messaging.RabbitMqProducer;
 import com.iliasbolan.storage.S3ClientService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
-import java.time.Duration;
+import io.grpc.ManagedChannel;
+import io.grpc.ManagedChannelBuilder;
+import com.iliasbolan.grpc.shuffle.ShuffleServiceGrpc;
+import com.iliasbolan.grpc.shuffle.PartitionRequest;
+import com.iliasbolan.grpc.shuffle.PartitionChunk;
+
+import java.util.Iterator;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.TimeUnit;
 
 /**
  * The central orchestration engine for executing Map-Reduce tasks on the Worker node.
@@ -31,23 +37,24 @@ import java.util.concurrent.ForkJoinPool;
  * <li><b>Resource Acquisition:</b> Coordinating with {@link S3ClientService} to localize bytecode and data.</li>
  * <li><b>Dynamic Execution:</b> Leveraging Reflection to instantiate user logic at runtime.</li>
  * <li><b>Parallelism:</b> Dispatching workloads to a shared {@link ForkJoinPool} for multi-core utilization.</li>
- * <li><b>Peer-to-Peer (P2P) Fetching:</b> Utilizing native Java HTTP clients to stream intermediate shuffle data directly from sibling nodes, bypassing S3 bottlenecks.</li>
+ * <li><b>gRPC P2P Shuffle:</b> Utilizing gRPC Server-Side Streaming to fetch intermediate data directly from sibling pods.</li>
+ * <li><b>Lifecycle Signaling:</b> Reporting task completion and network coordinates to the Manager via {@link RabbitMqProducer}.</li>
  * </ul>
  *
  * @author Ilias Bolanakis
- * @version 2.0
+ * @version 3.0
  * @since 2026-04-07
- * @see com.iliasbolan.core.TaskPayload
- * @see com.iliasbolan.engine.MapTaskProcessor
- * @see com.iliasbolan.engine.ShufflePartitioner
  */
 public class TaskExecutor {
 
     /** Logger instance for tracking task execution and system health. */
     private static final Logger logger = LoggerFactory.getLogger(TaskExecutor.class);
 
-    /** High-performance JSON mapper for processing RabbitMQ message bodies. */
-    private static final ObjectMapper objectMapper = new ObjectMapper();
+    /** * High-performance JSON mapper for processing RabbitMQ message bodies.
+     * Configured to ignore unknown properties to ensure compatibility with evolving Manager schemas.
+     */
+    private static final ObjectMapper objectMapper = new ObjectMapper()
+            .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
 
     /** Service for S3-compatible storage interactions (Used for Code/Final Output). */
     private final S3ClientService s3ClientService;
@@ -58,23 +65,29 @@ public class TaskExecutor {
     /** The root directory for local P2P shuffle data persistence. */
     private final String baseShuffleDir;
 
+    /** The producer responsible for signaling task events back to the Manager. */
+    private final RabbitMqProducer eventProducer;
+
+    /** The network identity of this pod, used for gRPC callback registration. */
+    private final String podIp;
+
     /**
-     * Constructs a new {@code TaskExecutor} with a shared parallel execution pool.
-     * <p>
-     * Note: This constructor initializes the common {@link ForkJoinPool}, which
-     * automatically scales based on the available processors in the container.
-     * </p>
+     * Constructs a new {@code TaskExecutor} with a shared parallel execution pool and identity context.
      *
      * @param s3ClientService The initialized service for S3 storage I/O.
      * @param baseShuffleDir  The local disk directory for hosting P2P intermediate data.
+     * @param eventProducer   The producer used to signal completion events back to the Orchestrator.
+     * @param podIp           The internal Kubernetes IP of this pod, used to build gRPC endpoints.
      */
-    public TaskExecutor(S3ClientService s3ClientService, String baseShuffleDir) {
+    public TaskExecutor(S3ClientService s3ClientService, String baseShuffleDir, RabbitMqProducer eventProducer, String podIp) {
         this.s3ClientService = s3ClientService;
         this.baseShuffleDir = baseShuffleDir;
+        this.eventProducer = eventProducer;
+        this.podIp = podIp;
         this.forkJoinPool = ForkJoinPool.commonPool();
 
-        logger.info("Initialized TaskExecutor with parallel ForkJoinPool (Parallelism level: {})",
-                forkJoinPool.getParallelism());
+        logger.info("Initialized TaskExecutor with parallel ForkJoinPool (Parallelism: {}) and Pod IP: {}",
+                forkJoinPool.getParallelism(), podIp);
     }
 
     /**
@@ -98,6 +111,12 @@ public class TaskExecutor {
 
     /**
      * Orchestrates the complete lifecycle of a distributed MAP task.
+     * <p>
+     * <b>Coordination Logic:</b><br>
+     * Upon successful completion of the map operation and local partitioning, this method
+     * resolves the worker's network identity and broadcasts it along with the
+     * gRPC service port to the Manager.
+     * </p>
      *
      * @param payload The metadata required to execute the specific map chunk.
      * @throws Throwable If an error occurs during resource acquisition or data processing.
@@ -105,6 +124,7 @@ public class TaskExecutor {
     private void executeMapPhase(TaskPayload payload) throws Throwable {
         logger.info("--- [ STARTING MAP PHASE: Task {} ] ---", payload.taskId());
 
+        // 1. Localize user-provided Mapper code
         String packagePath = payload.className().replace(".", "/");
         String localCodeDir = "/tmp/mapreduce/usercode/" + payload.jobId() + "/";
         String localCodePath = localCodeDir + packagePath + ".class";
@@ -113,8 +133,10 @@ public class TaskExecutor {
         fileObj.getParentFile().mkdirs();
         s3ClientService.downloadUserCode(payload.userCodeBucket(), payload.userCodeObject(), localCodePath);
 
+        // 2. Instantiate logic via Dynamic Class Loading
         Mapper mapper = DynamicClassLoader.loadMapper(localCodeDir, payload.className());
 
+        // 3. Stream data chunk from S3/MinIO
         List<String> records = s3ClientService.readDataChunk(
                 payload.bucketName(),
                 payload.objectName(),
@@ -124,12 +146,13 @@ public class TaskExecutor {
 
         logger.info("Successfully received {} clean records from S3 service.", records.size());
 
+        // 4. Parallelize execution using the MapTaskProcessor (ForkJoin)
         MapTaskProcessor rootMapTask = new MapTaskProcessor(records, 0, records.size(), mapper);
         List<KeyValuePair> intermediateResults = forkJoinPool.invoke(rootMapTask);
 
         logger.info("Parallel Map processing complete. Generated {} intermediate pairs.", intermediateResults.size());
 
-        // P2P UPGRADE: Using local disk storage instead of S3 uploads
+        // 5. Partition results to local disk for gRPC Shuffle Service
         ShufflePartitioner partitioner = new ShufflePartitioner(
                 baseShuffleDir,
                 payload.jobId(),
@@ -138,24 +161,30 @@ public class TaskExecutor {
         );
         partitioner.partitionAndWriteLocal(intermediateResults);
 
+        // 6. Signal completion and report gRPC coordinates (PodIP:Port) to Manager
+        String grpcPort = System.getenv().getOrDefault("SHUFFLE_GRPC_PORT", "50051");
+        String workerBindAddress = this.podIp + ":" + grpcPort;
+
+        eventProducer.sendCompletionSignal(payload.jobId(), payload.taskId(), "COMPLETED", workerBindAddress);
+
         logger.info("--- [ SUCCESSFULLY COMPLETED MAP PHASE: Task {} ] ---", payload.taskId());
     }
 
     /**
-     * Orchestrates the REDUCE task lifecycle utilizing direct P2P data fetching.
+     * Orchestrates the REDUCE task lifecycle utilizing gRPC Server-Side Streaming for P2P data transfer.
      * <p>
-     * <b>P2P Shuffle Protocol:</b><br>
-     * This method retrieves the routing table ({@code payload.workerEndpoints()}) and initiates
-     * HTTP GET requests to sibling pods. It requests the entire partition directory, streaming
-     * the intermediate text data directly into memory for grouping and sorting.
+     * <b>gRPC Shuffle Protocol:</b><br>
+     * Establish persistent {@link ManagedChannel} connections to sibling nodes to fetch
+     * partition streams, significantly reducing serialization overhead.
      * </p>
      *
      * @param payload The metadata required to aggregate the specific intermediate partition.
-     * @throws Throwable If P2P network fetching, aggregation, or final output persistence fails.
+     * @throws Throwable If gRPC network fetching, aggregation, or final output persistence fails.
      */
     private void executeReducePhase(TaskPayload payload) throws Throwable {
         logger.info("--- [ STARTING REDUCE PHASE: Partition {} for Job {} ] ---", payload.taskId(), payload.jobId());
 
+        // 1. Localize Reducer code
         String packagePath = payload.className().replace(".", "/");
         String localCodeDir = "/tmp/mapreduce/usercode/" + payload.jobId() + "/";
         String localCodePath = localCodeDir + packagePath + ".class";
@@ -169,56 +198,66 @@ public class TaskExecutor {
         int partitionIndex = Integer.parseInt(payload.taskId());
         java.util.Map<String, List<String>> groupedData = new java.util.HashMap<>();
 
-        // P2P SHUFFLE PHASE: Fetch data directly from Map worker endpoints
-        HttpClient httpClient = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build();
+        // 2. Fetch data from Map workers via gRPC
         List<String> endpoints = payload.workerEndpoints();
-
-        logger.info("Initiating P2P data transfer. Fetching partition {} from {} active Map workers...", partitionIndex, endpoints.size());
+        logger.info("Initiating gRPC P2P data transfer. Streaming from {} Map workers...", endpoints.size());
 
         for (String endpoint : endpoints) {
-            String url = String.format("http://%s/shuffle/%s/%d", endpoint, payload.jobId(), partitionIndex);
-            try {
-                HttpRequest request = HttpRequest.newBuilder().uri(URI.create(url)).GET().build();
-                HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+            String[] addressParts = endpoint.split(":");
+            String host = addressParts[0];
+            int port = (addressParts.length > 1) ? Integer.parseInt(addressParts[1]) : 50051;
 
-                if (response.statusCode() == 200) {
-                    String content = response.body();
+            ManagedChannel channel = ManagedChannelBuilder.forAddress(host, port)
+                    .usePlaintext() // Internal cluster traffic bypasses TLS for performance
+                    .keepAliveTime(30, TimeUnit.SECONDS)
+                    .build();
+
+            try {
+                ShuffleServiceGrpc.ShuffleServiceBlockingStub stub = ShuffleServiceGrpc.newBlockingStub(channel);
+                PartitionRequest request = PartitionRequest.newBuilder()
+                        .setJobId(payload.jobId())
+                        .setPartitionId(partitionIndex)
+                        .build();
+
+                // Consume the gRPC stream
+                Iterator<PartitionChunk> chunkStream = stub.getPartition(request);
+                while (chunkStream.hasNext()) {
+                    PartitionChunk chunk = chunkStream.next();
+                    String content = chunk.getContent().toStringUtf8();
+
                     for (String line : content.split("\\n")) {
                         if (line.isBlank()) continue;
                         String[] parts = line.split("\\t");
                         if (parts.length == 2) {
-                            groupedData.computeIfAbsent(parts[0], k -> new java.util.ArrayList<>()).add(parts[1]);
+                            groupedData.computeIfAbsent(parts[0], k -> new ArrayList<>()).add(parts[1]);
                         }
                     }
-                } else if (response.statusCode() == 404) {
-                    logger.debug("Worker node {} does not contain data for partition {}.", endpoint, partitionIndex);
-                } else {
-                    logger.warn("Received unexpected status code {} from P2P node: {}", response.statusCode(), url);
                 }
             } catch (Exception e) {
-                logger.error("P2P Network Error: Failed to fetch partition data from node {}", endpoint, e);
-                throw new RuntimeException("Critical P2P network failure during Reduce phase.", e);
+                logger.error("gRPC P2P Error: Failed to stream from node {}", endpoint, e);
+                throw new RuntimeException("Critical gRPC shuffle failure.", e);
+            } finally {
+                channel.shutdown().awaitTermination(5, TimeUnit.SECONDS);
             }
         }
 
-        logger.info("Sorting {} unique intermediate keys for partition {}...", groupedData.size(), partitionIndex);
-        List<java.util.Map.Entry<String, List<String>>> sortedEntries = new java.util.ArrayList<>(groupedData.entrySet());
+        // 3. Sort and Reduce the grouped data
+        logger.info("Sorting {} unique keys for partition {}...", groupedData.size(), partitionIndex);
+        List<java.util.Map.Entry<String, List<String>>> sortedEntries = new ArrayList<>(groupedData.entrySet());
         sortedEntries.sort(java.util.Map.Entry.comparingByKey());
 
         ReduceTaskProcessor rootReduceTask = new ReduceTaskProcessor(sortedEntries, 0, sortedEntries.size(), reducer);
-        List<com.iliasbolan.core.KeyValuePair> finalResults = forkJoinPool.invoke(rootReduceTask);
+        List<KeyValuePair> finalResults = forkJoinPool.invoke(rootReduceTask);
 
-        logger.info("Parallel Reduction complete. Results remain in sorted order.");
-
+        // 4. Serialize and persist final part file to S3
         StringBuilder outputBuilder = new StringBuilder();
-        for (com.iliasbolan.core.KeyValuePair pair : finalResults) {
+        for (KeyValuePair pair : finalResults) {
             outputBuilder.append(pair.key()).append("\t").append(pair.value()).append("\n");
         }
 
-        // Final output is still pushed to S3 so the user can download their result
         String finalPath = String.format("%s/output/result_part_%d.txt", payload.jobId(), partitionIndex);
         s3ClientService.writeData(payload.bucketName(), finalPath, outputBuilder.toString());
 
-        logger.info("--- [ SUCCESSFULLY COMPLETED REDUCE PHASE: Output saved to {} ] ---", finalPath);
+        logger.info("--- [ SUCCESSFULLY COMPLETED REDUCE PHASE: {} ] ---", finalPath);
     }
 }

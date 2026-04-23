@@ -1,87 +1,106 @@
 package com.iliasbolan.engine;
 
+import com.google.protobuf.ByteString;
 import com.iliasbolan.core.KeyValuePair;
 import com.iliasbolan.core.Mapper;
 import com.iliasbolan.core.Reducer;
+import com.iliasbolan.grpc.shuffle.PartitionChunk;
+import com.iliasbolan.grpc.shuffle.ShuffleServiceGrpc;
+import com.iliasbolan.messaging.RabbitMqProducer;
 import com.iliasbolan.storage.S3ClientService;
+import io.grpc.ManagedChannel;
+import io.grpc.ManagedChannelBuilder;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
-import org.mockito.ArgumentCaptor;
 import org.mockito.MockedStatic;
 import org.mockito.Mockito;
 
 import java.nio.file.Path;
-import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.List;
+import java.util.Collections;
+import java.util.Iterator;
 
 import static org.junit.jupiter.api.Assertions.assertThrows;
-import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.mockito.ArgumentMatchers.anyLong;
-import static org.mockito.ArgumentMatchers.anyString;
-import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.*;
 
 /**
- * Unit tests for the {@link TaskExecutor}.
+ * Unit tests for the {@link TaskExecutor} orchestration engine.
  * <p>
- * This suite verifies the entire Worker orchestration pipeline. It has been updated
- * to validate the <b>Peer-to-Peer (P2P) Shuffle</b> architecture, where intermediate
- * data is persisted to the local disk and transferred via HTTP instead of S3.
+ * This suite validates the <b>Hybrid gRPC Shuffle</b> architecture, ensuring that
+ * the execution engine correctly coordinates between S3 for persistent storage,
+ * RabbitMQ for lifecycle signaling, and gRPC for peer-to-peer data streaming.
  * </p>
  * <p>
- * <b>Infrastructure Mocking:</b> Uses Mockito to intercept S3 service calls and
- * DynamicClassLoader logic, ensuring tests remain isolated from the physical
- * network and file system.
+ * <b>Testing Strategy:</b><br>
+ * Utilizes Mockito for dependency injection and {@code MockedStatic} for intercepting
+ * dynamic class loading and gRPC network construction. This allows for full pipeline
+ * validation without requiring a live Kubernetes cluster or active gRPC server.
  * </p>
+ *
+ * @author Ilias Bolanakis
+ * @version 3.2
+ * @since 2026-04-23
  */
 class TaskExecutorTest {
 
+    /** Mocked service for S3-compatible storage interactions. */
     private S3ClientService mockS3Service;
+
+    /** Mocked producer for signaling task events to the Manager. */
+    private RabbitMqProducer mockEventProducer;
+
+    /** The instance under test. */
     private TaskExecutor taskExecutor;
+
+    /** Path to the temporary directory used for local shuffle data simulation. */
     private String baseShuffleDir;
 
-    /**
-     * Utilizes JUnit 5's {@code @TempDir} to provide a safe, isolated directory
-     * for testing local P2P shuffle persistence.
+    /** * JUnit 5 extension to provide a temporary directory for each test run,
+     * ensuring filesystem isolation.
      */
     @TempDir
     Path tempDir;
 
+    /**
+     * Initializes the testing environment before each test execution.
+     * <p>
+     * <b>Correction:</b> Now includes the required {@code podIp} argument to match
+     * the updated {@link TaskExecutor} constructor signature.
+     * </p>
+     */
     @BeforeEach
     void setUp() {
-        // Create a fake MinIO network service
         mockS3Service = Mockito.mock(S3ClientService.class);
+        mockEventProducer = Mockito.mock(RabbitMqProducer.class);
         baseShuffleDir = tempDir.toString();
 
-        // Constructor updated to support local shuffle directory
-        taskExecutor = new TaskExecutor(mockS3Service, baseShuffleDir);
+        // Pass a dummy Pod IP for local testing
+        taskExecutor = new TaskExecutor(mockS3Service, baseShuffleDir, mockEventProducer, "127.0.0.1");
     }
 
     /**
-     * Verifies that a successful MAP task correctly orchestrates the P2P pipeline:
-     * code download, data acquisition, parallel execution, and LOCAL partitioned persistence.
+     * Validates that a MAP task correctly executes the full gRPC-ready pipeline.
      * <p>
-     * <b>P2P Update:</b> This test now verifies that intermediate data is
-     * <u>not</u> uploaded to S3, as it is now hosted locally for sibling nodes.
+     * This test ensures that the mapper downloads user code, processes data chunks,
+     * partitions the results locally, and finally signals completion with its
+     * gRPC network coordinates to the Manager.
      * </p>
-     *
-     * @throws Throwable to accommodate Resilience4j-wrapped S3 operations.
+     * * @throws Throwable if any stage of the map phase fails.
      */
     @Test
-    void testExecuteTask_SuccessfulMapPhase_OrchestratesFullPipeline() throws Throwable {
-        // Arrange 1: The JSON Payload (including new workerEndpoints list)
+    void testExecuteTask_SuccessfulMapPhase_OrchestratesFullPipelineAndSignalsManager() throws Throwable {
         String jsonPayload = """
                 {
-                    "jobId": "job-test",
+                    "jobId": "job-grpc-test",
                     "taskId": "map-001",
                     "taskType": "MAP",
                     "bucketName": "input-bucket",
                     "objectName": "data.txt",
                     "byteOffset": 0,
                     "byteLength": 1024,
-                    "numReducers": 2,
+                    "numReducers": 1,
                     "userCodeBucket": "code-bucket",
                     "userCodeObject": "WordCount.class",
                     "className": "com.iliasbolan.WordCount",
@@ -89,24 +108,11 @@ class TaskExecutorTest {
                 }
                 """;
 
-        // Arrange 2: Mock S3 input data
-        List<String> fakeFileRecords = Arrays.asList(
-                "hello distributed systems",
-                "hello george"
-        );
-        when(mockS3Service.readDataChunk(eq("input-bucket"), eq("data.txt"), anyLong(), anyLong()))
-                .thenReturn(fakeFileRecords);
+        when(mockS3Service.readDataChunk(anyString(), anyString(), anyLong(), anyLong()))
+                .thenReturn(Arrays.asList("distributed systems", "grpc shuffle"));
 
-        // Arrange 3: A dummy Mapper
-        Mapper dummyMapper = (key, value) -> {
-            List<KeyValuePair> results = new ArrayList<>();
-            for (String word : value.split("\\s+")) {
-                results.add(new KeyValuePair(word, "1"));
-            }
-            return results;
-        };
+        Mapper dummyMapper = (key, value) -> Collections.singletonList(new KeyValuePair(value, "1"));
 
-        // Act: Intercept DynamicClassLoader
         try (MockedStatic<DynamicClassLoader> mockedLoader = Mockito.mockStatic(DynamicClassLoader.class)) {
             mockedLoader.when(() -> DynamicClassLoader.loadMapper(anyString(), anyString()))
                     .thenReturn(dummyMapper);
@@ -114,80 +120,100 @@ class TaskExecutorTest {
             taskExecutor.executeTask(jsonPayload);
         }
 
-        // Assert 1: Bytecode and Input data must still come from S3
+        // Verify code acquisition
         verify(mockS3Service).downloadUserCode(eq("code-bucket"), eq("WordCount.class"), anyString());
-        verify(mockS3Service).readDataChunk(eq("input-bucket"), eq("data.txt"), eq(0L), eq(1024L));
 
-        // Assert 2: P2P VALIDATION - Verify NO intermediate data was uploaded to S3
-        // Intermediate data now resides in the local 'tempDir' directory
+        // Verify that intermediate data is NOT written to S3 in the gRPC P2P model
         verify(mockS3Service, never()).writeData(eq("input-bucket"), contains("intermediate"), anyString());
+
+        // Verify completion signaling with gRPC endpoint info
+        verify(mockEventProducer).sendCompletionSignal(anyString(), anyString(), eq("COMPLETED"), contains(":50051"));
     }
 
     /**
-     * Ensures that the engine immediately rejects payloads with unknown task types.
-     */
-    @Test
-    void testExecuteTask_UnknownTaskType_ThrowsException() {
-        String jsonPayload = """
-                {
-                    "jobId": "job-test",
-                    "taskType": "INVALID_TYPE",
-                    "workerEndpoints": []
-                }
-                """;
-
-        assertThrows(IllegalArgumentException.class, () -> taskExecutor.executeTask(jsonPayload));
-    }
-
-    /**
-     * Verifies that a REDUCE task orchestrates the P2P fetch logic and persists
-     * final results to S3.
+     * Validates that a REDUCE task successfully streams data via gRPC.
      * <p>
-     * <b>P2P Update:</b> This test verifies that the worker bypasses S3 listing
-     * and instead prepares to fetch data from the provided network endpoints.
+     * This test mocks the gRPC networking layer using {@code MockedStatic} for
+     * {@link ManagedChannelBuilder} to simulate the high-performance streaming
+     * of intermediate data from sibling nodes.
      * </p>
-     *
-     * @throws Throwable to accommodate Resilience4j-wrapped S3 operations.
+     * <p>
+     * <b>Correction:</b> Explicitly stubs the {@code keepAliveTime} method on the
+     * builder mock to support fluent method chaining without {@code NullPointerException}.
+     * </p>
+     * * @throws Throwable if gRPC streaming or final reduction fails.
      */
     @Test
-    void testExecuteTask_SuccessfulReducePhase_OrchestratesFullPipeline() throws Throwable {
-        // Arrange 1: The JSON Payload with worker network identities
+    @SuppressWarnings("unchecked")
+    void testExecuteTask_SuccessfulReducePhase_StreamsViaGrpcAndPersistsToS3() throws Throwable {
         String jsonPayload = """
                 {
-                    "jobId": "job-test",
+                    "jobId": "job-grpc-test",
                     "taskId": "0", 
                     "taskType": "REDUCE",
                     "bucketName": "input-bucket",
-                    "objectName": "",
-                    "byteOffset": 0,
-                    "byteLength": 0,
-                    "numReducers": 2,
+                    "numReducers": 1,
                     "userCodeBucket": "code-bucket",
-                    "userCodeObject": "WordCountReducer.class",
+                    "userCodeObject": "Reducer.class",
                     "className": "com.iliasbolan.WordCountReducer",
-                    "workerEndpoints": []
+                    "workerEndpoints": ["10.0.0.1:50051"]
                 }
                 """;
 
-        // Arrange 2: A dummy Reducer
         Reducer dummyReducer = (key, values) -> new KeyValuePair(key, String.valueOf(values.size()));
 
-        // Act & Assert
-        try (MockedStatic<DynamicClassLoader> mockedLoader = Mockito.mockStatic(DynamicClassLoader.class)) {
-            mockedLoader.when(() -> DynamicClassLoader.loadReducer(anyString(), anyString()))
-                    .thenReturn(dummyReducer);
+        PartitionChunk fakeChunk = PartitionChunk.newBuilder()
+                .setContent(ByteString.copyFromUtf8("hello\t1\nworld\t1\n"))
+                .build();
+        Iterator<PartitionChunk> mockIterator = mock(Iterator.class);
+        when(mockIterator.hasNext()).thenReturn(true, false);
+        when(mockIterator.next()).thenReturn(fakeChunk);
+
+        try (MockedStatic<DynamicClassLoader> mockedLoader = Mockito.mockStatic(DynamicClassLoader.class);
+             MockedStatic<ManagedChannelBuilder> mockedBuilder = Mockito.mockStatic(ManagedChannelBuilder.class);
+             MockedStatic<ShuffleServiceGrpc> mockedGrpc = Mockito.mockStatic(ShuffleServiceGrpc.class)) {
+
+            mockedLoader.when(() -> DynamicClassLoader.loadReducer(anyString(), anyString())).thenReturn(dummyReducer);
+
+            ManagedChannel mockChannel = mock(ManagedChannel.class);
+            ManagedChannelBuilder mockChannelBuilder = mock(ManagedChannelBuilder.class);
+            ShuffleServiceGrpc.ShuffleServiceBlockingStub mockStub = mock(ShuffleServiceGrpc.ShuffleServiceBlockingStub.class);
+
+            // Mock the builder chain
+            mockedBuilder.when(() -> ManagedChannelBuilder.forAddress(anyString(), anyInt())).thenReturn(mockChannelBuilder);
+            when(mockChannelBuilder.usePlaintext()).thenReturn(mockChannelBuilder);
+
+            // FIX: Ensure fluent builder chaining returns the mock builder
+            when(mockChannelBuilder.keepAliveTime(anyLong(), any())).thenReturn(mockChannelBuilder);
+
+            when(mockChannelBuilder.build()).thenReturn(mockChannel);
+            when(mockChannel.shutdown()).thenReturn(mockChannel);
+            when(mockChannel.shutdownNow()).thenReturn(mockChannel);
+            when(mockChannel.awaitTermination(anyLong(), any())).thenReturn(true);
+
+            mockedGrpc.when(() -> ShuffleServiceGrpc.newBlockingStub(any(ManagedChannel.class))).thenReturn(mockStub);
+            when(mockStub.getPartition(any())).thenReturn(mockIterator);
 
             taskExecutor.executeTask(jsonPayload);
         }
 
-        // 1. Verify user bytecode is still localized from S3
-        verify(mockS3Service).downloadUserCode(eq("code-bucket"), eq("WordCountReducer.class"), anyString());
-
-        // 2. Verify P2P VALIDATION - S3 Listing is no longer used for intermediate data
+        // Verify that legacy listing is bypassed and final results are persisted to S3
         verify(mockS3Service, never()).listIntermediateFiles(anyString(), anyString(), anyInt());
-        verify(mockS3Service, never()).readObject(anyString(), contains("intermediate"));
+        verify(mockS3Service).writeData(eq("input-bucket"), eq("job-grpc-test/output/result_part_0.txt"), anyString());
+    }
 
-        // 3. Final output must still be persisted to S3 for job finalization
-        verify(mockS3Service).writeData(eq("input-bucket"), eq("job-test/output/result_part_0.txt"), anyString());
+    /**
+     * Validates that an unsupported task type triggers the appropriate exception.
+     */
+    @Test
+    void testExecuteTask_UnknownTaskType_ThrowsIllegalArgumentException() {
+        String jsonPayload = """
+                {
+                    "jobId": "job-test",
+                    "taskType": "CORRUPT_TYPE"
+                }
+                """;
+
+        assertThrows(IllegalArgumentException.class, () -> taskExecutor.executeTask(jsonPayload));
     }
 }

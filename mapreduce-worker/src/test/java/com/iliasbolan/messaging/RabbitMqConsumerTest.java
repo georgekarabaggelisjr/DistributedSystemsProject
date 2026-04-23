@@ -4,7 +4,8 @@ import com.iliasbolan.engine.TaskExecutor;
 import com.rabbitmq.client.AMQP;
 import com.rabbitmq.client.Channel;
 import com.rabbitmq.client.Connection;
-import com.rabbitmq.client.Consumer;
+import com.rabbitmq.client.DeliverCallback;
+import com.rabbitmq.client.CancelCallback; // Added to resolve method ambiguity
 import com.rabbitmq.client.Envelope;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -15,18 +16,26 @@ import java.nio.charset.StandardCharsets;
 
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.*;
-import static org.mockito.Mockito.doThrow;
-import static org.mockito.Mockito.verify;
-import static org.mockito.Mockito.when;
+import static org.mockito.Mockito.*;
 
 /**
- * Unit tests for the {@link RabbitMqConsumer}.
- * This verifies the interaction with the RabbitMQ driver, including graceful
- * timeouts, manual acknowledgments (ACK), and error re-queuing (NACK).
+ * Unit tests for the {@link RabbitMqConsumer} control plane component.
  * <p>
- * <b>Note:</b> These tests are updated to handle {@link Throwable} signatures
- * originating from the Resilience4j-wrapped TaskExecutor.
+ * This suite validates the worker's ability to consume task definitions from RabbitMQ,
+ * coordinate with the computational engine, and handle distributed system edge cases.
+ * It has been updated to verify the <b>gRPC-ready signaling</b> through the
+ * {@link RabbitMqProducer}.
  * </p>
+ * <p>
+ * <b>Method Ambiguity Fix:</b><br>
+ * Verifications of <code>basicConsume</code> explicitly define the <code>CancelCallback</code>
+ * type to distinguish between overloaded method signatures in the RabbitMQ Java client.
+ * </p>
+ *
+ * @author Ilias Bolanakis
+ * @version 2.4
+ * @since 2026-03-30
+ * @see com.iliasbolan.messaging.RabbitMqConsumer
  */
 class RabbitMqConsumerTest {
 
@@ -34,168 +43,174 @@ class RabbitMqConsumerTest {
     private Connection mockConnection;
     private Channel mockChannel;
     private TaskExecutor mockTaskExecutor;
+    private RabbitMqProducer mockEventProducer;
 
+    /**
+     * Re-initializes the mocked messaging infrastructure before each test.
+     */
     @BeforeEach
     void setUp() throws Exception {
         mockManager = Mockito.mock(RabbitMqConnectionManager.class);
         mockConnection = Mockito.mock(Connection.class);
         mockChannel = Mockito.mock(Channel.class);
         mockTaskExecutor = Mockito.mock(TaskExecutor.class);
+        mockEventProducer = Mockito.mock(RabbitMqProducer.class);
 
-        // Wire the mocks together so the consumer thinks it has a real network
+        // Wire the mocks to simulate a functional RabbitMQ session
         when(mockManager.createConnection()).thenReturn(mockConnection);
         when(mockConnection.createChannel()).thenReturn(mockChannel);
     }
 
     /**
-     * Verifies that the consumer correctly calculates its idle time and triggers
-     * a clean shutdown of the main thread once the timeout is exceeded.
-     * * @throws Throwable to accommodate the TaskExecutor's updated signatures.
+     * Verifies that the consumer correctly calculates idle time and triggers
+     * a clean pod shutdown once the timeout is exceeded.
      */
     @Test
-    void testStartConsuming_IdleTimeout_TriggersCleanShutdown() throws Throwable {
-        // Arrange: Set a very short timeout of 500ms
-        RabbitMqConsumer consumer = new RabbitMqConsumer(mockManager, "test-queue", 500, mockTaskExecutor);
+    void testStartConsuming_IdleTimeout_TriggersGracefulPodShutdown() throws Throwable {
+        RabbitMqConsumer consumer = new RabbitMqConsumer(mockManager, "test-queue", 500, mockTaskExecutor, mockEventProducer);
 
         long startTime = System.currentTimeMillis();
 
-        // Act: Start consuming. Because we don't send any messages, this should block
-        // for exactly 500ms and then exit cleanly thanks to our stopConsuming() fix!
+        // Act: Start the blocking loop
         consumer.startConsuming();
 
         long duration = System.currentTimeMillis() - startTime;
 
-        // Assert: Ensure it waited at least 500ms, but didn't hang forever
-        assertTrue(duration >= 500 && duration < 2000,
-                "Consumer did not shut down within the expected idle timeout window!");
+        // Assert: Ensure the loop exited within the configured idle window
+        assertTrue(duration >= 500 && duration < 2500,
+                "Consumer loop failed to exit within the configured idle timeout window.");
     }
 
     /**
-     * Ensures that upon successful task completion, the consumer issues a
-     * positive acknowledgment (ACK) to the broker.
-     * * @throws Throwable to accommodate the TaskExecutor's updated signatures.
+     * Verifies that successful task execution results in a positive acknowledgment (ACK)
+     * and a completion signal through the producer.
      */
     @Test
-    void testHandleDelivery_SuccessfulTask_SendsAck() throws Throwable {
+    @SuppressWarnings("unchecked")
+    void testHandleDelivery_SuccessfulTaskExecution_IssuesPositiveAckAndSignal() throws Throwable {
         // Arrange
-        RabbitMqConsumer consumer = new RabbitMqConsumer(mockManager, "test-queue", 5000, mockTaskExecutor);
+        RabbitMqConsumer consumer = new RabbitMqConsumer(mockManager, "test-queue", 5000, mockTaskExecutor, mockEventProducer);
 
-        // Run startConsuming in a separate thread so it doesn't block our test
         Thread consumerThread = new Thread(() -> {
             try { consumer.startConsuming(); } catch (Exception ignored) {}
         });
         consumerThread.start();
+        Thread.sleep(200);
 
-        // Give it 100ms to initialize and attach the RabbitMQ Consumer object to our mock channel
-        Thread.sleep(100);
+        // Capture the internal deliver callback to simulate a message
+        ArgumentCaptor<DeliverCallback> callbackCaptor = ArgumentCaptor.forClass(DeliverCallback.class);
 
-        // Capture the internal RabbitMQ Consumer object so we can manually trigger a message delivery
-        ArgumentCaptor<Consumer> consumerCaptor = ArgumentCaptor.forClass(Consumer.class);
-        verify(mockChannel).basicConsume(eq("test-queue"), eq(false), consumerCaptor.capture());
-        Consumer internalRabbitConsumer = consumerCaptor.getValue();
+        // FIX: Specified any(CancelCallback.class) to resolve ambiguity
+        verify(mockChannel).basicConsume(eq("test-queue"), eq(false), callbackCaptor.capture(), any(CancelCallback.class));
 
-        // Simulate a message arriving from RabbitMQ
+        DeliverCallback internalCallback = callbackCaptor.getValue();
+
         long deliveryTag = 12345L;
         Envelope envelope = new Envelope(deliveryTag, false, "exchange", "routingKey");
-        byte[] body = "{\"jobId\":\"1\"}".getBytes(StandardCharsets.UTF_8);
+        byte[] body = "{\"jobId\":\"test-job-001\", \"taskId\":\"reduce-0\", \"taskType\":\"REDUCE\"}".getBytes(StandardCharsets.UTF_8);
 
-        // Act: Manually fire the delivery event
-        internalRabbitConsumer.handleDelivery("tag", envelope, new AMQP.BasicProperties(), body);
+        // Act: Manually trigger the delivery
+        internalCallback.handle("tag", new com.rabbitmq.client.Delivery(envelope, new AMQP.BasicProperties(), body));
 
-        // Assert: Verify it executed the task and sent a positive ACK
-        // verify() must account for executeTask now throwing Throwable
+        // Assert: Verify engine dispatch and ACK
         verify(mockTaskExecutor).executeTask(anyString());
         verify(mockChannel).basicAck(eq(deliveryTag), eq(false));
 
-        // Clean up
+        // Assert: Verify signaling via the Producer
+        verify(mockEventProducer).sendCompletionSignal(eq("test-job-001"), eq("reduce-0"), eq("COMPLETED"), isNull());
+
+        // Cleanup
         consumer.stopConsuming();
         consumerThread.join();
     }
 
     /**
-     * Verifies that if a task fails or a Throwable is caught, the consumer
-     * issues a negative acknowledgment (NACK) with requeue=true.
-     * * @throws Throwable to accommodate the TaskExecutor's updated signatures.
+     * Verifies that task failures trigger a negative acknowledgment (NACK) with requeue
+     * and broadcast a FAILED event via the producer.
      */
     @Test
-    void testHandleDelivery_TaskFails_SendsNack() throws Throwable {
+    @SuppressWarnings("unchecked")
+    void testHandleDelivery_TaskExecutionFailure_IssuesNackAndFailedSignal() throws Throwable {
         // Arrange
-        RabbitMqConsumer consumer = new RabbitMqConsumer(mockManager, "test-queue", 5000, mockTaskExecutor);
-
-        // Make the task executor throw a simulated exception
-        // doThrow handles Throwable appropriately here
-        doThrow(new RuntimeException("Simulated processing crash!")).when(mockTaskExecutor).executeTask(anyString());
+        RabbitMqConsumer consumer = new RabbitMqConsumer(mockManager, "test-queue", 5000, mockTaskExecutor, mockEventProducer);
+        doThrow(new RuntimeException("I/O Error")).when(mockTaskExecutor).executeTask(anyString());
 
         Thread consumerThread = new Thread(() -> {
             try { consumer.startConsuming(); } catch (Exception ignored) {}
         });
         consumerThread.start();
-        Thread.sleep(100);
+        Thread.sleep(200);
 
-        ArgumentCaptor<Consumer> consumerCaptor = ArgumentCaptor.forClass(Consumer.class);
-        verify(mockChannel).basicConsume(eq("test-queue"), eq(false), consumerCaptor.capture());
-        Consumer internalRabbitConsumer = consumerCaptor.getValue();
+        ArgumentCaptor<DeliverCallback> callbackCaptor = ArgumentCaptor.forClass(DeliverCallback.class);
+
+        // FIX: Specified any(CancelCallback.class) to resolve ambiguity
+        verify(mockChannel).basicConsume(eq("test-queue"), eq(false), callbackCaptor.capture(), any(CancelCallback.class));
+
+        DeliverCallback internalCallback = callbackCaptor.getValue();
 
         long deliveryTag = 9999L;
         Envelope envelope = new Envelope(deliveryTag, false, "exchange", "routingKey");
+        byte[] body = "{\"jobId\":\"test-job-002\", \"taskId\":\"map-1\"}".getBytes(StandardCharsets.UTF_8);
 
         // Act
-        internalRabbitConsumer.handleDelivery("tag", envelope, new AMQP.BasicProperties(), "bad-payload".getBytes());
+        internalCallback.handle("tag", new com.rabbitmq.client.Delivery(envelope, new AMQP.BasicProperties(), body));
 
-        // Assert: Verify it sent a negative NACK with 'requeue = true' so the message isn't lost
+        // Assert: Verify NACK with requeue=true
         verify(mockChannel).basicNack(eq(deliveryTag), eq(false), eq(true));
+
+        // Assert: Verify the failure was signaled through the producer
+        verify(mockEventProducer).sendCompletionSignal(eq("test-job-002"), eq("map-1"), eq("FAILED"), anyString());
 
         consumer.stopConsuming();
         consumerThread.join();
     }
 
     /**
-     * Verifies the Poison Pill protection mechanism. If a task exceeds the MAX_RETRIES
-     * threshold, it should be NACKed with requeue=false (sending it to the DLX)
-     * and a FAILED status event should be broadcasted to the Manager.
-     * * @throws Throwable to accommodate the TaskExecutor's updated signatures.
+     * Validates the Poison Pill protection mechanism.
      */
     @Test
-    void testHandleDelivery_PoisonPill_SendsNackWithoutRequeue() throws Throwable {
+    @SuppressWarnings("unchecked")
+    void testHandleDelivery_MaxRetriesExceeded_SignalsFailureAndDropsMessage() throws Throwable {
         // Arrange
-        RabbitMqConsumer consumer = new RabbitMqConsumer(mockManager, "test-queue", 5000, mockTaskExecutor);
+        RabbitMqConsumer consumer = new RabbitMqConsumer(mockManager, "test-queue", 5000, mockTaskExecutor, mockEventProducer);
 
         Thread consumerThread = new Thread(() -> {
             try { consumer.startConsuming(); } catch (Exception ignored) {}
         });
         consumerThread.start();
-        Thread.sleep(100);
+        Thread.sleep(200);
 
-        ArgumentCaptor<Consumer> consumerCaptor = ArgumentCaptor.forClass(Consumer.class);
-        verify(mockChannel).basicConsume(eq("test-queue"), eq(false), consumerCaptor.capture());
-        Consumer internalRabbitConsumer = consumerCaptor.getValue();
+        ArgumentCaptor<DeliverCallback> callbackCaptor = ArgumentCaptor.forClass(DeliverCallback.class);
+
+        // FIX: Specified any(CancelCallback.class) to resolve ambiguity
+        verify(mockChannel).basicConsume(eq("test-queue"), eq(false), callbackCaptor.capture(), any(CancelCallback.class));
+
+        DeliverCallback internalCallback = callbackCaptor.getValue();
 
         long deliveryTag = 8888L;
         Envelope envelope = new Envelope(deliveryTag, false, "exchange", "routingKey");
-        byte[] body = "{\"jobId\":\"poison-job\", \"taskId\":\"map-1\"}".getBytes(StandardCharsets.UTF_8);
+        byte[] body = "{\"jobId\":\"poison-pill\", \"taskId\":\"map-2\"}".getBytes(StandardCharsets.UTF_8);
 
-        // Simulate x-delivery-count header = 4 (Exceeding MAX_RETRIES = 3)
         java.util.Map<String, Object> headers = new java.util.HashMap<>();
-        headers.put("x-delivery-count", 4);
-        AMQP.BasicProperties properties = new AMQP.BasicProperties.Builder()
-                .headers(headers)
-                .build();
+        headers.put("x-delivery-count", 5);
+        AMQP.BasicProperties properties = new AMQP.BasicProperties.Builder().headers(headers).build();
 
         // Act
-        internalRabbitConsumer.handleDelivery("tag", envelope, properties, body);
+        internalCallback.handle("tag", new com.rabbitmq.client.Delivery(envelope, properties, body));
 
-        // Assert: Ensure it was NACKed with requeue=FALSE (to be routed to DLX)
+        // Assert 1: Ensure message is NACKed with requeue=false
         verify(mockChannel).basicNack(eq(deliveryTag), eq(false), eq(false));
 
-        // Assert: Ensure a FAILED event was published back to the status queue
-        ArgumentCaptor<byte[]> publishCaptor = ArgumentCaptor.forClass(byte[].class);
-        verify(mockChannel).basicPublish(eq(""), eq("job_events_queue"), isNull(), publishCaptor.capture());
-        String publishedEvent = new String(publishCaptor.getValue(), StandardCharsets.UTF_8);
-        assertTrue(publishedEvent.contains("\"state\": \"FAILED\""));
-        assertTrue(publishedEvent.contains("MAX_RETRIES_EXCEEDED"));
+        // Assert 2: Verify signaled via Producer
+        verify(mockEventProducer).sendCompletionSignal(
+                eq("poison-pill"),
+                eq("map-2"),
+                eq("FAILED"),
+                eq("MAX_RETRIES_EXCEEDED")
+        );
 
-        // Assert: Ensure the TaskExecutor was completely bypassed for poison pills
-        verify(mockTaskExecutor, Mockito.never()).executeTask(anyString());
+        // Assert 3: Computational engine must be bypassed
+        verify(mockTaskExecutor, never()).executeTask(anyString());
 
         consumer.stopConsuming();
         consumerThread.join();

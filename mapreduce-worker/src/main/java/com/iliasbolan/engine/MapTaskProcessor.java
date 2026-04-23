@@ -28,11 +28,12 @@ import java.util.concurrent.RecursiveTask;
  * </p>
  * <p>
  * Upon completion of the map operations, the caller is responsible for applying the
- * Shuffle partitioning logic and writing the intermediate files to the Shared File System (MinIO).
+ * Shuffle partitioning logic and writing the intermediate files to the local disk
+ * to be streamed by the peer-to-peer gRPC Shuffle Service.
  * </p>
  *
  * @author Ilias Bolanakis
- * @version 1.3
+ * @version 1.4
  * @see java.util.concurrent.RecursiveTask
  * @see java.util.concurrent.ForkJoinPool
  * @see com.iliasbolan.core.Mapper
