@@ -49,14 +49,14 @@ class S3ClientServiceIntegrationTest {
     }
 
     /**
-     * Verifies a successful Write/Read round-trip using UTF-16 encoding and
+     * Verifies a successful Write/Read round-trip using UTF-8 encoding and
      * confirms the boundary-correction logic correctly aligns records.
      * * @throws Throwable to accommodate Resilience4j-powered service signatures.
      */
     @Test
     void testWriteAndReadDataChunk_SuccessfulRoundTrip() throws Throwable {
         // Arrange: Use newlines so the Record Reader has boundaries to work with.
-        // In UTF-16, each character (including \n) is 2 bytes.
+        // In UTF-8, these characters are 1 byte each (Indices 0-11 for A-F).
         String objectName = "test-job/chunk-test.txt";
         String testData = "A\nB\nC\nD\nE\nF\nG\nH\nI\nJ\nK\nL";
 
@@ -64,9 +64,9 @@ class S3ClientServiceIntegrationTest {
         s3ClientService.writeData(TEST_BUCKET, objectName, testData);
 
         // Act 2: Read the chunk.
-        // Note: Rule #1 will skip everything until the first \n AFTER the offset.
-        // If we want to start at 'F', we set the offset to point into 'E'.
-        List<String> records = s3ClientService.readDataChunk(TEST_BUCKET, objectName, 18, 20);
+        // SYNC LOGIC: We set offset to 8 (pointing at 'E').
+        // The service will read 'E' (8), then '\n' (9), and then start 'F' at index 10.
+        List<String> records = s3ClientService.readDataChunk(TEST_BUCKET, objectName, 8, 20);
 
         // Assert
         assertNotNull(records);

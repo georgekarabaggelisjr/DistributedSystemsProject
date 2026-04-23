@@ -32,7 +32,7 @@ import java.util.List;
  * <li><b>Resilience:</b> Implements {@code Resilience4j} retries with exponential backoff
  * and random jitter to survive transient network partitions.</li>
  * <li><b>Boundary Correction:</b> Implements a specialized synchronization algorithm
- * to ensure UTF-16 records are never bifurcated across Map chunks.</li>
+ * to ensure UTF-8 records are never bifurcated across Map chunks.</li>
  * <li><b>Idempotent Operations:</b> Ensures that task retries do not result in corrupted
  * or duplicated intermediate data.</li>
  * </ul>
@@ -127,7 +127,7 @@ public class S3ClientService {
      * @param objectName S3 key of the source file.
      * @param offset     The logical starting byte (from the Manager).
      * @param length     The target chunk size (typically 64MB).
-     * @return A {@link List} of UTF-16 encoded, sanitized text records.
+     * @return A {@link List} of UTF-8 encoded, sanitized text records.
      * @throws Throwable if the stream is interrupted or the data cannot be decoded.
      */
     public List<String> readDataChunk(String bucketName, String objectName, long offset, long length) throws Throwable {
@@ -158,9 +158,9 @@ public class S3ClientService {
                     bytesProcessedInChunk++;
                     lineBuffer.write(b);
 
-                    // UTF-16 records are separated by standard LF (0x0A)
+                    // UTF-8 records are separated by standard LF (0x0A)
                     if (b == 0x0A) {
-                        String line = new String(lineBuffer.toByteArray(), StandardCharsets.UTF_16).trim();
+                        String line = new String(lineBuffer.toByteArray(), StandardCharsets.UTF_8).trim();
 
                         if (!line.isEmpty()) {
                             cleanRecords.add(line);
@@ -177,7 +177,7 @@ public class S3ClientService {
 
                 // Edge Case: Handle file trailing bytes missing a newline
                 if (lineBuffer.size() > 0) {
-                    String lastLine = new String(lineBuffer.toByteArray(), StandardCharsets.UTF_16).trim();
+                    String lastLine = new String(lineBuffer.toByteArray(), StandardCharsets.UTF_8).trim();
                     if (!lastLine.isEmpty()) {
                         cleanRecords.add(lastLine);
                     }
@@ -193,7 +193,7 @@ public class S3ClientService {
      * Persists computational output to the shared storage layer.
      * <p>
      * This is used for both intermediate Map partitions and final Reduce results.
-     * Data is encoded in UTF-16 to maintain character set consistency across the cluster.
+     * Data is encoded in UTF-8 to maintain character set consistency across the cluster.
      * </p>
      *
      * @param bucketName  Target S3 bucket.
@@ -203,7 +203,7 @@ public class S3ClientService {
      */
     public void writeData(String bucketName, String objectName, String data) throws Throwable {
         Retry.decorateCheckedRunnable(retryContext, () -> {
-            byte[] dataBytes = data.getBytes(StandardCharsets.UTF_16);
+            byte[] dataBytes = data.getBytes(StandardCharsets.UTF_8);
             logger.debug("Writing {} bytes to s3://{}/{}", dataBytes.length, bucketName, objectName);
 
             try (InputStream inputStream = new ByteArrayInputStream(dataBytes)) {
@@ -261,7 +261,7 @@ public class S3ClientService {
     }
 
     /**
-     * Retrieves an entire S3 object as a UTF-16 String.
+     * Retrieves an entire S3 object as a UTF-8 String.
      * <p>
      * <b>Warning:</b> This method loads the entire object into memory. It is suitable
      * for intermediate partitions but should not be used for raw input files.
@@ -277,7 +277,7 @@ public class S3ClientService {
             try (InputStream stream = minioClient.getObject(
                     GetObjectArgs.builder().bucket(bucketName).object(objectName).build())) {
 
-                return new String(stream.readAllBytes(), StandardCharsets.UTF_16);
+                return new String(stream.readAllBytes(), StandardCharsets.UTF_8);
             }
         }).get();
     }
