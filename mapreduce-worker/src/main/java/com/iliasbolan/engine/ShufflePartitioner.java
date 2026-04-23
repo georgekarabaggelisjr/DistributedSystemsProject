@@ -5,11 +5,11 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
-import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -17,30 +17,26 @@ import java.util.Map;
 /**
  * Handles the Shuffle and Partitioning phase of a Map-Reduce job.
  * <p>
- * After the {@link MapTaskProcessor} generates a consolidated list of intermediate
- * {@link KeyValuePair} objects, this class is responsible for routing each pair to
- * its appropriate Reducer partition. It applies a deterministic hash function to the
- * key to calculate the target partition: <code>hash(key) % R</code>, where R is the
- * total number of Reducers.
+ * <b>Spill-to-Disk Architecture Update:</b><br>
+ * To support the OOM-safe Map phase, this class has been upgraded to support highly
+ * concurrent, thread-safe appends. It uses Lock Stripping (an array of dedicated locks
+ * per partition) to allow multiple Fork/Join threads to flush their localized buffers
+ * to the container's disk in parallel without corrupting the target text files.
  * </p>
  * <p>
  * <b>Peer-to-Peer (P2P) gRPC Architecture Update:</b><br>
- * To support the high-performance P2P shuffle, this class writes the partitioned
- * output directly to the local container disk using standard Java NIO. These deterministic
- * file paths (e.g., <code>/tmp/shuffle-data/{jobId}/{partitionId}/{mapTaskId}.txt</code>)
- * are subsequently streamed by the embedded gRPC server ({@code ShuffleService}),
- * allowing sibling Reduce nodes to fetch the data directly over the network via
- * Server-Side Streaming.
+ * This class writes the partitioned output directly to the local container disk using
+ * standard Java NIO. These deterministic file paths are subsequently streamed by the
+ * embedded gRPC server, allowing sibling Reduce nodes to fetch the data directly.
  * </p>
  *
  * @author Ilias Bolanakis
- * @version 2.1
+ * @version 3.0
  * @see com.iliasbolan.engine.MapTaskProcessor
- * @since 2026-03-30
+ * @since 2026-04-24
  */
 public class ShufflePartitioner {
 
-    // Instantiate the SLF4J Logger specific to this class
     private static final Logger logger = LoggerFactory.getLogger(ShufflePartitioner.class);
 
     private final String baseShuffleDir;
@@ -48,13 +44,22 @@ public class ShufflePartitioner {
     private final String mapTaskId;
     private final int numReducers;
 
+    /** * Array of granular locks. Lock Stripping ensures that threads writing to
+     * partition 0 do not block threads writing to partition 1.
+     */
+    private final Object[] partitionLocks;
+
     /**
      * Constructs a new {@code ShufflePartitioner} for a specific Map task.
      *
-     * @param baseShuffleDir  The root directory on the local disk for shuffle data (e.g., "/tmp/shuffle-data").
-     * @param jobId           The unique identifier for the current Map-Reduce job.
-     * @param mapTaskId       The unique identifier for the specific Map chunk being processed.
-     * @param numReducers     The total number of Reducer partitions configured for this job (R).
+     * """
+     * Initializes the P2P Local Storage partitioner and its concurrent locking mechanisms.
+     * * Args:
+     * baseShuffleDir (str): The root directory on the local disk for shuffle data.
+     * jobId (str): The unique identifier for the current Map-Reduce job.
+     * mapTaskId (str): The unique identifier for the specific Map chunk being processed.
+     * numReducers (int): The total number of Reducer partitions configured for this job (R).
+     * """
      */
     public ShufflePartitioner(String baseShuffleDir, String jobId, String mapTaskId, int numReducers) {
         this.baseShuffleDir = baseShuffleDir;
@@ -62,82 +67,75 @@ public class ShufflePartitioner {
         this.mapTaskId = mapTaskId;
         this.numReducers = numReducers;
 
+        // Initialize granular locks for thread-safe file appends
+        this.partitionLocks = new Object[numReducers];
+        for (int i = 0; i < numReducers; i++) {
+            this.partitionLocks[i] = new Object();
+        }
+
         logger.info("Initialized ShufflePartitioner (P2P Local Storage). JobId: {}, MapTaskId: {}, Target Reducers: {}",
                 jobId, mapTaskId, numReducers);
     }
 
     /**
-     * Partitions a list of intermediate key-value pairs and writes them to the local disk.
-     * <p>
-     * This method executes the fundamental shuffle logic. It iterates through the provided
-     * list, calculates the target partition using {@link Math#abs(int)} to prevent
-     * negative modulo results, and groups the pairs. Finally, it formats each partition's
-     * data into a simple text representation and persists it locally for the gRPC server
-     * to stream to requesting Reducers.
-     * </p>
+     * Thread-safe method to append a batch of mapped records directly to local disk.
      *
-     * @param intermediateData The complete list of key-value pairs generated by the Map phase.
-     * @throws IOException If a file system error occurs during the directory creation or write process.
+     * """
+     * Flushes a memory-bounded buffer of KeyValuePairs to their respective partition files.
+     * * This method groups the incoming buffer locally, then acquires the specific lock
+     * for each target partition file before appending data. This prevents file corruption
+     * while maintaining high concurrency.
+     * * Args:
+     * buffer (List[KeyValuePair]): A small batch of processed records from a single Fork/Join thread.
+     * * Raises:
+     * IOException: If a file system error occurs during the directory creation or append process.
+     * """
      */
-    public void partitionAndWriteLocal(List<KeyValuePair> intermediateData) throws IOException {
-        logger.info("Starting local partition and write phase. Total intermediate pairs to route: {}", intermediateData.size());
+    public void appendThreadSafe(List<KeyValuePair> buffer) throws IOException {
+        // Step 1: Group the incoming buffer by target partition (Thread-Local operation)
+        Map<Integer, StringBuilder> localPartitions = new HashMap<>();
 
-        // Step 1: Initialize in-memory buckets for each partition
-        Map<Integer, List<KeyValuePair>> partitions = new HashMap<>();
-        for (int i = 0; i < numReducers; i++) {
-            partitions.put(i, new ArrayList<>());
-        }
-
-        // Step 2: Route each KeyValuePair using the record method pair.key()
-        // PERFORMANCE CRITICAL: Absolutely no logging inside this loop!
-        for (KeyValuePair pair : intermediateData) {
+        for (KeyValuePair pair : buffer) {
             // Use Math.abs to ensure the hash is positive before the modulo operation
             int partitionIndex = Math.abs(pair.key().hashCode()) % numReducers;
-            partitions.get(partitionIndex).add(pair);
+
+            localPartitions.computeIfAbsent(partitionIndex, k -> new StringBuilder())
+                    .append(pair.key()).append("\t").append(pair.value()).append("\n");
         }
 
-        int writtenPartitionsCount = 0;
-
-        // Step 3: Serialize and write each partition to the local container disk
-        for (Map.Entry<Integer, List<KeyValuePair>> entry : partitions.entrySet()) {
+        // Step 2: Flush to disk using granular locks
+        for (Map.Entry<Integer, StringBuilder> entry : localPartitions.entrySet()) {
             int partitionIndex = entry.getKey();
-            List<KeyValuePair> partitionData = entry.getValue();
+            String payload = entry.getValue().toString();
 
-            // Skip empty partitions to save disk I/O and storage
-            if (partitionData.isEmpty()) {
-                logger.debug("Skipping partition {} as it contains no data.", partitionIndex);
-                continue;
-            }
-
-            // Serialize data into a simple "key\tvalue\n" text format
-            StringBuilder serializedData = new StringBuilder();
-            for (KeyValuePair pair : partitionData) {
-                serializedData.append(pair.key()).append("\t").append(pair.value()).append("\n");
-            }
-
-            // Generate the deterministic local file path for the gRPC service to read from
-            // Path structure: {baseDir}/{jobId}/{partitionIndex}/{mapTaskId}.txt
             Path partitionDir = Paths.get(baseShuffleDir, jobId, String.valueOf(partitionIndex));
             Path filePath = partitionDir.resolve(mapTaskId + ".txt");
 
-            try {
-                // Ensure the hierarchical directory structure exists before writing
-                Files.createDirectories(partitionDir);
+            // Acquire the dedicated lock for this specific partition
+            synchronized (partitionLocks[partitionIndex]) {
+                if (!Files.exists(partitionDir)) {
+                    Files.createDirectories(partitionDir);
+                }
 
-                // Write the string to disk, creating the file if missing, or overwriting if it exists
+                // Explicitly use UTF-8 to prevent multi-byte boundary errors
                 Files.writeString(
                         filePath,
-                        serializedData.toString(),
+                        payload,
+                        StandardCharsets.UTF_8,
                         StandardOpenOption.CREATE,
-                        StandardOpenOption.TRUNCATE_EXISTING
+                        StandardOpenOption.APPEND
                 );
-                writtenPartitionsCount++;
-            } catch (IOException e) {
-                logger.error("Failed to write partition {} to local path: {}", partitionIndex, filePath.toAbsolutePath(), e);
-                throw e;
             }
         }
+    }
 
-        logger.info("Successfully completed Shuffle phase. Wrote {} active partitions to local disk.", writtenPartitionsCount);
+    /**
+     * Legacy method for partitioning a massive list of intermediate key-value pairs at once.
+     * @deprecated Replaced by {@link #appendThreadSafe(List)} to support memory-safe streaming.
+     */
+    @Deprecated
+    public void partitionAndWriteLocal(List<KeyValuePair> intermediateData) throws IOException {
+        logger.warn("Invoked deprecated partitionAndWriteLocal. Use appendThreadSafe for OOM protection.");
+        appendThreadSafe(intermediateData);
     }
 }

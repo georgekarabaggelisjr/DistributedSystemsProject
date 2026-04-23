@@ -13,63 +13,52 @@ import io.grpc.ManagedChannelBuilder;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.mockito.ArgumentCaptor;
 import org.mockito.MockedStatic;
 import org.mockito.Mockito;
 
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Iterator;
 
-import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.*;
 
 /**
  * Unit tests for the {@link TaskExecutor} orchestration engine.
  * <p>
- * This suite validates the <b>Hybrid gRPC Shuffle</b> architecture, ensuring that
- * the execution engine correctly coordinates between S3 for persistent storage,
- * RabbitMQ for lifecycle signaling, and gRPC for peer-to-peer data streaming.
+ * <b>Spill-to-Disk Architecture Update:</b><br>
+ * This suite has been upgraded to validate the end-to-end memory-safe pipeline.
+ * It verifies that the `MapTaskProcessor` correctly bypasses list aggregation and
+ * flushes directly to the local disk, and proves that the `ExternalMergeSorter`
+ * successfully reads raw gRPC streams, sorts them in memory bounds, and delegates
+ * them to the Batch Processor.
  * </p>
  * <p>
  * <b>Testing Strategy:</b><br>
  * Utilizes Mockito for dependency injection and {@code MockedStatic} for intercepting
- * dynamic class loading and gRPC network construction. This allows for full pipeline
- * validation without requiring a live Kubernetes cluster or active gRPC server.
+ * dynamic class loading and gRPC network construction. Real file I/O is permitted
+ * within the JUnit 5 {@code @TempDir} to fully test the External Merge Sort mechanics.
  * </p>
  *
  * @author Ilias Bolanakis
- * @version 3.2
- * @since 2026-04-23
+ * @version 4.0
+ * @since 2026-04-24
  */
 class TaskExecutorTest {
 
-    /** Mocked service for S3-compatible storage interactions. */
     private S3ClientService mockS3Service;
-
-    /** Mocked producer for signaling task events to the Manager. */
     private RabbitMqProducer mockEventProducer;
-
-    /** The instance under test. */
     private TaskExecutor taskExecutor;
-
-    /** Path to the temporary directory used for local shuffle data simulation. */
     private String baseShuffleDir;
 
-    /** * JUnit 5 extension to provide a temporary directory for each test run,
-     * ensuring filesystem isolation.
-     */
     @TempDir
     Path tempDir;
 
-    /**
-     * Initializes the testing environment before each test execution.
-     * <p>
-     * <b>Correction:</b> Now includes the required {@code podIp} argument to match
-     * the updated {@link TaskExecutor} constructor signature.
-     * </p>
-     */
     @BeforeEach
     void setUp() {
         mockS3Service = Mockito.mock(S3ClientService.class);
@@ -81,16 +70,20 @@ class TaskExecutorTest {
     }
 
     /**
-     * Validates that a MAP task correctly executes the full gRPC-ready pipeline.
-     * <p>
-     * This test ensures that the mapper downloads user code, processes data chunks,
-     * partitions the results locally, and finally signals completion with its
-     * gRPC network coordinates to the Manager.
-     * </p>
-     * * @throws Throwable if any stage of the map phase fails.
+     * Validates that a MAP task correctly executes the full memory-safe pipeline.
+     *
+     * """
+     * Verifies the end-to-end Map phase with localized disk-spilling.
+     * * Ensures that the dynamic Map logic processes the chunk and correctly
+     * invokes the thread-safe `ShufflePartitioner` to write intermediate files
+     * to the container's disk before signaling the Orchestrator.
+     * * Raises:
+     * Throwable: If any mocked I/O or reflection phase fails.
+     * """
+     * @throws Throwable if any stage of the map phase fails.
      */
     @Test
-    void testExecuteTask_SuccessfulMapPhase_OrchestratesFullPipelineAndSignalsManager() throws Throwable {
+    void testExecuteTask_SuccessfulMapPhase_OrchestratesFullPipelineAndSpillsToDisk() throws Throwable {
         String jsonPayload = """
                 {
                     "jobId": "job-grpc-test",
@@ -123,29 +116,34 @@ class TaskExecutorTest {
         // Verify code acquisition
         verify(mockS3Service).downloadUserCode(eq("code-bucket"), eq("WordCount.class"), anyString());
 
-        // Verify that intermediate data is NOT written to S3 in the gRPC P2P model
+        // Assert 1: Verify intermediate data is NOT written to S3 in the P2P model
         verify(mockS3Service, never()).writeData(eq("input-bucket"), contains("intermediate"), anyString());
 
-        // Verify completion signaling with gRPC endpoint info
+        // Assert 2: Verify the Spill-to-Disk actually wrote to the local partition directory
+        // Since numReducers = 1, everything hashes to partition '0'
+        Path expectedSpillFile = Paths.get(baseShuffleDir, "job-grpc-test", "0", "map-001.txt");
+        assertTrue(Files.exists(expectedSpillFile), "The Map phase failed to spill intermediate results to the local disk.");
+
+        // Assert 3: Verify completion signaling with gRPC endpoint info
         verify(mockEventProducer).sendCompletionSignal(anyString(), anyString(), eq("COMPLETED"), contains(":50051"));
     }
 
     /**
-     * Validates that a REDUCE task successfully streams data via gRPC.
-     * <p>
-     * This test mocks the gRPC networking layer using {@code MockedStatic} for
-     * {@link ManagedChannelBuilder} to simulate the high-performance streaming
-     * of intermediate data from sibling nodes.
-     * </p>
-     * <p>
-     * <b>Correction:</b> Explicitly stubs the {@code keepAliveTime} method on the
-     * builder mock to support fluent method chaining without {@code NullPointerException}.
-     * </p>
-     * * @throws Throwable if gRPC streaming or final reduction fails.
+     * Validates that a REDUCE task successfully streams data via gRPC and applies the External Merge Sort.
+     *
+     * """
+     * Verifies the complex Reduce phase utilizing Disk Spills and K-Way Merge processing.
+     * * Simulates a high-performance gRPC stream, validating that the engine writes
+     * the raw stream to disk, correctly sorts the file using the ExternalMergeSorter,
+     * reduces the batches, and uploads the accurate final string to S3.
+     * * Raises:
+     * Throwable: If gRPC streaming, external sorting, or S3 persistence fails.
+     * """
+     * @throws Throwable if gRPC streaming or final reduction fails.
      */
     @Test
     @SuppressWarnings("unchecked")
-    void testExecuteTask_SuccessfulReducePhase_StreamsViaGrpcAndPersistsToS3() throws Throwable {
+    void testExecuteTask_SuccessfulReducePhase_ExternalMergeSortsAndPersistsToS3() throws Throwable {
         String jsonPayload = """
                 {
                     "jobId": "job-grpc-test",
@@ -160,11 +158,14 @@ class TaskExecutorTest {
                 }
                 """;
 
+        // Dummy reducer counts the number of occurrences of a key
         Reducer dummyReducer = (key, values) -> new KeyValuePair(key, String.valueOf(values.size()));
 
+        // Create a raw mock stream simulating network delivery
         PartitionChunk fakeChunk = PartitionChunk.newBuilder()
-                .setContent(ByteString.copyFromUtf8("hello\t1\nworld\t1\n"))
+                .setContent(ByteString.copyFromUtf8("hello\t1\nworld\t1\nhello\t1\n"))
                 .build();
+
         Iterator<PartitionChunk> mockIterator = mock(Iterator.class);
         when(mockIterator.hasNext()).thenReturn(true, false);
         when(mockIterator.next()).thenReturn(fakeChunk);
@@ -182,13 +183,10 @@ class TaskExecutorTest {
             // Mock the builder chain
             mockedBuilder.when(() -> ManagedChannelBuilder.forAddress(anyString(), anyInt())).thenReturn(mockChannelBuilder);
             when(mockChannelBuilder.usePlaintext()).thenReturn(mockChannelBuilder);
-
-            // FIX: Ensure fluent builder chaining returns the mock builder
             when(mockChannelBuilder.keepAliveTime(anyLong(), any())).thenReturn(mockChannelBuilder);
 
             when(mockChannelBuilder.build()).thenReturn(mockChannel);
             when(mockChannel.shutdown()).thenReturn(mockChannel);
-            when(mockChannel.shutdownNow()).thenReturn(mockChannel);
             when(mockChannel.awaitTermination(anyLong(), any())).thenReturn(true);
 
             mockedGrpc.when(() -> ShuffleServiceGrpc.newBlockingStub(any(ManagedChannel.class))).thenReturn(mockStub);
@@ -197,9 +195,17 @@ class TaskExecutorTest {
             taskExecutor.executeTask(jsonPayload);
         }
 
-        // Verify that legacy listing is bypassed and final results are persisted to S3
+        // Assert 1: Legacy listing is completely bypassed
         verify(mockS3Service, never()).listIntermediateFiles(anyString(), anyString(), anyInt());
-        verify(mockS3Service).writeData(eq("input-bucket"), eq("job-grpc-test/output/result_part_0.txt"), anyString());
+
+        // Assert 2: Capture the S3 upload to prove the External Merge Sorter successfully processed the disk files
+        ArgumentCaptor<String> dataCaptor = ArgumentCaptor.forClass(String.class);
+        verify(mockS3Service).writeData(eq("input-bucket"), eq("job-grpc-test/output/result_part_0.txt"), dataCaptor.capture());
+
+        // 'hello' appeared twice, 'world' appeared once.
+        // The ExternalMergeSorter guarantees alphabetical total order output.
+        String finalOutput = dataCaptor.getValue();
+        assertEquals("hello\t2\nworld\t1\n", finalOutput, "External Merge Sorter failed to correctly group and reduce the disk-spilled batches.");
     }
 
     /**

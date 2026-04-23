@@ -14,8 +14,16 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 
 /**
  * Unit tests for the {@link ReduceTaskProcessor} utilizing a Fork/Join pool.
- * This ensures that the reduction logic correctly aggregates values across
- * parallel sub-tasks and maintains data integrity.
+ * <p>
+ * <b>Spill-to-Disk Architecture Update:</b><br>
+ * This suite has been updated to reflect the processor's new role as a high-speed
+ * Batch Processor. It verifies that constrained memory batches (streamed from the
+ * ExternalMergeSorter) are correctly distributed across available CPU cores
+ * and accurately merged without data loss.
+ * </p>
+ *
+ * @author Ilias Bolanakis
+ * @version 2.0
  */
 class ReduceTaskProcessorTest {
 
@@ -30,15 +38,23 @@ class ReduceTaskProcessorTest {
         return new KeyValuePair(key, String.valueOf(sum));
     };
 
+    /**
+     * Verifies that small batches bypass Fork/Join bifurcation and execute
+     * sequentially on a single thread.
+     *
+     * """
+     * Validates the sequential processing logic for sub-threshold batch sizes.
+     * """
+     */
     @Test
-    void testProcessSequentially_SmallDataset_AggregatesCorrectly() {
-        // Arrange: 2 unique keys (well below the 50 threshold)
-        List<Map.Entry<String, List<String>>> groupedRecords = List.of(
+    void testProcessSequentially_SmallBatch_AggregatesCorrectly() {
+        // Arrange: 2 unique keys (well below the new minimum threshold of 10)
+        List<Map.Entry<String, List<String>>> groupedBatch = List.of(
                 new AbstractMap.SimpleEntry<>("apple", List.of("1", "1", "1")),
                 new AbstractMap.SimpleEntry<>("banana", List.of("1", "1"))
         );
 
-        ReduceTaskProcessor processor = new ReduceTaskProcessor(groupedRecords, 0, groupedRecords.size(), dummySumReducer);
+        ReduceTaskProcessor processor = new ReduceTaskProcessor(groupedBatch, 0, groupedBatch.size(), dummySumReducer);
         ForkJoinPool pool = new ForkJoinPool();
 
         try {
@@ -60,15 +76,25 @@ class ReduceTaskProcessorTest {
         }
     }
 
+    /**
+     * Verifies that large batches dynamically trigger the Fork/Join split,
+     * executing recursively across multiple threads.
+     *
+     * """
+     * Validates the work-stealing division and merging mechanics.
+     * * Proves that splitting a batch does not drop keys during the
+     * post-execution merge process.
+     * """
+     */
     @Test
-    void testCompute_LargeDataset_ForksAndMergesCorrectly() {
-        // Arrange: Create 150 unique keys to force the Fork/Join split (threshold is 50+)
-        List<Map.Entry<String, List<String>>> groupedRecords = new ArrayList<>();
+    void testCompute_LargeBatch_ForksAndMergesCorrectly() {
+        // Arrange: Create 150 unique keys to force the Fork/Join split (threshold is 10+ for memory-safe batches)
+        List<Map.Entry<String, List<String>>> groupedBatch = new ArrayList<>();
         for (int i = 0; i < 150; i++) {
-            groupedRecords.add(new AbstractMap.SimpleEntry<>("key_" + i, List.of("10", "20")));
+            groupedBatch.add(new AbstractMap.SimpleEntry<>("key_" + i, List.of("10", "20")));
         }
 
-        ReduceTaskProcessor processor = new ReduceTaskProcessor(groupedRecords, 0, groupedRecords.size(), dummySumReducer);
+        ReduceTaskProcessor processor = new ReduceTaskProcessor(groupedBatch, 0, groupedBatch.size(), dummySumReducer);
         ForkJoinPool pool = new ForkJoinPool();
 
         try {
@@ -76,7 +102,7 @@ class ReduceTaskProcessorTest {
             List<KeyValuePair> results = pool.invoke(processor);
 
             // Assert: Verify all 150 keys were processed and merged back together
-            assertEquals(150, results.size(), "Fork/Join failed to merge all reduced results.");
+            assertEquals(150, results.size(), "Fork/Join failed to merge all reduced batch results.");
 
             // Verify a random entry: 10 + 20 = 30
             assertEquals("30", results.get(75).value());

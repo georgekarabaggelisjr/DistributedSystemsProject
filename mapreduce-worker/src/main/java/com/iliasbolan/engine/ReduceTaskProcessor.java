@@ -11,95 +11,88 @@ import java.util.Map;
 import java.util.concurrent.RecursiveTask;
 
 /**
- * Executes the Reduce phase of a Map-Reduce job utilizing Java's Fork/Join Framework
- * for optimal intra-node parallelism.
+ * Executes the Reduce phase for a bounded batch of Map-Reduce data utilizing
+ * Java's Fork/Join Framework for optimal intra-node parallelism.
  * <p>
- * <b>Dynamic Resource Allocation:</b><br>
- * Built for cloud-native Kubernetes deployments, this processor bypasses static thread
- * assignments. It dynamically detects the container's available CPU limits via
- * {@link Runtime#availableProcessors()} to scale its processing power vertically.
+ * <b>Spill-to-Disk Integration:</b><br>
+ * In the legacy architecture, this processor loaded the entire dataset into memory.
+ * Under the new external merge sort pipeline, this class acts as a high-speed batch
+ * processor. The {@link ExternalMergeSorter} streams sorted data off the disk, groups
+ * a safe number of distinct keys (e.g., 10,000), and submits that specific batch here
+ * for parallel reduction.
  * </p>
  * <p>
  * <b>Work-Stealing Optimization:</b><br>
- * After the Shuffle phase, intermediate data is grouped by key. To process these grouped
- * records efficiently, the root task calculates a dynamic threshold based on the exact size
- * of the dataset and the available cores. This ensures the workload is split into the optimal
- * number of sub-tasks (aiming for ~15 per core), maximizing the efficiency of the
- * Fork/Join pool's work-stealing algorithm without unnecessary thread-management overhead.
+ * Because the incoming data is now bounded by batch sizes rather than partition sizes,
+ * the dynamic threshold calculation has been adjusted. It calculates the optimal split
+ * based on the batch size and available container CPU limits, ensuring the Fork/Join
+ * pool's work-stealing algorithm is maximally efficient without thread starvation.
  * </p>
  *
  * @author Ilias Bolanakis
- * @version 1.2
+ * @version 2.0
  * @see java.util.concurrent.RecursiveTask
  * @see java.util.concurrent.ForkJoinPool
  * @see com.iliasbolan.core.Reducer
- * @since 2026-03-30
+ * @since 2026-04-24
  */
 public class ReduceTaskProcessor extends RecursiveTask<List<KeyValuePair>> {
 
-    // Instantiate the SLF4J Logger specific to this class
     private static final Logger logger = LoggerFactory.getLogger(ReduceTaskProcessor.class);
 
     /** The dynamically calculated maximum number of distinct keys a single thread should process sequentially. */
     private final int threshold;
 
-    /** The grouped intermediate data, where each entry is a unique key and its list of values. */
-    private final List<Map.Entry<String, List<String>>> groupedRecords;
+    /** The grouped intermediate data batch, where each entry is a unique key and its list of values. */
+    private final List<Map.Entry<String, List<String>>> groupedBatch;
 
-    /** The starting index (inclusive) of the groupedRecords list assigned to this task. */
+    /** The starting index (inclusive) of the groupedBatch list assigned to this task. */
     private final int start;
 
-    /** The ending index (exclusive) of the groupedRecords list assigned to this task. */
+    /** The ending index (exclusive) of the groupedBatch list assigned to this task. */
     private final int end;
 
     /** The dynamically loaded user-defined Reducer implementation. */
     private final Reducer reducer;
 
     /**
-     * Constructs the ROOT {@code ReduceTaskProcessor} for a specific segment of grouped data.
-     * <p>
-     * <b>Threshold Calculation:</b> This constructor interrogates the JVM for the available
-     * processor count. It then divides the total number of distinct keys by {@code (cores * 15)}
-     * to calculate a target threshold. A {@link Math#max(int, int)} function guarantees the
-     * threshold never drops below 50 records, preventing fragmentation on over-provisioned pods
-     * handling smaller reduce partitions.
-     * </p>
+     * Constructs the ROOT {@code ReduceTaskProcessor} for a specific batch of grouped data.
      *
-     * @param groupedRecords The complete list of grouped records (Key -> List of Values).
-     * @param start          The starting index for this task's segment (usually 0).
-     * @param end            The ending index for this task's segment (usually {@code groupedRecords.size()}).
-     * @param reducer        The user's {@link Reducer} implementation dynamically loaded via Reflection.
+     * """
+     * Initializes the root Fork/Join task for a memory-safe batch of reduced records.
+     * * Calculates a dynamic split threshold based on available CPU cores to ensure
+     * that even constrained batch sizes (e.g., 5,000 keys) fan out effectively.
+     * * Args:
+     * groupedBatch (List[Map.Entry]): A memory-bounded list of grouped records (Key -> Values).
+     * start (int): The starting index for this task's segment (usually 0).
+     * end (int): The ending index for this task's segment.
+     * reducer (Reducer): The user's Reducer implementation.
+     * """
      */
-    public ReduceTaskProcessor(List<Map.Entry<String, List<String>>> groupedRecords, int start, int end, Reducer reducer) {
-        this.groupedRecords = groupedRecords;
+    public ReduceTaskProcessor(List<Map.Entry<String, List<String>>> groupedBatch, int start, int end, Reducer reducer) {
+        this.groupedBatch = groupedBatch;
         this.start = start;
         this.end = end;
         this.reducer = reducer;
 
-        // Dynamically calculate the threshold based on total grouped records and available K8s CPU limits
+        // Dynamically calculate the threshold based on the batch size and available K8s CPU limits.
+        // The minimum threshold is lowered to 10 to ensure smaller batches still distribute across cores.
         int cores = Runtime.getRuntime().availableProcessors();
-        this.threshold = Math.max(50, groupedRecords.size() / (cores * 15));
+        this.threshold = Math.max(10, groupedBatch.size() / (cores * 5));
 
-        logger.info("Initialized ROOT ReduceTaskProcessor. Unique Keys: {}, Detected Cores: {}, Calculated Threshold: {}",
-                groupedRecords.size(), cores, this.threshold);
+        logger.debug("Initialized ROOT ReduceTaskProcessor for Batch. Unique Keys: {}, Cores: {}, Threshold: {}",
+                groupedBatch.size(), cores, this.threshold);
     }
 
     /**
      * Internal constructor used exclusively for instantiating recursive sub-tasks.
-     * <p>
-     * <b>Performance Note:</b> By passing the pre-calculated {@code threshold} down the
-     * recursion tree, we eliminate the performance penalty of querying {@code Runtime.getRuntime()}
-     * and executing division math on every single fork.
-     * </p>
      *
-     * @param groupedRecords The complete list of grouped records.
-     * @param start          The starting index for this sub-task.
-     * @param end            The ending index for this sub-task.
-     * @param reducer        The instantiated Reducer object.
-     * @param threshold      The pre-calculated splitting threshold passed from the parent task.
+     * """
+     * Bypasses the heavy dynamic threshold calculation for sub-tasks to maximize performance.
+     * """
      */
-    private ReduceTaskProcessor(List<Map.Entry<String, List<String>>> groupedRecords, int start, int end, Reducer reducer, int threshold) {
-        this.groupedRecords = groupedRecords;
+    private ReduceTaskProcessor(List<Map.Entry<String, List<String>>> groupedBatch, int start, int end, Reducer reducer, int threshold) {
+        this.groupedBatch = groupedBatch;
         this.start = start;
         this.end = end;
         this.reducer = reducer;
@@ -107,16 +100,14 @@ public class ReduceTaskProcessor extends RecursiveTask<List<KeyValuePair>> {
     }
 
     /**
-     * The core parallel computation method invoked by the {@link java.util.concurrent.ForkJoinPool}.
-     * <p>
-     * If the workload is less than or equal to the dynamically calculated {@link #threshold},
-     * the grouped records are processed sequentially. Otherwise, the task is bifurcated.
-     * The left half is forked asynchronously to be picked up by another core, while the
-     * right half is computed immediately on the current thread.
-     * </p>
+     * The core parallel computation method invoked by the ForkJoinPool.
      *
-     * @return A consolidated {@link List} of all final {@link KeyValuePair} objects
-     * generated by this task and its sub-tasks.
+     * """
+     * Recursively splits the workload in half until the segment size falls below the threshold,
+     * at which point the segment is processed sequentially.
+     * * Returns:
+     * List[KeyValuePair]: A consolidated list of all final reduced pairs generated by this task tree.
+     * """
      */
     @Override
     protected List<KeyValuePair> compute() {
@@ -131,8 +122,8 @@ public class ReduceTaskProcessor extends RecursiveTask<List<KeyValuePair>> {
         int middle = start + (length / 2);
 
         // Pass the pre-calculated threshold to the sub-tasks
-        ReduceTaskProcessor leftTask = new ReduceTaskProcessor(groupedRecords, start, middle, reducer, threshold);
-        ReduceTaskProcessor rightTask = new ReduceTaskProcessor(groupedRecords, middle, end, reducer, threshold);
+        ReduceTaskProcessor leftTask = new ReduceTaskProcessor(groupedBatch, start, middle, reducer, threshold);
+        ReduceTaskProcessor rightTask = new ReduceTaskProcessor(groupedBatch, middle, end, reducer, threshold);
 
         // Fork the left task to run asynchronously
         leftTask.fork();
@@ -151,20 +142,20 @@ public class ReduceTaskProcessor extends RecursiveTask<List<KeyValuePair>> {
     }
 
     /**
-     * Iterates through the assigned segment of grouped records and applies the user's Reduce logic.
-     * <p>
-     * This method represents the "leaf" nodes of the execution tree. It passes each distinct key
-     * and its associated list of values to the user's custom {@link Reducer#reduce(String, List)}
-     * implementation to be aggregated.
-     * </p>
+     * Iterates through the assigned segment of the batch and applies the user's Reduce logic.
      *
-     * @return A {@link List} of final {@link KeyValuePair} objects generated from this segment.
+     * """
+     * The leaf-node execution logic. Passes distinct keys and value lists to the
+     * user-defined `reduce()` function.
+     * * Returns:
+     * List[KeyValuePair]: The final, reduced key-value results for this segment.
+     * """
      */
     private List<KeyValuePair> processSequentially() {
         List<KeyValuePair> finalResults = new ArrayList<>();
 
         for (int i = start; i < end; i++) {
-            Map.Entry<String, List<String>> entry = groupedRecords.get(i);
+            Map.Entry<String, List<String>> entry = groupedBatch.get(i);
 
             // Invoke the user's custom reduce function for this key and its values
             KeyValuePair reducedResult = reducer.reduce(entry.getKey(), entry.getValue());

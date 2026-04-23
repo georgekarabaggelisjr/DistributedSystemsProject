@@ -20,14 +20,14 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * directory structure and serialization format required for the P2P Shuffle phase.
  * </p>
  * <p>
- * <b>Peer-to-Peer (P2P) Architecture Update:</b><br>
- * These tests have been refactored to validate local disk persistence. Instead of
- * mocking a remote S3 service, the suite utilizes JUnit 5's <code>@TempDir</code>
+ * <b>Spill-to-Disk Architecture Update:</b><br>
+ * These tests have been refactored to validate the new highly concurrent,
+ * lock-striped disk persistence logic. They utilize JUnit 5's <code>@TempDir</code>
  * to perform real I/O operations in a safe, isolated temporary environment.
  * </p>
  *
  * @author Ilias Bolanakis
- * @version 2.0
+ * @version 3.0
  * @see com.iliasbolan.engine.ShufflePartitioner
  */
 class ShufflePartitionerTest {
@@ -50,19 +50,25 @@ class ShufflePartitionerTest {
         baseShuffleDir = tempDir.toString();
 
         // Initialize the partitioner with 3 target Reducers (R=3)
-        // Constructor now accepts baseShuffleDir instead of S3ClientService
         partitioner = new ShufflePartitioner(
                 baseShuffleDir, testJobId, testMapId, 3
         );
     }
 
     /**
-     * Verifies that the partitioner correctly groups identical keys and skips
-     * generating directories for partitions that receive no data.
-     * * @throws IOException If a file system error occurs during the partitioning process.
+     * Verifies that the thread-safe partitioner correctly groups identical keys and
+     * safely creates directory structures for active partitions.
+     * * """
+     * Validates the core routing and disk-spill mechanism.
+     * * Proves that batches are correctly segmented by hash and written to the
+     * correct deterministic files without data loss.
+     * * Raises:
+     * IOException: If a file system error occurs during the partitioning process.
+     * """
+     * @throws IOException If a file system error occurs during the partitioning process.
      */
     @Test
-    void testPartitionAndWriteLocal_CorrectlyGroupsKeysAndSkipsEmptyPartitions() throws IOException {
+    void testAppendThreadSafe_CorrectlyGroupsKeysAndSkipsEmptyPartitions() throws IOException {
         // Arrange: "apple" and "banana" will hash to specific partitions.
         // Include "apple" twice to ensure they end up in the same local file.
         List<KeyValuePair> intermediateData = List.of(
@@ -71,13 +77,11 @@ class ShufflePartitionerTest {
                 new KeyValuePair("apple", "1")
         );
 
-        // Act: Invoke the local write logic
-        partitioner.partitionAndWriteLocal(intermediateData);
+        // Act: Invoke the thread-safe local write logic
+        partitioner.appendThreadSafe(intermediateData);
 
         // Assert:
         // 1. Verify that only directories for active partitions were created
-        // We have 3 reducers, but we only expect directories for the partitions
-        // determined by the hash(key) % 3 logic.
         int applePartition = Math.abs("apple".hashCode()) % 3;
         int bananaPartition = Math.abs("banana".hashCode()) % 3;
 
@@ -96,17 +100,24 @@ class ShufflePartitionerTest {
     /**
      * Verifies that the partitioner adheres to the deterministic local path
      * naming convention required for the P2P embedded server to locate data.
-     * * @throws IOException If a file system error occurs.
+     * * """
+     * Validates the routing path generation.
+     * * Essential for the gRPC Server-Side Streaming to accurately fetch files
+     * requested by remote Reducers.
+     * * Raises:
+     * IOException: If a file system error occurs.
+     * """
+     * @throws IOException If a file system error occurs.
      */
     @Test
-    void testPartitionAndWriteLocal_DeterministicPathConvention() throws IOException {
+    void testAppendThreadSafe_DeterministicPathConvention() throws IOException {
         // Arrange: A single test key
         String testKey = "p2p-test";
         List<KeyValuePair> intermediateData = List.of(new KeyValuePair(testKey, "value"));
         int expectedPartition = Math.abs(testKey.hashCode()) % 3;
 
         // Act
-        partitioner.partitionAndWriteLocal(intermediateData);
+        partitioner.appendThreadSafe(intermediateData);
 
         // Assert: Verify the local path follows the required P2P convention:
         // {baseDir}/{jobId}/{partitionIndex}/{mapTaskId}.txt

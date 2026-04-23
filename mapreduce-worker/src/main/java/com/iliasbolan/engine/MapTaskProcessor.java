@@ -7,47 +7,38 @@ import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.RecursiveTask;
+import java.util.concurrent.RecursiveAction;
 
 /**
  * Executes the Map phase of a Map-Reduce job utilizing Java's Fork/Join Framework for
  * optimal intra-node parallelism.
+ * <p>
+ * <b>Spill-to-Disk Memory Optimization:</b><br>
+ * Upgraded to a {@link RecursiveAction} to completely bypass in-memory list aggregation.
+ * Instead of merging millions of intermediate records into a single master list, each
+ * thread processes a small subset of the data chunk and immediately delegates the
+ * results to a thread-safe {@link ShufflePartitioner}. This guarantees a flat memory
+ * footprint regardless of chunk density.
+ * </p>
  * <p>
  * <b>Dynamic Resource Allocation:</b><br>
  * Unlike traditional threaded applications with hardcoded thread counts, this processor is
  * designed for cloud-native Kubernetes environments. It dynamically detects the container's
  * available CPU limits using {@link Runtime#availableProcessors()}.
  * </p>
- * <p>
- * <b>Work-Stealing Optimization:</b><br>
- * To maximize the efficiency of the Fork/Join pool's work-stealing algorithm, the class
- * abandons a static threshold. Instead, the root task calculates a dynamic threshold based
- * on the exact size of the incoming 64MB data chunk and the number of available cores.
- * This ensures that the workload is bifurcated into an optimal number of sub-tasks
- * (approximately 15 per core), preventing both CPU under-utilization and thread-management thrashing.
- * </p>
- * <p>
- * Upon completion of the map operations, the caller is responsible for applying the
- * Shuffle partitioning logic and writing the intermediate files to the local disk
- * to be streamed by the peer-to-peer gRPC Shuffle Service.
- * </p>
  *
  * @author Ilias Bolanakis
- * @version 1.4
- * @see java.util.concurrent.RecursiveTask
+ * @version 2.0
+ * @see java.util.concurrent.RecursiveAction
  * @see java.util.concurrent.ForkJoinPool
  * @see com.iliasbolan.core.Mapper
- * @since 2026-03-30
+ * @since 2026-04-24
  */
-public class MapTaskProcessor extends RecursiveTask<List<KeyValuePair>> {
+public class MapTaskProcessor extends RecursiveAction {
 
-    // Instantiate the SLF4J Logger specific to this class
     private static final Logger logger = LoggerFactory.getLogger(MapTaskProcessor.class);
 
-    /**
-     * The dynamically calculated maximum number of records a single thread should process sequentially.
-     * If the assigned workload exceeds this limit, the task will be split.
-     */
+    /** The dynamically calculated maximum number of records a single thread should process sequentially. */
     private final int threshold;
 
     /** The subset of data records (e.g., lines of a file) to be processed. */
@@ -62,26 +53,30 @@ public class MapTaskProcessor extends RecursiveTask<List<KeyValuePair>> {
     /** The dynamically loaded user-defined Mapper implementation. */
     private final Mapper mapper;
 
+    /** The thread-safe partitioner responsible for spilling mapped data directly to local disk. */
+    private final ShufflePartitioner partitioner;
+
     /**
      * Constructs the ROOT {@code MapTaskProcessor} for a specific segment of the data chunk.
-     * <p>
-     * <b>Threshold Calculation:</b> This constructor interrogates the JVM for the available
-     * processor count. It then divides the total number of records by {@code (cores * 15)}
-     * to calculate a target threshold. A {@link Math#max(int, int)} function is applied to
-     * guarantee the threshold never drops below 100 records, preventing extreme fragmentation
-     * on highly over-provisioned nodes.
-     * </p>
      *
-     * @param records The complete list of records parsed from the downloaded chunk.
-     * @param start   The starting index for this task's segment (usually 0 for the root task).
-     * @param end     The ending index for this task's segment (usually {@code records.size()}).
-     * @param mapper  The user's {@link Mapper} implementation dynamically loaded via Reflection.
+     * """
+     * Initializes the root Fork/Join action for mapping records and spilling to disk.
+     * * Calculates a dynamic split threshold based on available CPU cores to ensure
+     * proper fan-out. Binds a shared Partitioner to handle concurrent disk writes.
+     * * Args:
+     * records (List[str]): The complete list of UTF-8 records parsed from the chunk.
+     * start (int): The starting index for this task's segment.
+     * end (int): The ending index for this task's segment.
+     * mapper (Mapper): The user's dynamic Mapper implementation.
+     * partitioner (ShufflePartitioner): The service handling concurrent disk spills.
+     * """
      */
-    public MapTaskProcessor(List<String> records, int start, int end, Mapper mapper) {
+    public MapTaskProcessor(List<String> records, int start, int end, Mapper mapper, ShufflePartitioner partitioner) {
         this.records = records;
         this.start = start;
         this.end = end;
         this.mapper = mapper;
+        this.partitioner = partitioner;
 
         // Dynamically calculate the threshold based on the total records and available K8s CPU limits
         int cores = Runtime.getRuntime().availableProcessors();
@@ -93,98 +88,87 @@ public class MapTaskProcessor extends RecursiveTask<List<KeyValuePair>> {
 
     /**
      * Internal constructor used exclusively for instantiating recursive sub-tasks.
-     * <p>
-     * <b>Performance Note:</b> By passing the pre-calculated {@code threshold} down the
-     * recursion tree, we eliminate the severe performance penalty of querying
-     * {@code Runtime.getRuntime()} and executing division operations on every single fork.
-     * </p>
      *
-     * @param records   The complete list of records.
-     * @param start     The starting index for this sub-task.
-     * @param end       The ending index for this sub-task.
-     * @param mapper    The instantiated Mapper object.
-     * @param threshold The pre-calculated splitting threshold passed from the parent task.
+     * """
+     * Bypasses the heavy dynamic threshold calculation for sub-tasks to maximize performance.
+     * """
      */
-    private MapTaskProcessor(List<String> records, int start, int end, Mapper mapper, int threshold) {
+    private MapTaskProcessor(List<String> records, int start, int end, Mapper mapper, ShufflePartitioner partitioner, int threshold) {
         this.records = records;
         this.start = start;
         this.end = end;
         this.mapper = mapper;
+        this.partitioner = partitioner;
         this.threshold = threshold;
     }
 
     /**
      * The core parallel computation method invoked by the {@link java.util.concurrent.ForkJoinPool}.
-     * <p>
-     * If the assigned workload ({@code end - start}) is less than or equal to the calculated
-     * {@link #threshold}, the records are processed synchronously on the current thread.
-     * Otherwise, the task is bifurcated. The left half is forked asynchronously to be
-     * picked up by another available core, while the right half is computed immediately.
-     * </p>
      *
-     * @return A consolidated {@link List} of all intermediate {@link KeyValuePair} objects
-     * generated by this task and all of its underlying sub-tasks.
+     * """
+     * Recursively splits the workload in half until the segment size falls below the threshold.
+     * * Because this is a RecursiveAction, no data is merged or returned. Threads execute
+     * their batches and flush to disk independently.
+     * """
      */
     @Override
-    protected List<KeyValuePair> compute() {
+    protected void compute() {
         int length = end - start;
 
         // Base case: workload is small enough to process sequentially
         if (length <= threshold) {
-            return processSequentially();
+            processSequentially();
+            return;
         }
 
         // Recursive case: split the workload in half
         int middle = start + (length / 2);
 
-        // Pass the pre-calculated threshold to the sub-tasks
-        MapTaskProcessor leftTask = new MapTaskProcessor(records, start, middle, mapper, threshold);
-        MapTaskProcessor rightTask = new MapTaskProcessor(records, middle, end, mapper, threshold);
+        MapTaskProcessor leftTask = new MapTaskProcessor(records, start, middle, mapper, partitioner, threshold);
+        MapTaskProcessor rightTask = new MapTaskProcessor(records, middle, end, mapper, partitioner, threshold);
 
         // Fork the left task to run asynchronously on another thread
         leftTask.fork();
 
         // Compute the right task immediately on the current thread
-        List<KeyValuePair> rightResult = rightTask.compute();
+        rightTask.compute();
 
-        // Wait for the left task to complete and retrieve its result
-        List<KeyValuePair> leftResult = leftTask.join();
-
-        // Merge the intermediate results
-        List<KeyValuePair> mergedResult = new ArrayList<>(leftResult);
-        mergedResult.addAll(rightResult);
-
-        return mergedResult;
+        // Wait for the left task to complete
+        leftTask.join();
     }
 
     /**
-     * Iterates through the assigned segment of records and applies the user's Map logic.
-     * <p>
-     * This method represents the "leaf" nodes of the execution tree. It loops through its
-     * designated index range, passing each line to the user's custom {@link Mapper#map(String, String)}
-     * implementation.
-     * </p>
+     * Iterates through the assigned segment of records, applies the Map logic, and flushes to disk.
      *
-     * @return A {@link List} of intermediate {@link KeyValuePair} objects generated from this segment.
+     * """
+     * The leaf-node execution logic. Passes lines to the user-defined `map()` function
+     * and immediately flushes the intermediate results to the thread-safe Partitioner.
+     * * Raises:
+     * RuntimeException: If the disk spill operation fails.
+     * """
      */
-    private List<KeyValuePair> processSequentially() {
-        List<KeyValuePair> intermediateResults = new ArrayList<>();
+    private void processSequentially() {
+        List<KeyValuePair> localBuffer = new ArrayList<>();
 
         for (int i = start; i < end; i++) {
             String record = records.get(i);
-
-            // In a standard text processing job, the key could be the line number or an offset.
-            // For simplicity, we pass the line number as a String.
             String key = String.valueOf(i);
 
-            // Invoke the user's custom map function
             List<KeyValuePair> mappedPairs = mapper.map(key, record);
 
             if (mappedPairs != null) {
-                intermediateResults.addAll(mappedPairs);
+                localBuffer.addAll(mappedPairs);
             }
         }
 
-        return intermediateResults;
+        // Flush directly to disk via the partitioner, completely bypassing root list aggregation
+        if (!localBuffer.isEmpty()) {
+            try {
+                partitioner.appendThreadSafe(localBuffer);
+            } catch (Exception e) {
+                logger.error("Failed to spill mapped records to disk", e);
+                throw new RuntimeException("Disk spill failed during Map phase", e);
+            }
+        }
     }
 }
