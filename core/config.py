@@ -1,9 +1,8 @@
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     # FastAPI
     PROJECT_NAME: str = "MapReduce UI Gateway"
-    VERSION: str = "1.0.0"
 
     # PostgreSQL (DDS)
     DATABASE_URL: str
@@ -27,9 +26,8 @@ class Settings(BaseSettings):
     MANAGER_SERVICE_DNS: str = "manager-service.default.svc.cluster.local"
     MANAGER_REPLICAS: int = 3
 
-    class Config:
-        env_file = ".env"
-        case_sensitive = True
+    # Pydantic V2 Config
+    model_config = SettingsConfigDict(env_file=".env", case_sensitive=True)
 
 # Instantiate a global settings object to be imported by other modules
 settings = Settings()
