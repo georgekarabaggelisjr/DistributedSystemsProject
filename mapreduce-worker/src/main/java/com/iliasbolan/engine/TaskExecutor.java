@@ -2,9 +2,6 @@ package com.iliasbolan.engine;
 
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.iliasbolan.core.KeyValuePair;
-import com.iliasbolan.core.Mapper;
-import com.iliasbolan.core.Reducer;
 import com.iliasbolan.core.TaskPayload;
 import com.iliasbolan.messaging.RabbitMqProducer;
 import com.iliasbolan.storage.S3ClientService;
@@ -19,35 +16,34 @@ import com.iliasbolan.grpc.shuffle.PartitionChunk;
 
 import java.io.BufferedOutputStream;
 import java.io.FileOutputStream;
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.Iterator;
 import java.util.List;
-import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.TimeUnit;
 
 /**
  * The central orchestration engine for executing Map-Reduce tasks on the Worker node.
  * <p>
  * This class acts as the critical bridge between the messaging layer (RabbitMQ) and
- * the computation layer (JVM Threads). It handles the full lifecycle of a task
- * execution, ensuring that remote resources are localized and processed via
- * parallel decomposition.
+ * the computation layer. To ensure enterprise-grade stability and security, this
+ * orchestrator delegates all untrusted byte-code execution to an isolated Child JVM
+ * ({@link SandboxRunner}).
  * </p>
  * <h3>Core Responsibilities:</h3>
  * <ul>
  * <li><b>Deserialization:</b> Converting raw JSON payloads into validated {@link TaskPayload} objects.</li>
  * <li><b>Resource Acquisition:</b> Coordinating with {@link S3ClientService} to localize bytecode and data.</li>
- * <li><b>Dynamic Execution:</b> Leveraging Reflection to instantiate user logic at runtime.</li>
- * <li><b>Parallelism:</b> Dispatching workloads to a shared {@link ForkJoinPool} for multi-core utilization.</li>
  * <li><b>gRPC P2P Shuffle:</b> Utilizing gRPC Server-Side Streaming to fetch intermediate data.</li>
- * <li><b>Spill-to-Disk Resilience:</b> Streams gRPC payloads and Map results directly to the local filesystem to prevent OOM errors on massive datasets.</li>
- * <li><b>Lifecycle Signaling:</b> Reporting task completion and network coordinates to the Manager via {@link RabbitMqProducer}.</li>
+ * <li><b>Process Isolation (Sandboxing):</b> Spawning ephemeral child processes to execute user code,
+ * entirely preventing ClassLoader memory leaks and main-thread security compromises.</li>
+ * <li><b>Lifecycle Signaling:</b> Reporting task completion and network coordinates to the Manager.</li>
  * </ul>
  *
  * @author Ilias Bolanakis
- * @version 4.1
+ * @version 5.0
  * @since 2026-04-24
  */
 public class TaskExecutor {
@@ -58,7 +54,6 @@ public class TaskExecutor {
             .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
 
     private final S3ClientService s3ClientService;
-    private final ForkJoinPool forkJoinPool;
     private final String baseShuffleDir;
     private final RabbitMqProducer eventProducer;
     private final String podIp;
@@ -68,10 +63,8 @@ public class TaskExecutor {
         this.baseShuffleDir = baseShuffleDir;
         this.eventProducer = eventProducer;
         this.podIp = podIp;
-        this.forkJoinPool = ForkJoinPool.commonPool();
 
-        logger.info("Initialized TaskExecutor with parallel ForkJoinPool (Parallelism: {}) and Pod IP: {}",
-                forkJoinPool.getParallelism(), podIp);
+        logger.info("Initialized TaskExecutor (Sandbox Orchestrator Mode). Pod IP: {}", podIp);
     }
 
     public void executeTask(String jsonPayload) throws Throwable {
@@ -79,9 +72,9 @@ public class TaskExecutor {
         logger.info("Successfully parsed task payload. JobId: {}, TaskType: {}", payload.jobId(), payload.taskType());
 
         if ("MAP".equalsIgnoreCase(payload.taskType())) {
-            executeMapPhase(payload);
+            executeMapPhase(payload, jsonPayload);
         } else if ("REDUCE".equalsIgnoreCase(payload.taskType())) {
-            executeReducePhase(payload);
+            executeReducePhase(payload, jsonPayload);
         } else {
             throw new IllegalArgumentException("Unknown task type received: " + payload.taskType());
         }
@@ -91,17 +84,15 @@ public class TaskExecutor {
      * Orchestrates the complete lifecycle of a distributed MAP task.
      *
      * """
-     * Executes the Map phase utilizing a strictly memory-safe disk-spill architecture.
-     * * Downloads the required data chunk and delegates computation to the ForkJoinPool.
-     * The processing threads stream intermediate pairs directly to the local disk via
-     * the ShufflePartitioner, completely bypassing memory-bound lists.
+     * Prepares the environment and delegates Map execution to the Sandbox JVM.
      * * Args:
      * payload (TaskPayload): The metadata required to execute the specific map chunk.
+     * rawJson (String): The unparsed JSON string, passed as an argument to the child process.
      * * Raises:
-     * Throwable: If an error occurs during resource acquisition or data processing.
+     * Throwable: If an error occurs during resource acquisition or the child JVM fails.
      * """
      */
-    private void executeMapPhase(TaskPayload payload) throws Throwable {
+    private void executeMapPhase(TaskPayload payload, String rawJson) throws Throwable {
         logger.info("--- [ STARTING MAP PHASE: Task {} ] ---", payload.taskId());
 
         String packagePath = payload.className().replace(".", "/");
@@ -112,32 +103,13 @@ public class TaskExecutor {
         fileObj.getParentFile().mkdirs();
         s3ClientService.downloadUserCode(payload.userCodeBucket(), payload.userCodeObject(), localCodePath);
 
-        Mapper mapper = DynamicClassLoader.loadMapper(localCodeDir, payload.className());
+        // Persist the payload so the Sandbox JVM can read its instructions
+        Path payloadFile = Paths.get("/tmp/mapreduce/payloads", payload.jobId() + "_map_" + payload.taskId() + ".json");
+        Files.createDirectories(payloadFile.getParent());
+        Files.writeString(payloadFile, rawJson);
 
-        List<String> records = s3ClientService.readDataChunk(
-                payload.bucketName(),
-                payload.objectName(),
-                payload.byteOffset(),
-                payload.byteLength()
-        );
-
-        logger.info("Successfully received {} clean records from S3 service.", records.size());
-
-        // Initialize the partitioner first to handle concurrent disk spills
-        ShufflePartitioner partitioner = new ShufflePartitioner(
-                baseShuffleDir,
-                payload.jobId(),
-                payload.taskId(),
-                payload.numReducers()
-        );
-
-        // Pass the partitioner into the MapTaskProcessor
-        MapTaskProcessor rootMapTask = new MapTaskProcessor(records, 0, records.size(), mapper, partitioner);
-
-        // Execute the void action. Threads will process batches and flush to disk independently.
-        forkJoinPool.invoke(rootMapTask);
-
-        logger.info("Parallel Map processing and disk-spilling complete.");
+        logger.info("Delegating Map computation to Ephemeral Sandbox JVM...");
+        runSandbox(payloadFile);
 
         String grpcPort = System.getenv().getOrDefault("SHUFFLE_GRPC_PORT", "50051");
         String workerBindAddress = this.podIp + ":" + grpcPort;
@@ -148,20 +120,19 @@ public class TaskExecutor {
     }
 
     /**
-     * Orchestrates the REDUCE task lifecycle utilizing gRPC Server-Side Streaming and Spill-to-Disk.
+     * Orchestrates the REDUCE task lifecycle utilizing gRPC and the Sandbox JVM.
      *
      * """
-     * Executes the Reduce phase by streaming remote partition data directly to local disk.
-     * * This implements the first stage of the Spill-to-Disk architecture, preventing OOM
-     * errors by bypassing in-memory collections for the raw gRPC payload. It then delegates
-     * to the ExternalMergeSorter for grouped processing.
+     * Executes the Reduce phase by streaming remote partition data directly to local disk,
+     * then spawning the Sandbox to safely execute the External Merge Sort and user reduction.
      * * Args:
      * payload (TaskPayload): The metadata required to aggregate the intermediate partition.
+     * rawJson (String): The unparsed JSON string.
      * * Raises:
-     * Throwable: If gRPC network fetching, sorting, or final output persistence fails.
+     * Throwable: If gRPC network fetching fails, or the child JVM crashes.
      * """
      */
-    private void executeReducePhase(TaskPayload payload) throws Throwable {
+    private void executeReducePhase(TaskPayload payload, String rawJson) throws Throwable {
         logger.info("--- [ STARTING REDUCE PHASE: Partition {} for Job {} ] ---", payload.taskId(), payload.jobId());
 
         String packagePath = payload.className().replace(".", "/");
@@ -172,7 +143,6 @@ public class TaskExecutor {
         fileObj.getParentFile().mkdirs();
         s3ClientService.downloadUserCode(payload.userCodeBucket(), payload.userCodeObject(), localCodePath);
 
-        Reducer reducer = DynamicClassLoader.loadReducer(localCodeDir, payload.className());
         int partitionIndex = Integer.parseInt(payload.taskId());
 
         // 1. Prepare Local Directory for Raw gRPC Spills
@@ -203,7 +173,6 @@ public class TaskExecutor {
                         .setPartitionId(partitionIndex)
                         .build();
 
-                // Consume the gRPC stream and write bytes directly to disk (UTF-8 safe)
                 Iterator<PartitionChunk> chunkStream = stub.getPartition(request);
                 while (chunkStream.hasNext()) {
                     PartitionChunk chunk = chunkStream.next();
@@ -217,23 +186,59 @@ public class TaskExecutor {
             }
         }
 
-        // 3. External Merge Sort and Reduce
-        logger.info("gRPC streams persisted. Initiating External Merge Sort...");
+        // 3. Delegate to Sandbox for External Merge Sort & Reduce Execution
+        Path payloadFile = Paths.get("/tmp/mapreduce/payloads", payload.jobId() + "_reduce_" + payload.taskId() + ".json");
+        Files.createDirectories(payloadFile.getParent());
+        Files.writeString(payloadFile, rawJson);
 
-        // Output path for final S3 upload
-        String finalPath = String.format("%s/output/result_part_%d.txt", payload.jobId(), partitionIndex);
+        logger.info("gRPC streams persisted. Delegating External Merge Sort and Reduce to Sandbox JVM...");
+        runSandbox(payloadFile);
 
-        // The ExternalMergeSorter handles chunking, sorting, and passing data to the Reducer
-        // It returns the file path containing the final reduced results
-        Path finalReducedFile = ExternalMergeSorter.sortReduceAndSpill(rawDataDir, reducer, forkJoinPool);
-
-        // 4. Persist final results to S3
-        logger.info("Uploading final reduced data to S3...");
-        s3ClientService.writeData(payload.bucketName(), finalPath, Files.readString(finalReducedFile));
-
-        // Cleanup local temporary files to preserve disk space
+        // 4. Cleanup local temporary gRPC files (S3 upload was handled by Sandbox)
         ExternalMergeSorter.cleanupDirectory(rawDataDir);
 
+        String finalPath = String.format("%s/output/result_part_%d.txt", payload.jobId(), partitionIndex);
         logger.info("--- [ SUCCESSFULLY COMPLETED REDUCE PHASE: {} ] ---", finalPath);
+    }
+
+    /**
+     * Spawns an isolated Child JVM to execute untrusted user code.
+     *
+     * """
+     * Bootstraps the SandboxRunner via a native OS ProcessBuilder.
+     * * This architectural boundary prevents user-code from accessing the primary worker's
+     * memory space, avoiding ClassLoader Metaspace leaks and shielding core orchestration
+     * threads from fatal exceptions.
+     * * Args:
+     * payloadFile (Path): The temporary file containing the task execution instructions.
+     * * Raises:
+     * RuntimeException: If the child JVM exits with a non-zero failure code.
+     * """
+     */
+    private void runSandbox(Path payloadFile) throws IOException, InterruptedException {
+        String javaHome = System.getProperty("java.home");
+        String javaBin = Paths.get(javaHome, "bin", "java").toString();
+        String classpath = System.getProperty("java.class.path");
+
+        ProcessBuilder pb = new ProcessBuilder(
+                javaBin,
+                "-cp", classpath,
+                "com.iliasbolan.engine.SandboxRunner",
+                payloadFile.toAbsolutePath().toString(),
+                this.baseShuffleDir
+        );
+
+        // Inherit IO so the Sandbox's logs are seamlessly piped to the main K8s console
+        pb.inheritIO();
+
+        Process process = pb.start();
+        int exitCode = process.waitFor();
+
+        // Secure cleanup
+        Files.deleteIfExists(payloadFile);
+
+        if (exitCode != 0) {
+            throw new RuntimeException("Sandbox JVM terminated abnormally with exit code: " + exitCode);
+        }
     }
 }

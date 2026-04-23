@@ -10,22 +10,41 @@ import static org.junit.jupiter.api.Assertions.*;
 
 /**
  * Unit tests for the {@link DynamicClassLoader}.
- * This verifies that the reflection-based loading logic correctly validates
- * class types and handles missing resources gracefully.
- * NOTE: To test a "Success" case for loading an actual Mapper/Reducer,
- * We would need to have a compiled .class file at a specific path
- * that is NOT already in the system classpath.
- * In a production CI pipeline, we would often compile a "DummyMapper.java"
- * to a temp folder during the test setup to verify the success path.
+ * <p>
+ * This suite verifies that the reflection-based loading logic correctly validates
+ * class types and handles missing resources gracefully within the isolated
+ * sandbox environment.
+ * </p>
+ * <p>
+ * <b>Sandbox Integration Note:</b><br>
+ * These tests simulate the staging directory structure used by the {@link SandboxRunner}.
+ * By utilizing the project's own build directory, we can verify the validation logic
+ * against known types while ensuring that the <code>URLClassLoader</code> correctly
+ * isolates the loading context.
+ * </p>
+ *
+ * @author Ilias Bolanakis
+ * @version 2.0
+ * @see com.iliasbolan.engine.DynamicClassLoader
  */
 class DynamicClassLoaderTest {
 
-    // Use the project's own build directory to find classes for testing
+    /** * Use the project's own build directory to find classes for testing.
+     * In a sandbox environment, this corresponds to the staged bytecode directory.
+     */
     private final String currentClasspath = new File("target/classes").getAbsolutePath();
 
+    /**
+     * Verifies that the loader correctly rejects classes that do not implement
+     * the {@link Mapper} interface.
+     * <p>
+     * This test uses the {@link TaskExecutor} class as a known existing class
+     * that fails the interface validation.
+     * </p>
+     */
     @Test
     void testLoadMapper_Failure_ClassDoesNotImplementInterface() {
-        // Arrange: Use a class that exists (TaskExecutor) but is NOT a Mapper
+        // Arrange: Use a class that exists but is NOT a Mapper
         String className = "com.iliasbolan.engine.TaskExecutor";
 
         // Act & Assert: It should throw IllegalArgumentException during validation
@@ -33,9 +52,14 @@ class DynamicClassLoaderTest {
                 DynamicClassLoader.loadMapper(currentClasspath, className)
         );
 
-        assertTrue(exception.getMessage().contains("does not implement the Mapper interface"));
+        assertTrue(exception.getMessage().contains("does not implement the Mapper interface"),
+                "Exception message should indicate interface validation failure.");
     }
 
+    /**
+     * Verifies that the loader correctly rejects classes that do not implement
+     * the {@link Reducer} interface.
+     */
     @Test
     void testLoadReducer_Failure_ClassDoesNotImplementInterface() {
         // Arrange: Use a class that exists but is NOT a Reducer
@@ -46,9 +70,14 @@ class DynamicClassLoaderTest {
                 DynamicClassLoader.loadReducer(currentClasspath, className)
         );
 
-        assertTrue(exception.getMessage().contains("does not implement the Reducer interface"));
+        assertTrue(exception.getMessage().contains("does not implement the Reducer interface"),
+                "Exception message should indicate interface validation failure.");
     }
 
+    /**
+     * Verifies that the loader correctly propagates a {@link ClassNotFoundException}
+     * when an invalid class name is provided.
+     */
     @Test
     void testLoadClass_Failure_ClassNotFound() {
         // Arrange: A class name that definitely doesn't exist
@@ -60,6 +89,13 @@ class DynamicClassLoaderTest {
         );
     }
 
+    /**
+     * Verifies that the loader handles non-existent directories gracefully.
+     * <p>
+     * While the loader logs a warning for missing directories, the actual
+     * loading attempt should still result in a {@link ClassNotFoundException}.
+     * </p>
+     */
     @Test
     void testLoadClass_Failure_InvalidDirectory() {
         // Arrange: A directory path that doesn't exist

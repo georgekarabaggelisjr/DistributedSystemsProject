@@ -6,113 +6,107 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.File;
-import java.io.IOException;
-import java.net.MalformedURLException;
 import java.net.URL;
 import java.net.URLClassLoader;
 
 /**
  * A utility class responsible for dynamically loading user-provided Map and Reduce classes at runtime.
  * <p>
- * In a distributed Map-Reduce architecture, Worker nodes are generic compute engines.
- * They receive compiled user code (typically a {@code .class} or {@code .jar} file) from a
- * Shared File System and must load this code into the JVM dynamically. This class utilizes
- * {@link URLClassLoader} and Java Reflection to instantiate the user's logic and cast it
+ * This class is a core component of the worker's security boundary. It is designed to run
+ * exclusively within the isolated {@link SandboxRunner} JVM. By loading untrusted third-party
+ * bytecode into an ephemeral process, the system prevents Metaspace memory leaks and
+ * protects the primary worker daemon from malicious code execution.
+ * </p>
+ * <p>
+ * The loader utilizes the Java Reflection API to instantiate the user's logic and cast it
  * to the system's strict {@link Mapper} or {@link Reducer} interfaces.
  * </p>
  *
  * @author Ilias Bolanakis
- * @version 1.1
+ * @version 2.0
  * @since 2026-03-30
  */
 public class DynamicClassLoader {
 
-    // Instantiate the SLF4J Logger specific to this class
     private static final Logger logger = LoggerFactory.getLogger(DynamicClassLoader.class);
 
     /**
-     * Dynamically loads a Java class from a specified file path and attempts to instantiate it
-     * as a {@link Mapper}.
+     * Dynamically loads and instantiates a {@link Mapper} implementation from the filesystem.
      *
-     * @param directoryPath The absolute or relative path to the directory containing the compiled class.
-     * @param className     The fully qualified name of the class (e.g., "com.user.MyMapper").
-     * @return An instantiated object that implements the {@link Mapper} interface.
-     * @throws Exception If the file cannot be found, the class cannot be loaded, or it does not implement {@link Mapper}.
+     * @param directoryPath The local path where the bytecode was staged by the Orchestrator.
+     * @param className     The fully qualified name of the user's Mapper class.
+     * @return An instantiated and validated {@link Mapper} object.
+     * @throws IllegalArgumentException If the loaded class does not implement the Mapper interface.
+     * @throws Exception                If the class cannot be found or instantiation fails.
      */
     public static Mapper loadMapper(String directoryPath, String className) throws Exception {
-        logger.info("Attempting to load Mapper class '{}' from directory: {}", className, directoryPath);
+        logger.info("Sandbox: Attempting to load Mapper class '{}' from {}", className, directoryPath);
 
         Class<?> loadedClass = loadClassFromFile(directoryPath, className);
 
         // Ensure the user's class actually implements our Mapper interface
         if (!Mapper.class.isAssignableFrom(loadedClass)) {
-            logger.error("Validation failed: Class '{}' does not implement the core Mapper interface.", className);
+            logger.error("Sandbox Validation Error: Class '{}' does not implement Mapper.", className);
             throw new IllegalArgumentException("The provided class does not implement the Mapper interface.");
         }
 
-        // Instantiate and cast
-        Mapper mapperInstance = (Mapper) loadedClass.getDeclaredConstructor().newInstance();
-        logger.info("Successfully instantiated Mapper: {}", className);
-
-        return mapperInstance;
+        // Instantiate using the default no-args constructor via reflection
+        return (Mapper) loadedClass.getDeclaredConstructor().newInstance();
     }
 
     /**
-     * Dynamically loads a Java class from a specified file path and attempts to instantiate it
-     * as a {@link Reducer}.
+     * Dynamically loads and instantiates a {@link Reducer} implementation from the filesystem.
      *
-     * @param directoryPath The absolute or relative path to the directory containing the compiled class.
-     * @param className     The fully qualified name of the class (e.g., "com.user.MyReducer").
-     * @return An instantiated object that implements the {@link Reducer} interface.
-     * @throws Exception If the file cannot be found, the class cannot be loaded, or it does not implement {@link Reducer}.
+     * @param directoryPath The local path where the bytecode was staged by the Orchestrator.
+     * @param className     The fully qualified name of the user's Reducer class.
+     * @return An instantiated and validated {@link Reducer} object.
+     * @throws IllegalArgumentException If the loaded class does not implement the Reducer interface.
+     * @throws Exception                If the class cannot be found or instantiation fails.
      */
     public static Reducer loadReducer(String directoryPath, String className) throws Exception {
-        logger.info("Attempting to load Reducer class '{}' from directory: {}", className, directoryPath);
+        logger.info("Sandbox: Attempting to load Reducer class '{}' from {}", className, directoryPath);
 
         Class<?> loadedClass = loadClassFromFile(directoryPath, className);
 
         // Ensure the user's class actually implements our Reducer interface
         if (!Reducer.class.isAssignableFrom(loadedClass)) {
-            logger.error("Validation failed: Class '{}' does not implement the core Reducer interface.", className);
+            logger.error("Sandbox Validation Error: Class '{}' does not implement Reducer.", className);
             throw new IllegalArgumentException("The provided class does not implement the Reducer interface.");
         }
 
-        // Instantiate and cast
-        Reducer reducerInstance = (Reducer) loadedClass.getDeclaredConstructor().newInstance();
-        logger.info("Successfully instantiated Reducer: {}", className);
-
-        return reducerInstance;
+        // Instantiate using the default no-args constructor
+        return (Reducer) loadedClass.getDeclaredConstructor().newInstance();
     }
 
     /**
      * Core reflection logic to load a class into the JVM from a file directory.
+     * <p>
+     * This method initializes a {@link URLClassLoader} scoped to the task's staged bytecode
+     * directory. It uses a try-with-resources block to ensure the ClassLoader is marked
+     * for closure immediately after the Class object is successfully loaded.
+     * </p>
      *
      * @param directoryPath The path to the directory containing the {@code .class} files.
      * @param className     The fully qualified name of the class to load.
      * @return The loaded {@link Class} object.
-     * @throws MalformedURLException If the directory path cannot be converted to a valid URL.
-     * @throws ClassNotFoundException If the specific class name cannot be found in the directory.
-     * @throws IOException If an I/O error occurs while closing the URLClassLoader.
+     * @throws Exception If the path is invalid or the class is not found.
      */
-    private static Class<?> loadClassFromFile(String directoryPath, String className)
-            throws MalformedURLException, ClassNotFoundException, IOException {
-
+    private static Class<?> loadClassFromFile(String directoryPath, String className) throws Exception {
         File file = new File(directoryPath);
 
         if (!file.exists() || !file.isDirectory()) {
-            logger.warn("The directory '{}' does not exist or is not a valid directory. Class loading may fail.", directoryPath);
+            logger.warn("Sandbox I/O Warning: Staging directory '{}' missing or invalid.", directoryPath);
         }
 
-        // Convert the file path to a URL format required by URLClassLoader
+        // Convert the local file path to a URL format required by URLClassLoader
         URL url = file.toURI().toURL();
         URL[] urls = new URL[]{url};
 
-        // Create a new ClassLoader pointed at the specific directory
+        // Standard parent-last loading to prefer staged bytecode over worker internals
         try (URLClassLoader classLoader = new URLClassLoader(urls, DynamicClassLoader.class.getClassLoader())) {
-            // Load the class into the JVM
             return classLoader.loadClass(className);
         } catch (ClassNotFoundException e) {
-            logger.error("Failed to find class '{}' inside directory '{}'", className, directoryPath, e);
+            logger.error("Sandbox Runtime Error: Class '{}' not found in path {}", className, directoryPath);
             throw e;
         }
     }

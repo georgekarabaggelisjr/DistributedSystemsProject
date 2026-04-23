@@ -1,9 +1,6 @@
 package com.iliasbolan.engine;
 
 import com.google.protobuf.ByteString;
-import com.iliasbolan.core.KeyValuePair;
-import com.iliasbolan.core.Mapper;
-import com.iliasbolan.core.Reducer;
 import com.iliasbolan.grpc.shuffle.PartitionChunk;
 import com.iliasbolan.grpc.shuffle.ShuffleServiceGrpc;
 import com.iliasbolan.messaging.RabbitMqProducer;
@@ -13,15 +10,11 @@ import io.grpc.ManagedChannelBuilder;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
-import org.mockito.ArgumentCaptor;
+import org.mockito.MockedConstruction;
 import org.mockito.MockedStatic;
 import org.mockito.Mockito;
 
-import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.Paths;
-import java.util.Arrays;
-import java.util.Collections;
 import java.util.Iterator;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -31,22 +24,20 @@ import static org.mockito.Mockito.*;
 /**
  * Unit tests for the {@link TaskExecutor} orchestration engine.
  * <p>
- * <b>Spill-to-Disk Architecture Update:</b><br>
- * This suite has been upgraded to validate the end-to-end memory-safe pipeline.
- * It verifies that the `MapTaskProcessor` correctly bypasses list aggregation and
- * flushes directly to the local disk, and proves that the `ExternalMergeSorter`
- * successfully reads raw gRPC streams, sorts them in memory bounds, and delegates
- * them to the Batch Processor.
+ * <b>Sandbox Orchestrator Update:</b><br>
+ * This suite has been heavily refactored to validate the new Lightweight Orchestrator pattern.
+ * Instead of testing in-memory class loading and Fork/Join pooling, it now validates that the
+ * engine correctly provisions local resources, streams gRPC partitions, and securely delegates
+ * untrusted execution to an isolated Child JVM via {@link ProcessBuilder}.
  * </p>
  * <p>
  * <b>Testing Strategy:</b><br>
- * Utilizes Mockito for dependency injection and {@code MockedStatic} for intercepting
- * dynamic class loading and gRPC network construction. Real file I/O is permitted
- * within the JUnit 5 {@code @TempDir} to fully test the External Merge Sort mechanics.
+ * Utilizes Mockito 5's {@code mockConstruction} to intercept native OS process creation,
+ * simulating sandbox success and failure states without booting actual JVMs during the test lifecycle.
  * </p>
  *
  * @author Ilias Bolanakis
- * @version 4.0
+ * @version 5.0
  * @since 2026-04-24
  */
 class TaskExecutorTest {
@@ -70,23 +61,21 @@ class TaskExecutorTest {
     }
 
     /**
-     * Validates that a MAP task correctly executes the full memory-safe pipeline.
+     * Validates that a MAP task correctly provisions the environment and launches the Sandbox.
      *
      * """
-     * Verifies the end-to-end Map phase with localized disk-spilling.
-     * * Ensures that the dynamic Map logic processes the chunk and correctly
-     * invokes the thread-safe `ShufflePartitioner` to write intermediate files
-     * to the container's disk before signaling the Orchestrator.
+     * Verifies the orchestration sequence for Map tasks.
+     * * Ensures that the payload is safely persisted to disk, the `ProcessBuilder` is invoked
+     * with the correct sandbox classpath, and the control plane is signaled upon success.
      * * Raises:
-     * Throwable: If any mocked I/O or reflection phase fails.
+     * Throwable: If mocked OS process interception fails.
      * """
-     * @throws Throwable if any stage of the map phase fails.
      */
     @Test
-    void testExecuteTask_SuccessfulMapPhase_OrchestratesFullPipelineAndSpillsToDisk() throws Throwable {
+    void testExecuteTask_SuccessfulMapPhase_DelegatesToSandboxAndSignalsManager() throws Throwable {
         String jsonPayload = """
                 {
-                    "jobId": "job-grpc-test",
+                    "jobId": "job-sandbox-test",
                     "taskId": "map-001",
                     "taskType": "MAP",
                     "bucketName": "input-bucket",
@@ -101,52 +90,50 @@ class TaskExecutorTest {
                 }
                 """;
 
-        when(mockS3Service.readDataChunk(anyString(), anyString(), anyLong(), anyLong()))
-                .thenReturn(Arrays.asList("distributed systems", "grpc shuffle"));
+        Process mockProcess = mock(Process.class);
+        when(mockProcess.waitFor()).thenReturn(0); // Simulate successful Sandbox exit
 
-        Mapper dummyMapper = (key, value) -> Collections.singletonList(new KeyValuePair(value, "1"));
-
-        try (MockedStatic<DynamicClassLoader> mockedLoader = Mockito.mockStatic(DynamicClassLoader.class)) {
-            mockedLoader.when(() -> DynamicClassLoader.loadMapper(anyString(), anyString()))
-                    .thenReturn(dummyMapper);
+        // Intercept native OS process creation
+        try (MockedConstruction<ProcessBuilder> mockedPb = mockConstruction(ProcessBuilder.class,
+                (mock, context) -> {
+                    when(mock.start()).thenReturn(mockProcess);
+                    when(mock.inheritIO()).thenReturn(mock);
+                })) {
 
             taskExecutor.executeTask(jsonPayload);
+
+            // Assert 1: The ProcessBuilder was actually invoked to spawn the SandboxRunner
+            assertEquals(1, mockedPb.constructed().size(), "Sandbox JVM was never spawned.");
+
+            // Assert 2: The process was started and waited upon
+            verify(mockProcess, times(1)).waitFor();
         }
 
-        // Verify code acquisition
+        // Assert 3: Code acquisition occurred prior to sandbox launch
         verify(mockS3Service).downloadUserCode(eq("code-bucket"), eq("WordCount.class"), anyString());
 
-        // Assert 1: Verify intermediate data is NOT written to S3 in the P2P model
-        verify(mockS3Service, never()).writeData(eq("input-bucket"), contains("intermediate"), anyString());
-
-        // Assert 2: Verify the Spill-to-Disk actually wrote to the local partition directory
-        // Since numReducers = 1, everything hashes to partition '0'
-        Path expectedSpillFile = Paths.get(baseShuffleDir, "job-grpc-test", "0", "map-001.txt");
-        assertTrue(Files.exists(expectedSpillFile), "The Map phase failed to spill intermediate results to the local disk.");
-
-        // Assert 3: Verify completion signaling with gRPC endpoint info
-        verify(mockEventProducer).sendCompletionSignal(anyString(), anyString(), eq("COMPLETED"), contains(":50051"));
+        // Assert 4: Completion signaling with gRPC endpoint info
+        verify(mockEventProducer).sendCompletionSignal(eq("job-sandbox-test"), eq("map-001"), eq("COMPLETED"), contains(":50051"));
     }
 
     /**
-     * Validates that a REDUCE task successfully streams data via gRPC and applies the External Merge Sort.
+     * Validates that a REDUCE task successfully streams gRPC data before delegating to the Sandbox.
      *
      * """
-     * Verifies the complex Reduce phase utilizing Disk Spills and K-Way Merge processing.
-     * * Simulates a high-performance gRPC stream, validating that the engine writes
-     * the raw stream to disk, correctly sorts the file using the ExternalMergeSorter,
-     * reduces the batches, and uploads the accurate final string to S3.
+     * Verifies the complex Reduce orchestration sequence.
+     * * Validates that the Orchestrator successfully fetches remote data via gRPC streams,
+     * writes it to the local disk, and subsequently boots the Sandbox JVM to handle the
+     * memory-intensive sorting and reduction.
      * * Raises:
-     * Throwable: If gRPC streaming, external sorting, or S3 persistence fails.
+     * Throwable: If gRPC mock networking or OS interception fails.
      * """
-     * @throws Throwable if gRPC streaming or final reduction fails.
      */
     @Test
     @SuppressWarnings("unchecked")
-    void testExecuteTask_SuccessfulReducePhase_ExternalMergeSortsAndPersistsToS3() throws Throwable {
+    void testExecuteTask_SuccessfulReducePhase_StreamsGrpcAndDelegatesToSandbox() throws Throwable {
         String jsonPayload = """
                 {
-                    "jobId": "job-grpc-test",
+                    "jobId": "job-sandbox-test",
                     "taskId": "0", 
                     "taskType": "REDUCE",
                     "bucketName": "input-bucket",
@@ -158,29 +145,29 @@ class TaskExecutorTest {
                 }
                 """;
 
-        // Dummy reducer counts the number of occurrences of a key
-        Reducer dummyReducer = (key, values) -> new KeyValuePair(key, String.valueOf(values.size()));
-
-        // Create a raw mock stream simulating network delivery
         PartitionChunk fakeChunk = PartitionChunk.newBuilder()
-                .setContent(ByteString.copyFromUtf8("hello\t1\nworld\t1\nhello\t1\n"))
+                .setContent(ByteString.copyFromUtf8("hello\t1\nworld\t1\n"))
                 .build();
 
         Iterator<PartitionChunk> mockIterator = mock(Iterator.class);
         when(mockIterator.hasNext()).thenReturn(true, false);
         when(mockIterator.next()).thenReturn(fakeChunk);
 
-        try (MockedStatic<DynamicClassLoader> mockedLoader = Mockito.mockStatic(DynamicClassLoader.class);
+        Process mockProcess = mock(Process.class);
+        when(mockProcess.waitFor()).thenReturn(0); // Simulate successful Sandbox exit
+
+        try (MockedConstruction<ProcessBuilder> mockedPb = mockConstruction(ProcessBuilder.class,
+                (mock, context) -> {
+                    when(mock.start()).thenReturn(mockProcess);
+                    when(mock.inheritIO()).thenReturn(mock);
+                });
              MockedStatic<ManagedChannelBuilder> mockedBuilder = Mockito.mockStatic(ManagedChannelBuilder.class);
              MockedStatic<ShuffleServiceGrpc> mockedGrpc = Mockito.mockStatic(ShuffleServiceGrpc.class)) {
-
-            mockedLoader.when(() -> DynamicClassLoader.loadReducer(anyString(), anyString())).thenReturn(dummyReducer);
 
             ManagedChannel mockChannel = mock(ManagedChannel.class);
             ManagedChannelBuilder mockChannelBuilder = mock(ManagedChannelBuilder.class);
             ShuffleServiceGrpc.ShuffleServiceBlockingStub mockStub = mock(ShuffleServiceGrpc.ShuffleServiceBlockingStub.class);
 
-            // Mock the builder chain
             mockedBuilder.when(() -> ManagedChannelBuilder.forAddress(anyString(), anyInt())).thenReturn(mockChannelBuilder);
             when(mockChannelBuilder.usePlaintext()).thenReturn(mockChannelBuilder);
             when(mockChannelBuilder.keepAliveTime(anyLong(), any())).thenReturn(mockChannelBuilder);
@@ -193,19 +180,41 @@ class TaskExecutorTest {
             when(mockStub.getPartition(any())).thenReturn(mockIterator);
 
             taskExecutor.executeTask(jsonPayload);
+
+            // Assert: Sandbox was launched for the reduce operation
+            assertEquals(1, mockedPb.constructed().size(), "Sandbox JVM was never spawned for Reduce phase.");
         }
 
-        // Assert 1: Legacy listing is completely bypassed
-        verify(mockS3Service, never()).listIntermediateFiles(anyString(), anyString(), anyInt());
+        // Verify that the orchestrator still handles the localized code download
+        verify(mockS3Service).downloadUserCode(anyString(), anyString(), anyString());
+    }
 
-        // Assert 2: Capture the S3 upload to prove the External Merge Sorter successfully processed the disk files
-        ArgumentCaptor<String> dataCaptor = ArgumentCaptor.forClass(String.class);
-        verify(mockS3Service).writeData(eq("input-bucket"), eq("job-grpc-test/output/result_part_0.txt"), dataCaptor.capture());
+    /**
+     * Validates that an abnormal exit from the Sandbox JVM bubbles up as a RuntimeException.
+     */
+    @Test
+    void testExecuteTask_SandboxFails_ThrowsRuntimeException() throws Throwable {
+        String jsonPayload = """
+                {
+                    "jobId": "job-fail-test",
+                    "taskId": "map-002",
+                    "taskType": "MAP",
+                    "className": "com.fail.Mapper"
+                }
+                """;
 
-        // 'hello' appeared twice, 'world' appeared once.
-        // The ExternalMergeSorter guarantees alphabetical total order output.
-        String finalOutput = dataCaptor.getValue();
-        assertEquals("hello\t2\nworld\t1\n", finalOutput, "External Merge Sorter failed to correctly group and reduce the disk-spilled batches.");
+        Process mockProcess = mock(Process.class);
+        when(mockProcess.waitFor()).thenReturn(1); // Simulate JVM crash / Error code 1
+
+        try (MockedConstruction<ProcessBuilder> mockedPb = mockConstruction(ProcessBuilder.class,
+                (mock, context) -> {
+                    when(mock.start()).thenReturn(mockProcess);
+                    when(mock.inheritIO()).thenReturn(mock);
+                })) {
+
+            RuntimeException exception = assertThrows(RuntimeException.class, () -> taskExecutor.executeTask(jsonPayload));
+            assertTrue(exception.getMessage().contains("exit code: 1"), "Did not propagate the correct exit code.");
+        }
     }
 
     /**

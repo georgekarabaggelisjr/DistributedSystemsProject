@@ -15,6 +15,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -200,7 +201,8 @@ public class ShuffleGrpcServer {
          * @param responseObserver The stream used to transmit data to the Reducer.
          */
         private void streamFileContent(Path file, StreamObserver<PartitionChunk> responseObserver) {
-            try (Stream<String> lines = Files.lines(file)) {
+            // Enforce UTF-8 encoding
+            try (Stream<String> lines = Files.lines(file, StandardCharsets.UTF_8)) {
                 StringBuilder chunkBuilder = new StringBuilder();
 
                 lines.forEach(line -> {
