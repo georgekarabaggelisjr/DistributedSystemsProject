@@ -20,10 +20,19 @@ spec:
         image: quay.io/keycloak/keycloak:26.5.6
         args: ["start"]
         env:
-        - name: KC_BOOTSTRAP_ADMIN_USERNAME
-          value: "admin"
-        - name: KC_BOOTSTRAP_ADMIN_PASSWORD
-          value: "admin"
+        # Hostname & Connectivity
+        - name: KC_HOSTNAME
+          value: "keycloak.192.168.49.2.nip.io" # For coenncting the CLI and the rest services (TODO: Put the the IP in a seperate file so that we can easily change it later at merging)
+        - name: KC_HOSTNAME_STRICT
+          value: "false"
+        - name: KC_HOSTNAME_STRICT_HTTPS
+          value: "false"
+        - name: KC_HTTP_ENABLED
+          value: "true"
+        - name: KC_PROXY_HEADERS
+          value: "xforwarded" 
+
+        # Database
         - name: KC_DB
           value: "postgres"
         - name: KC_DB_URL_HOST
@@ -34,24 +43,32 @@ spec:
           value: "keycloak"
         - name: KC_DB_PASSWORD
           value: "S71h2nd)e"
-        - name: KC_HOSTNAME
-          value: "keycloak.192.168.49.2.nip.io" # For coenncting the CLI and the rest services (TODO: Put the the IP in a seperate file so that we can easily change it later at merging)
-        - name: KC_PROXY_HEADERS
-          value: "xforwarded"
-        - name: KC_HTTP_ENABLED
-          value: "true"
-        - name: KC_HOSTNAME_STRICT
-          value: "false"
+
+        # Admin Setup
+        - name: KC_BOOTSTRAP_ADMIN_USERNAME
+          value: "admin"
+        - name: KC_BOOTSTRAP_ADMIN_PASSWORD
+          value: "admin"
+
+        # Observability
         - name: KC_HEALTH_ENABLED
           value: "true"
+        - name: KC_METRICS_ENABLED
+          value: "true"
+
         ports:
         - containerPort: 8080
           name: http
+        - containerPort: 9000
+          name: management
+
         readinessProbe:
           httpGet:
             path: /health/ready
             port: 9000
-          initialDelaySeconds: 30
+          initialDelaySeconds: 40
+          periodSeconds: 10
+        
         resources:
           limits:
             memory: 1500Mi
