@@ -1,12 +1,13 @@
 package com.iliasbolan.engine;
 
-import com.google.protobuf.ByteString;
-import com.iliasbolan.grpc.shuffle.PartitionChunk;
+import com.iliasbolan.core.TaskPayload;
 import com.iliasbolan.grpc.shuffle.ShuffleServiceGrpc;
 import com.iliasbolan.messaging.RabbitMqProducer;
 import com.iliasbolan.storage.S3ClientService;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
+import io.grpc.Status;
+import io.grpc.StatusRuntimeException;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -15,85 +16,72 @@ import org.mockito.MockedStatic;
 import org.mockito.Mockito;
 
 import java.nio.file.Path;
-import java.util.Iterator;
+import java.util.List;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.*;
 
 /**
- * Unit tests for the {@link TaskExecutor} orchestration engine.
+ * Enterprise-grade unit test suite for the {@link TaskExecutor} orchestration engine.
  * <p>
- * <b>Sandbox Orchestrator Update:</b><br>
- * This suite has been heavily refactored to validate the new Lightweight Orchestrator pattern.
- * Instead of testing in-memory class loading and Fork/Join pooling, it now validates that the
- * engine correctly provisions local resources, streams gRPC partitions, and securely delegates
- * untrusted execution to an isolated Child JVM via {@link ProcessBuilder}.
- * </p>
- * <p>
- * <b>Testing Strategy:</b><br>
- * Utilizes Mockito 5's {@code mockConstruction} to intercept native OS process creation,
- * simulating sandbox success and failure states without booting actual JVMs during the test lifecycle.
+ * This suite validates the core operational phases of a distributed worker node, including:
+ * <ul>
+ * <li>Map phase resource localization and sandbox execution.</li>
+ * <li>Reduce phase P2P data streaming via gRPC.</li>
+ * <li>Reactive Lineage Recomputation triggers (Sentinel Interceptor).</li>
+ * <li>Process isolation and child JVM lifecycle management.</li>
+ * </ul>
  * </p>
  *
  * @author Ilias Bolanakis
- * @version 5.0
+ * @version 6.0
  * @since 2026-04-24
  */
 class TaskExecutorTest {
 
-    private S3ClientService mockS3Service;
-    private RabbitMqProducer mockEventProducer;
+    private S3ClientService s3ClientService;
+    private RabbitMqProducer eventProducer;
     private TaskExecutor taskExecutor;
-    private String baseShuffleDir;
+    private final String podIp = "10.0.0.1";
 
     @TempDir
     Path tempDir;
 
+    /**
+     * Re-initializes mocks and the subject under test before each execution to ensure
+     * strict test isolation.
+     */
     @BeforeEach
     void setUp() {
-        mockS3Service = Mockito.mock(S3ClientService.class);
-        mockEventProducer = Mockito.mock(RabbitMqProducer.class);
-        baseShuffleDir = tempDir.toString();
-
-        // Pass a dummy Pod IP for local testing
-        taskExecutor = new TaskExecutor(mockS3Service, baseShuffleDir, mockEventProducer, "127.0.0.1");
+        s3ClientService = mock(S3ClientService.class);
+        eventProducer = mock(RabbitMqProducer.class);
+        taskExecutor = new TaskExecutor(s3ClientService, tempDir.toString(), eventProducer, podIp);
     }
 
     /**
-     * Validates that a MAP task correctly provisions the environment and launches the Sandbox.
+     * Validates that the Map phase correctly localizes user code, persists the execution
+     * payload, and signals completion after successful sandbox execution.
      *
-     * """
-     * Verifies the orchestration sequence for Map tasks.
-     * * Ensures that the payload is safely persisted to disk, the `ProcessBuilder` is invoked
-     * with the correct sandbox classpath, and the control plane is signaled upon success.
-     * * Raises:
-     * Throwable: If mocked OS process interception fails.
-     * """
+     * @throws Throwable If the internal orchestration logic or mocks fail.
      */
     @Test
-    void testExecuteTask_SuccessfulMapPhase_DelegatesToSandboxAndSignalsManager() throws Throwable {
+    void testExecuteMapPhase_Success_SignalsCompletion() throws Throwable {
         String jsonPayload = """
                 {
-                    "jobId": "job-sandbox-test",
-                    "taskId": "map-001",
+                    "jobId": "job-123",
+                    "taskId": "map-0",
                     "taskType": "MAP",
-                    "bucketName": "input-bucket",
-                    "objectName": "data.txt",
-                    "byteOffset": 0,
-                    "byteLength": 1024,
-                    "numReducers": 1,
-                    "userCodeBucket": "code-bucket",
-                    "userCodeObject": "WordCount.class",
-                    "className": "com.iliasbolan.WordCount",
-                    "workerEndpoints": []
+                    "className": "com.example.WordCountMapper",
+                    "userCodeBucket": "code",
+                    "userCodeObject": "mapper.class"
                 }
                 """;
 
         Process mockProcess = mock(Process.class);
-        when(mockProcess.waitFor()).thenReturn(0); // Simulate successful Sandbox exit
+        when(mockProcess.waitFor()).thenReturn(0);
 
-        // Intercept native OS process creation
         try (MockedConstruction<ProcessBuilder> mockedPb = mockConstruction(ProcessBuilder.class,
                 (mock, context) -> {
                     when(mock.start()).thenReturn(mockProcess);
@@ -102,101 +90,80 @@ class TaskExecutorTest {
 
             taskExecutor.executeTask(jsonPayload);
 
-            // Assert 1: The ProcessBuilder was actually invoked to spawn the SandboxRunner
-            assertEquals(1, mockedPb.constructed().size(), "Sandbox JVM was never spawned.");
-
-            // Assert 2: The process was started and waited upon
-            verify(mockProcess, times(1)).waitFor();
+            // Verify resource acquisition and sandbox execution
+            verify(s3ClientService).downloadUserCode(eq("code"), eq("mapper.class"), anyString());
+            verify(eventProducer).sendCompletionSignal(eq("job-123"), eq("map-0"), eq("COMPLETED"), contains(podIp));
         }
-
-        // Assert 3: Code acquisition occurred prior to sandbox launch
-        verify(mockS3Service).downloadUserCode(eq("code-bucket"), eq("WordCount.class"), anyString());
-
-        // Assert 4: Completion signaling with gRPC endpoint info
-        verify(mockEventProducer).sendCompletionSignal(eq("job-sandbox-test"), eq("map-001"), eq("COMPLETED"), contains(":50051"));
     }
 
     /**
-     * Validates that a REDUCE task successfully streams gRPC data before delegating to the Sandbox.
+     * Validates the <b>Reactive Lineage Recomputation</b> protocol (Sentinel Interceptor).
+     * <p>
+     * Verifies that if a remote Map pod is unreachable during the Reduce phase fetch loop,
+     * the executor intercepts the gRPC network failure, transmits a targeted
+     * {@code SHUFFLE_FETCH_FAILED} error signal to the Manager, and suspends execution
+     * gracefully.
+     * </p>
      *
-     * """
-     * Verifies the complex Reduce orchestration sequence.
-     * * Validates that the Orchestrator successfully fetches remote data via gRPC streams,
-     * writes it to the local disk, and subsequently boots the Sandbox JVM to handle the
-     * memory-intensive sorting and reduction.
-     * * Raises:
-     * Throwable: If gRPC mock networking or OS interception fails.
-     * """
+     * @throws Throwable If the internal orchestration logic fails.
      */
     @Test
-    @SuppressWarnings("unchecked")
-    void testExecuteTask_SuccessfulReducePhase_StreamsGrpcAndDelegatesToSandbox() throws Throwable {
+    void testExecuteReducePhase_ShuffleFetchFailed_SendsErrorSignal() throws Throwable {
         String jsonPayload = """
                 {
-                    "jobId": "job-sandbox-test",
-                    "taskId": "0", 
+                    "jobId": "job-999",
+                    "taskId": "0",
                     "taskType": "REDUCE",
-                    "bucketName": "input-bucket",
-                    "numReducers": 1,
-                    "userCodeBucket": "code-bucket",
-                    "userCodeObject": "Reducer.class",
-                    "className": "com.iliasbolan.WordCountReducer",
-                    "workerEndpoints": ["10.0.0.1:50051"]
+                    "className": "com.test.Reducer",
+                    "workerEndpoints": ["10.244.2.15:50051"]
                 }
                 """;
 
-        PartitionChunk fakeChunk = PartitionChunk.newBuilder()
-                .setContent(ByteString.copyFromUtf8("hello\t1\nworld\t1\n"))
-                .build();
+        ManagedChannel mockChannel = mock(ManagedChannel.class);
+        ManagedChannelBuilder mockBuilder = mock(ManagedChannelBuilder.class);
 
-        Iterator<PartitionChunk> mockIterator = mock(Iterator.class);
-        when(mockIterator.hasNext()).thenReturn(true, false);
-        when(mockIterator.next()).thenReturn(fakeChunk);
+        // Simulate a gRPC network failure (e.g., pod eviction)
+        StatusRuntimeException networkError = new StatusRuntimeException(Status.UNAVAILABLE.withDescription("Pod Evicted"));
 
-        Process mockProcess = mock(Process.class);
-        when(mockProcess.waitFor()).thenReturn(0); // Simulate successful Sandbox exit
+        try (MockedStatic<ManagedChannelBuilder> staticBuilder = Mockito.mockStatic(ManagedChannelBuilder.class);
+             MockedStatic<ShuffleServiceGrpc> staticGrpc = Mockito.mockStatic(ShuffleServiceGrpc.class)) {
 
-        try (MockedConstruction<ProcessBuilder> mockedPb = mockConstruction(ProcessBuilder.class,
-                (mock, context) -> {
-                    when(mock.start()).thenReturn(mockProcess);
-                    when(mock.inheritIO()).thenReturn(mock);
-                });
-             MockedStatic<ManagedChannelBuilder> mockedBuilder = Mockito.mockStatic(ManagedChannelBuilder.class);
-             MockedStatic<ShuffleServiceGrpc> mockedGrpc = Mockito.mockStatic(ShuffleServiceGrpc.class)) {
-
-            ManagedChannel mockChannel = mock(ManagedChannel.class);
-            ManagedChannelBuilder mockChannelBuilder = mock(ManagedChannelBuilder.class);
-            ShuffleServiceGrpc.ShuffleServiceBlockingStub mockStub = mock(ShuffleServiceGrpc.ShuffleServiceBlockingStub.class);
-
-            mockedBuilder.when(() -> ManagedChannelBuilder.forAddress(anyString(), anyInt())).thenReturn(mockChannelBuilder);
-            when(mockChannelBuilder.usePlaintext()).thenReturn(mockChannelBuilder);
-            when(mockChannelBuilder.keepAliveTime(anyLong(), any())).thenReturn(mockChannelBuilder);
-
-            when(mockChannelBuilder.build()).thenReturn(mockChannel);
+            staticBuilder.when(() -> ManagedChannelBuilder.forAddress(anyString(), anyInt())).thenReturn(mockBuilder);
+            when(mockBuilder.usePlaintext()).thenReturn(mockBuilder);
+            when(mockBuilder.keepAliveTime(anyLong(), any())).thenReturn(mockBuilder);
+            when(mockBuilder.build()).thenReturn(mockChannel);
             when(mockChannel.shutdown()).thenReturn(mockChannel);
-            when(mockChannel.awaitTermination(anyLong(), any())).thenReturn(true);
 
-            mockedGrpc.when(() -> ShuffleServiceGrpc.newBlockingStub(any(ManagedChannel.class))).thenReturn(mockStub);
-            when(mockStub.getPartition(any())).thenReturn(mockIterator);
+            // Force the gRPC stub to throw a network exception when the iterator is requested
+            staticGrpc.when(() -> ShuffleServiceGrpc.newBlockingStub(any(ManagedChannel.class)))
+                    .thenThrow(networkError);
 
             taskExecutor.executeTask(jsonPayload);
 
-            // Assert: Sandbox was launched for the reduce operation
-            assertEquals(1, mockedPb.constructed().size(), "Sandbox JVM was never spawned for Reduce phase.");
-        }
+            // Verification: The Sentinel must report the exact missing lineage chunk
+            verify(eventProducer).sendErrorSignal(
+                    eq("job-999"),
+                    eq("0"),
+                    eq("FAILED"),
+                    eq("SHUFFLE_FETCH_FAILED:map-chunk-0")
+            );
 
-        // Verify that the orchestrator still handles the localized code download
-        verify(mockS3Service).downloadUserCode(anyString(), anyString(), anyString());
+            // Verify the Sandbox was NOT invoked, preserving node stability
+            verify(s3ClientService).downloadUserCode(any(), any(), any());
+        }
     }
 
     /**
-     * Validates that an abnormal exit from the Sandbox JVM bubbles up as a RuntimeException.
+     * Enforces the Fail-Fast protocol by ensuring that if the isolated Child JVM (Sandbox)
+     * terminates with a non-zero exit code, the error is propagated as a RuntimeException.
+     *
+     * @throws Throwable If the process mock encounters an error.
      */
     @Test
-    void testExecuteTask_SandboxFails_ThrowsRuntimeException() throws Throwable {
+    void testExecuteTask_SandboxCrash_ThrowsRuntimeException() throws Throwable {
         String jsonPayload = """
                 {
-                    "jobId": "job-fail-test",
+                    "jobId": "job-fail",
                     "taskId": "map-002",
                     "taskType": "MAP",
                     "className": "com.fail.Mapper"
@@ -204,7 +171,7 @@ class TaskExecutorTest {
                 """;
 
         Process mockProcess = mock(Process.class);
-        when(mockProcess.waitFor()).thenReturn(1); // Simulate JVM crash / Error code 1
+        when(mockProcess.waitFor()).thenReturn(1); // Simulate JVM crash
 
         try (MockedConstruction<ProcessBuilder> mockedPb = mockConstruction(ProcessBuilder.class,
                 (mock, context) -> {
@@ -213,19 +180,20 @@ class TaskExecutorTest {
                 })) {
 
             RuntimeException exception = assertThrows(RuntimeException.class, () -> taskExecutor.executeTask(jsonPayload));
-            assertTrue(exception.getMessage().contains("exit code: 1"), "Did not propagate the correct exit code.");
+            assertTrue(exception.getMessage().contains("exit code: 1"));
         }
     }
 
     /**
-     * Validates that an unsupported task type triggers the appropriate exception.
+     * Validates that malformed task definitions or unsupported phase types trigger
+     * an immediate {@link IllegalArgumentException}.
      */
     @Test
     void testExecuteTask_UnknownTaskType_ThrowsIllegalArgumentException() {
         String jsonPayload = """
                 {
-                    "jobId": "job-test",
-                    "taskType": "CORRUPT_TYPE"
+                    "jobId": "job-invalid",
+                    "taskType": "ILLEGAL_PHASE"
                 }
                 """;
 

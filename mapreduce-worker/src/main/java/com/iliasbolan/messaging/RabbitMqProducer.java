@@ -25,7 +25,7 @@ import java.util.Map;
  * </p>
  *
  * @author Ilias Bolanakis
- * @version 1.0
+ * @version 2.0
  * @since 2026-04-23
  * @see com.iliasbolan.messaging.RabbitMqConnectionManager
  */
@@ -39,29 +39,16 @@ public class RabbitMqProducer {
     private final RabbitMqConnectionManager connectionManager;
     private final String eventQueue;
 
-    /**
-     * Constructs a new producer for signaling task completion events.
-     *
-     * @param connectionManager The shared manager providing authenticated RabbitMQ connections.
-     * @param eventQueue        The name of the queue where the Manager listens for events (e.g., "job_events_queue").
-     */
     public RabbitMqProducer(RabbitMqConnectionManager connectionManager, String eventQueue) {
         this.connectionManager = connectionManager;
         this.eventQueue = eventQueue;
-
-        logger.info("Initialized RabbitMqProducer. Target Event Queue: {}", eventQueue);
     }
 
     /**
-     * Publishes a task completion signal to the Manager.
-     * <p>
-     * This method encapsulates the network address of the worker's gRPC server,
-     * allowing the Manager to update the global routing table so that subsequent
-     * Reduce tasks can find their required data partitions.
-     * </p>
+     * Transmits a successful task completion signal to the global Orchestrator.
      *
-     * @param jobId             The unique UUID of the MapReduce job.
-     * @param taskId            The specific identifier of the completed Map task.
+     * @param jobId             The universally unique identifier of the Map-Reduce job.
+     * @param taskId            The specific partition identifier of the completed Map task.
      * @param status            The final execution status (typically "COMPLETED").
      * @param workerBindAddress The gRPC network endpoint (e.g., "10.244.1.5:50051")
      * where Reducers can stream shuffle data.
@@ -88,6 +75,43 @@ public class RabbitMqProducer {
 
         } catch (Exception e) {
             logger.error("Critical Failure: Could not transmit completion signal for task {} to the Manager.", taskId, e);
+        }
+    }
+
+    /**
+     * Transmits a task failure event to the global Orchestrator.
+     * <p>
+     * <b>Reactive Lineage Recomputation:</b><br>
+     * Used heavily by the Sentinel interceptor during the P2P Shuffle phase. If a worker
+     * detects a remote pod has crashed (ephemeral data loss), it uses this method to
+     * safely dispatch the specific {@code SHUFFLE_FETCH_FAILED} error payload to the
+     * Manager, bypassing the global Fail-Fast teardown and triggering self-healing.
+     * </p>
+     *
+     * @param jobId  The universally unique identifier of the Map-Reduce job.
+     * @param taskId The specific partition identifier of the task that failed.
+     * @param status The final execution status (typically "FAILED").
+     * @param error  The specific error payload (e.g., "SHUFFLE_FETCH_FAILED:map-chunk-5").
+     */
+    public void sendErrorSignal(String jobId, String taskId, String status, String error) {
+        try (Connection connection = connectionManager.createConnection();
+             Channel channel = connection.createChannel()) {
+
+            Map<String, Object> payload = new HashMap<>();
+            payload.put("job_id", jobId);
+            payload.put("task_id", taskId);
+            payload.put("status", status);
+            payload.put("error", error); // Injects the error string directly for Python Pydantic parsing
+
+            byte[] messageBody = objectMapper.writeValueAsBytes(payload);
+
+            channel.basicPublish("", eventQueue, null, messageBody);
+
+            logger.warn("Transmitted targeted error signal to Manager. Job: {}, Task: {}, Error: {}",
+                    jobId, taskId, error);
+
+        } catch (Exception e) {
+            logger.error("Critical Failure: Could not transmit error signal for task {} to the Manager.", taskId, e);
         }
     }
 }

@@ -10,6 +10,7 @@ import org.slf4j.LoggerFactory;
 
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
+import io.grpc.StatusRuntimeException;
 import com.iliasbolan.grpc.shuffle.ShuffleServiceGrpc;
 import com.iliasbolan.grpc.shuffle.PartitionRequest;
 import com.iliasbolan.grpc.shuffle.PartitionChunk;
@@ -32,18 +33,17 @@ import java.util.concurrent.TimeUnit;
  * orchestrator delegates all untrusted byte-code execution to an isolated Child JVM
  * ({@link SandboxRunner}).
  * </p>
- * <h3>Core Responsibilities:</h3>
- * <ul>
- * <li><b>Deserialization:</b> Converting raw JSON payloads into validated {@link TaskPayload} objects.</li>
- * <li><b>Resource Acquisition:</b> Coordinating with {@link S3ClientService} to localize bytecode and data.</li>
- * <li><b>gRPC P2P Shuffle:</b> Utilizing gRPC Server-Side Streaming to fetch intermediate data.</li>
- * <li><b>Process Isolation (Sandboxing):</b> Spawning ephemeral child processes to execute user code,
- * entirely preventing ClassLoader memory leaks and main-thread security compromises.</li>
- * <li><b>Lifecycle Signaling:</b> Reporting task completion and network coordinates to the Manager.</li>
- * </ul>
+ * <h3>Architecture Update: Reactive Lineage Recomputation (The Sentinel)</h3>
+ * <p>
+ * This worker acts as a Sentinel for Peer-to-Peer ephemeral data loss. During the
+ * Shuffle phase, if a remote Map pod is unresponsive (e.g., evicted by Kubernetes),
+ * this executor intercepts the gRPC network failure. Instead of crashing, it gracefully
+ * suspends execution, signals the exact missing chunk ID to the Orchestrator, and allows
+ * the control plane to deterministically rebuild the lost lineage.
+ * </p>
  *
  * @author Ilias Bolanakis
- * @version 5.0
+ * @version 6.0
  * @since 2026-04-24
  */
 public class TaskExecutor {
@@ -83,14 +83,13 @@ public class TaskExecutor {
     /**
      * Orchestrates the complete lifecycle of a distributed MAP task.
      *
-     * """
+     * <p>
      * Prepares the environment and delegates Map execution to the Sandbox JVM.
-     * * Args:
-     * payload (TaskPayload): The metadata required to execute the specific map chunk.
-     * rawJson (String): The unparsed JSON string, passed as an argument to the child process.
-     * * Raises:
-     * Throwable: If an error occurs during resource acquisition or the child JVM fails.
-     * """
+     * </p>
+     *
+     * @param payload  The metadata required to execute the specific map chunk.
+     * @param rawJson  The unparsed JSON string, passed as an argument to the child process.
+     * @throws Throwable If an error occurs during resource acquisition or the child JVM fails.
      */
     private void executeMapPhase(TaskPayload payload, String rawJson) throws Throwable {
         logger.info("--- [ STARTING MAP PHASE: Task {} ] ---", payload.taskId());
@@ -122,15 +121,15 @@ public class TaskExecutor {
     /**
      * Orchestrates the REDUCE task lifecycle utilizing gRPC and the Sandbox JVM.
      *
-     * """
-     * Executes the Reduce phase by streaming remote partition data directly to local disk,
-     * then spawning the Sandbox to safely execute the External Merge Sort and user reduction.
-     * * Args:
-     * payload (TaskPayload): The metadata required to aggregate the intermediate partition.
-     * rawJson (String): The unparsed JSON string.
-     * * Raises:
-     * Throwable: If gRPC network fetching fails, or the child JVM crashes.
-     * """
+     * <p>
+     * Executes the Reduce phase by streaming remote partition data directly to local disk.
+     * If a remote node is unreachable, it acts as a Sentinel, firing a highly specific
+     * telemetry event back to the Manager to trigger Reactive Lineage Recomputation.
+     * </p>
+     *
+     * @param payload  The metadata required to aggregate the intermediate partition.
+     * @param rawJson  The unparsed JSON string.
+     * @throws Throwable If a critical, non-network failure occurs.
      */
     private void executeReducePhase(TaskPayload payload, String rawJson) throws Throwable {
         logger.info("--- [ STARTING REDUCE PHASE: Partition {} for Job {} ] ---", payload.taskId(), payload.jobId());
@@ -178,6 +177,24 @@ public class TaskExecutor {
                     PartitionChunk chunk = chunkStream.next();
                     chunk.getContent().writeTo(bos);
                 }
+            } catch (StatusRuntimeException grpcEx) {
+                // --- THE SENTINEL INTERCEPTOR ---
+                // We've detected P2P data loss. We dynamically calculate the lost chunk ID based
+                // on the deterministic ordering of the endpoints routing table.
+                String lostTaskId = "map-chunk-" + i;
+                logger.warn("P2P Data Loss Detected! Map pod unreachable at endpoint {}. Triggering Lineage Recovery for '{}'.", endpoint, lostTaskId);
+
+                // Construct a specialized error payload (Requires your RabbitMqProducer to support sending the error field)
+                String errorPayload = "SHUFFLE_FETCH_FAILED:" + lostTaskId;
+
+                // Assuming an overloaded method or unified method in your RabbitMqProducer:
+                // If your existing sendCompletionSignal doesn't accept an error field directly,
+                // you will need to update RabbitMqProducer to serialize it correctly into the JSON.
+                eventProducer.sendErrorSignal(payload.jobId(), payload.taskId(), "FAILED", errorPayload);
+
+                // Gracefully suspend execution WITHOUT crashing the pod.
+                // The Orchestrator will rebuild the lost chunk and eventually re-queue this Reducer task.
+                return;
             } catch (Exception e) {
                 logger.error("gRPC P2P Error: Failed to stream from node {}", endpoint, e);
                 throw new RuntimeException("Critical gRPC shuffle failure.", e);
@@ -204,16 +221,17 @@ public class TaskExecutor {
     /**
      * Spawns an isolated Child JVM to execute untrusted user code.
      *
-     * """
-     * Bootstraps the SandboxRunner via a native OS ProcessBuilder.
-     * * This architectural boundary prevents user-code from accessing the primary worker's
-     * memory space, avoiding ClassLoader Metaspace leaks and shielding core orchestration
-     * threads from fatal exceptions.
-     * * Args:
-     * payloadFile (Path): The temporary file containing the task execution instructions.
-     * * Raises:
-     * RuntimeException: If the child JVM exits with a non-zero failure code.
-     * """
+     * <p>
+     * Bootstraps the SandboxRunner via a native OS ProcessBuilder. This architectural
+     * boundary prevents user-code from accessing the primary worker's memory space,
+     * avoiding ClassLoader Metaspace leaks and shielding core orchestration threads
+     * from fatal exceptions.
+     * </p>
+     *
+     * @param payloadFile The temporary file containing the task execution instructions.
+     * @throws IOException If the OS fails to allocate process resources.
+     * @throws InterruptedException If the K8s node preempts the worker pod.
+     * @throws RuntimeException If the child JVM exits with a non-zero failure code.
      */
     private void runSandbox(Path payloadFile) throws IOException, InterruptedException {
         String javaHome = System.getProperty("java.home");
