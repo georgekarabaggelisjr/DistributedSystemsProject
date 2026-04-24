@@ -41,7 +41,7 @@ import java.util.List;
  * @param workerEndpoints A routing table of network addresses (IP:Port) for active Map workers. Used during the REDUCE phase to pull intermediate partitions directly (P2P), bypassing MinIO/S3.
  *
  * @author Ilias Bolanakis
- * @version 1.3
+ * @version 2.0
  * @since 2026-04-07
  */
 @JsonIgnoreProperties(ignoreUnknown = true)

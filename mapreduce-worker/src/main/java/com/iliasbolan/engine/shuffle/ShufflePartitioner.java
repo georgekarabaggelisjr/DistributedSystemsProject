@@ -1,6 +1,7 @@
-package com.iliasbolan.engine;
+package com.iliasbolan.engine.shuffle;
 
 import com.iliasbolan.core.KeyValuePair;
+import com.iliasbolan.engine.execution.MapTaskProcessor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -16,24 +17,22 @@ import java.util.Map;
 
 /**
  * Handles the Shuffle and Partitioning phase of a Map-Reduce job.
- * <p>
- * <b>Spill-to-Disk Architecture Update:</b><br>
- * To support the OOM-safe Map phase, this class has been upgraded to support highly
- * concurrent, thread-safe appends. It uses Lock Stripping (an array of dedicated locks
- * per partition) to allow multiple Fork/Join threads to flush their localized buffers
- * to the container's disk in parallel without corrupting the target text files.
- * </p>
- * <p>
- * <b>Peer-to-Peer (P2P) gRPC Architecture Update:</b><br>
- * This class writes the partitioned output directly to the local container disk using
- * standard Java NIO. These deterministic file paths are subsequently streamed by the
- * embedded gRPC server, allowing sibling Reduce nodes to fetch the data directly.
- * </p>
+ * * <p><b>Architectural Update: Spill-to-Disk Architecture</b><br>
+ * To facilitate memory-safe Map phases and prevent {@link OutOfMemoryError} conditions,
+ * this class supports highly concurrent, thread-safe appends. It implements
+ * <i>Lock Stripping</i>—utilizing an array of dedicated locks per partition—to
+ * allow multiple {@link java.util.concurrent.ForkJoinPool} threads to flush their
+ * localized buffers to the container's disk in parallel without risk of data corruption.</p>
+ * * <p><b>Architectural Update: Peer-to-Peer (P2P) gRPC</b><br>
+ * This component writes partitioned output directly to the local container file system
+ * using Java NIO. These deterministic file paths are subsequently exposed via an
+ * embedded gRPC server, enabling remote Reduce nodes to perform direct data
+ * transfers from sibling Map nodes.</p>
  *
  * @author Ilias Bolanakis
- * @version 3.0
- * @see com.iliasbolan.engine.MapTaskProcessor
+ * @version 2.0
  * @since 2026-04-24
+ * @see MapTaskProcessor
  */
 public class ShufflePartitioner {
 
@@ -44,22 +43,20 @@ public class ShufflePartitioner {
     private final String mapTaskId;
     private final int numReducers;
 
-    /** * Array of granular locks. Lock Stripping ensures that threads writing to
-     * partition 0 do not block threads writing to partition 1.
+    /** * Internal array of granular locks used for Lock Stripping.
+     * This mechanism ensures that threads writing to distinct partitions (e.g., Partition 0
+     * vs. Partition 1) do not contend for the same monitor lock.
      */
     private final Object[] partitionLocks;
 
     /**
-     * Constructs a new {@code ShufflePartitioner} for a specific Map task.
+     * Initializes a new {@code ShufflePartitioner} instance for a specific Map task
+     * and configures concurrent local storage mechanisms.
      *
-     * """
-     * Initializes the P2P Local Storage partitioner and its concurrent locking mechanisms.
-     * * Args:
-     * baseShuffleDir (str): The root directory on the local disk for shuffle data.
-     * jobId (str): The unique identifier for the current Map-Reduce job.
-     * mapTaskId (str): The unique identifier for the specific Map chunk being processed.
-     * numReducers (int): The total number of Reducer partitions configured for this job (R).
-     * """
+     * @param baseShuffleDir The root directory on the local disk designated for shuffle data storage.
+     * @param jobId          The unique identifier for the current Map-Reduce job execution.
+     * @param mapTaskId      The unique identifier for the specific Map chunk being processed.
+     * @param numReducers    The total number of Reducer partitions (R) configured for this job.
      */
     public ShufflePartitioner(String baseShuffleDir, String jobId, String mapTaskId, int numReducers) {
         this.baseShuffleDir = baseShuffleDir;
@@ -78,18 +75,17 @@ public class ShufflePartitioner {
     }
 
     /**
-     * Thread-safe method to append a batch of mapped records directly to local disk.
+     * Persists a batch of mapped records directly to the local file system in a
+     * thread-safe manner.
+     * * <p>This method performs a thread-local grouping of the incoming buffer by
+     * target partition. It then acquires a granular lock specific to each
+     * partition file before performing an atomic append operation. This design
+     * minimizes lock contention while guaranteeing file integrity.</p>
      *
-     * """
-     * Flushes a memory-bounded buffer of KeyValuePairs to their respective partition files.
-     * * This method groups the incoming buffer locally, then acquires the specific lock
-     * for each target partition file before appending data. This prevents file corruption
-     * while maintaining high concurrency.
-     * * Args:
-     * buffer (List[KeyValuePair]): A small batch of processed records from a single Fork/Join thread.
-     * * Raises:
-     * IOException: If a file system error occurs during the directory creation or append process.
-     * """
+     * @param buffer A memory-bounded collection of {@link KeyValuePair} objects
+     * emitted by a single computation thread.
+     * @throws IOException If a file system error occurs during directory creation
+     * or the data append process.
      */
     public void appendThreadSafe(List<KeyValuePair> buffer) throws IOException {
         // Step 1: Group the incoming buffer by target partition (Thread-Local operation)
@@ -117,7 +113,7 @@ public class ShufflePartitioner {
                     Files.createDirectories(partitionDir);
                 }
 
-                // Explicitly use UTF-8 to prevent multi-byte boundary errors
+                // Explicitly use UTF-8 to prevent multibyte boundary errors
                 Files.writeString(
                         filePath,
                         payload,
@@ -130,8 +126,11 @@ public class ShufflePartitioner {
     }
 
     /**
-     * Legacy method for partitioning a massive list of intermediate key-value pairs at once.
-     * @deprecated Replaced by {@link #appendThreadSafe(List)} to support memory-safe streaming.
+     * Legacy method for partitioning a bulk list of intermediate key-value pairs.
+     * * @param intermediateData The complete collection of intermediate data.
+     * @throws IOException If a file system error occurs.
+     * @deprecated As of version 2.0, replaced by {@link #appendThreadSafe(List)}
+     * to support memory-safe streaming and prevent OOM scenarios.
      */
     @Deprecated
     public void partitionAndWriteLocal(List<KeyValuePair> intermediateData) throws IOException {

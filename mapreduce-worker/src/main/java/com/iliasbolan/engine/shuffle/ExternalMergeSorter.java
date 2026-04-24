@@ -1,4 +1,4 @@
-package com.iliasbolan.engine;
+package com.iliasbolan.engine.shuffle;
 
 import com.iliasbolan.core.KeyValuePair;
 import com.iliasbolan.core.Reducer;
@@ -21,50 +21,50 @@ import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 /**
- * Enterprise-grade external merge sort utility for distributed data processing.
- * <p>
- * To prevent OutOfMemoryError (OOM) exceptions on highly skewed or massive
+ * External merge sort utility for distributed data processing.
+ *
+ * <p>To prevent {@link OutOfMemoryError} (OOM) exceptions on highly skewed or massive
  * data partitions, this engine processes data using disk-backed buffers.
- * The process is strictly divided into two phases:
+ * The process is strictly divided into two distinct phases:
  * <ol>
- * <li><b>Chunking & Sorting:</b> Raw streams are read into constrained memory buffers.
- * Once full, the buffer is sorted and written back to disk as a "Sorted Run".</li>
- * <li><b>K-Way Merge & Reduce:</b> All sorted runs are opened simultaneously. A Priority
- * Queue extracts the absolute minimum key across all files, groups identical keys,
- * and streams them directly into the user's {@link Reducer}.</li>
+ * <li><b>Chunking &amp; Sorting:</b> Raw streams are read into constrained memory buffers.
+ * Once the buffer reaches capacity, it is sorted and persisted to disk as a "Sorted Run".</li>
+ * <li><b>K-Way Merge &amp; Reduce:</b> All sorted runs are opened concurrently. A {@link PriorityQueue}
+ * is utilized to extract the absolute minimum key across all active runs, grouping identical keys
+ * into collections that are streamed directly into the user-defined {@link Reducer}.</li>
  * </ol>
  * </p>
- * <p>
- * <b>Encoding Note:</b> All I/O operations strictly enforce UTF-8 encoding to
- * maintain byte-boundary safety and optimize disk footprint.
- * </p>
+ *
+ * <p><b>Character Encoding:</b> All I/O operations strictly enforce UTF-8 encoding to
+ * guarantee byte-boundary safety and optimize the storage footprint on the local container disk.</p>
  *
  * @author Ilias Bolanakis
- * @version 1.0
+ * @version 2.0
  * @since 2026-04-24
  */
 public class ExternalMergeSorter {
 
     private static final Logger logger = LoggerFactory.getLogger(ExternalMergeSorter.class);
 
-    // Limit in-memory buffer to ~500,000 records per chunk to ensure safety within container bounds
+    /** * Limits the in-memory buffer to 500,000 records per chunk.
+     * This threshold ensures that the JVM remains within the memory limits
+     * typically assigned to Kubernetes worker containers.
+     */
     private static final int CHUNK_RECORD_LIMIT = 500_000;
 
     /**
-     * Orchestrates the entire Spill-to-Disk sort and reduce pipeline.
+     * Orchestrates the complete Spill-to-Disk sort and reduce pipeline.
      *
-     * """
-     * Executes an external merge sort on raw partition data and applies the reduce logic.
-     * * Args:
-     * rawDataDir (Path): The local directory containing the raw gRPC stream files.
-     * reducer (Reducer): The user-defined Reducer instance dynamically loaded into the JVM.
-     * pool (ForkJoinPool): The shared thread pool, utilized here for parallel chunk sorting.
-     * * Returns:
-     * Path: The absolute path to the final serialized file containing the reduced output.
-     * * Raises:
-     * IOException: If disk I/O fails during chunking, merging, or cleanup.
-     * """
+     * <p>This method initializes the external merge sort on raw partition data
+     * and subsequently applies the user's reduction logic to the sorted streams.</p>
+     *
+     * @param rawDataDir The local directory containing the raw gRPC stream files.
+     * @param reducer    The user-defined Reducer implementation dynamically loaded into the JVM.
+     * @param pool       The shared thread pool (Note: Currently reserved for future parallel expansion).
+     * @return The {@link Path} to the final serialized file containing the reduced output.
+     * @throws IOException If a disk I/O failure occurs during chunking, merging, or resource cleanup.
      */
+    @SuppressWarnings("unused")
     public static Path sortReduceAndSpill(Path rawDataDir, Reducer reducer, ForkJoinPool pool) throws IOException {
         logger.info("Initializing ExternalMergeSorter on directory: {}", rawDataDir);
 
@@ -83,18 +83,18 @@ public class ExternalMergeSorter {
     }
 
     /**
-     * Reads raw input files, sorts them in memory up to a safe threshold, and spills to disk.
+     * Reads raw input files and spills sorted chunks to the local file system.
      *
-     * """
-     * Scans all raw stream files in the target directory, grouping data into memory-safe chunks.
-     * * Each chunk is sorted alphabetically by Key and written to an isolated 'run' file.
-     * * Args:
-     * rawDataDir (Path): The directory containing raw gRPC `.txt` streams.
-     * runsDir (Path): The directory where sorted chunks will be stored.
-     * * Returns:
-     * List[Path]: A list of file paths pointing to the successfully sorted runs.
-     * """
+     * <p>Scans all gRPC stream files in the target directory and groups data into
+     * memory-safe segments. Each segment is sorted alphabetically by Key and
+     * written to an isolated 'run' file to ensure total order partitioning.</p>
+     *
+     * @param rawDataDir The directory containing raw gRPC stream files.
+     * @param runsDir    The directory where sorted chunk files will be persisted.
+     * @return A {@link List} of {@link Path} objects identifying the generated sorted runs.
+     * @throws IOException If disk I/O failures occur while reading streams or spilling runs.
      */
+    @SuppressWarnings("SimplifyStreamApiCallChains")
     private static List<Path> createSortedRuns(Path rawDataDir, Path runsDir) throws IOException {
         List<Path> sortedRunFiles = new ArrayList<>();
         List<KeyValuePair> currentChunk = new ArrayList<>(CHUNK_RECORD_LIMIT);
@@ -111,7 +111,6 @@ public class ExternalMergeSorter {
                     while ((line = reader.readLine()) != null) {
                         if (line.isBlank()) continue;
 
-                        // Fast extraction based on the \t delimiter
                         int tabIndex = line.indexOf('\t');
                         if (tabIndex > 0) {
                             String key = line.substring(0, tabIndex);
@@ -119,7 +118,6 @@ public class ExternalMergeSorter {
                             currentChunk.add(new KeyValuePair(key, value));
                         }
 
-                        // Flush to disk when memory threshold is met
                         if (currentChunk.size() >= CHUNK_RECORD_LIMIT) {
                             sortedRunFiles.add(sortAndSpillChunk(currentChunk, runsDir, runCounter++));
                             currentChunk.clear();
@@ -128,7 +126,6 @@ public class ExternalMergeSorter {
                 }
             }
 
-            // Flush any remaining data in the buffer
             if (!currentChunk.isEmpty()) {
                 sortedRunFiles.add(sortAndSpillChunk(currentChunk, runsDir, runCounter));
             }
@@ -137,20 +134,15 @@ public class ExternalMergeSorter {
     }
 
     /**
-     * Sorts an in-memory chunk and writes it securely to disk using UTF-8.
+     * Sorts an in-memory chunk and persists it to disk using UTF-8 encoding.
      *
-     * """
-     * In-memory sorting utility for individual data chunks.
-     * * Args:
-     * chunk (List[KeyValuePair]): The loaded data records.
-     * runsDir (Path): Destination directory for the sorted file.
-     * runId (int): Identifier for naming the output run file.
-     * * Returns:
-     * Path: The path to the successfully written run file.
-     * """
+     * @param chunk   The collection of records currently loaded in memory.
+     * @param runsDir The destination directory for the sorted file.
+     * @param runId   A unique identifier for naming the resulting run file.
+     * @return The {@link Path} to the persisted sorted run.
+     * @throws IOException If a disk I/O failure occurs during the write operation.
      */
     private static Path sortAndSpillChunk(List<KeyValuePair> chunk, Path runsDir, int runId) throws IOException {
-        // Sort alphabetically by Key to guarantee Total Order partitioning
         chunk.sort(Comparator.comparing(KeyValuePair::key));
 
         Path runFile = runsDir.resolve("run_" + runId + ".txt");
@@ -164,17 +156,17 @@ public class ExternalMergeSorter {
     }
 
     /**
-     * Merges multiple sorted files and streams grouped keys to the user's Reducer.
+     * Merges multiple sorted runs and streams grouped keys to the user-defined Reducer.
      *
-     * """
-     * Implements a K-Way Merge using a PriorityQueue across open file streams.
-     * * Identical keys extracted from across different runs are grouped into a single list
-     * and streamed directly into the Reducer to minimize memory usage.
-     * * Args:
-     * sortedRuns (List[Path]): The collection of sorted run files to merge.
-     * outputFile (Path): The target destination for the final reduced output.
-     * reducer (Reducer): The user's aggregation logic.
-     * """
+     * <p>Utilizes a K-Way Merge algorithm powered by a {@link PriorityQueue} across
+     * multiple open file streams. Identical keys from different runs are grouped
+     * into a single collection and streamed directly to the Reducer to maintain
+     * a minimal memory footprint.</p>
+     *
+     * @param sortedRuns The collection of sorted run files to be merged.
+     * @param outputFile The destination file for the final reduced results.
+     * @param reducer    The user-defined aggregation logic.
+     * @throws IOException If disk I/O failures occur during merging or reducing.
      */
     private static void performNWayMergeAndReduce(List<Path> sortedRuns, Path outputFile, Reducer reducer) throws IOException {
         PriorityQueue<StreamNode> pq = new PriorityQueue<>(Comparator.comparing(n -> n.currentPair.key()));
@@ -182,7 +174,6 @@ public class ExternalMergeSorter {
 
         try (BufferedWriter writer = Files.newBufferedWriter(outputFile, StandardCharsets.UTF_8, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING)) {
 
-            // 1. Initialize streams: Read the first line of every sorted run into the Priority Queue
             for (Path runFile : sortedRuns) {
                 BufferedReader reader = Files.newBufferedReader(runFile, StandardCharsets.UTF_8);
                 activeReaders.add(reader);
@@ -195,7 +186,6 @@ public class ExternalMergeSorter {
             String currentGroupingKey = null;
             List<String> currentValuesGroup = new ArrayList<>();
 
-            // 2. Continually pop the globally smallest key from the Priority Queue
             while (!pq.isEmpty()) {
                 StreamNode minNode = pq.poll();
                 KeyValuePair pair = minNode.currentPair;
@@ -204,31 +194,26 @@ public class ExternalMergeSorter {
                     currentGroupingKey = pair.key();
                 }
 
-                // If the key changes, it's time to reduce the previously grouped block
                 if (!currentGroupingKey.equals(pair.key())) {
                     executeReduceAndWrite(currentGroupingKey, currentValuesGroup, reducer, writer);
 
-                    // Reset group for the new key
                     currentGroupingKey = pair.key();
                     currentValuesGroup.clear();
                 }
 
                 currentValuesGroup.add(pair.value());
 
-                // Read the next line from the file we just extracted from
                 StreamNode nextNode = StreamNode.fromReader(minNode.reader);
                 if (nextNode != null) {
                     pq.add(nextNode);
                 }
             }
 
-            // Flush the final grouped key
             if (currentGroupingKey != null && !currentValuesGroup.isEmpty()) {
                 executeReduceAndWrite(currentGroupingKey, currentValuesGroup, reducer, writer);
             }
 
         } finally {
-            // Guarantee closure of all file descriptors to prevent IO leaks
             for (BufferedReader reader : activeReaders) {
                 try { reader.close(); } catch (IOException ignored) {}
             }
@@ -236,7 +221,13 @@ public class ExternalMergeSorter {
     }
 
     /**
-     * Helper to isolate the execution of the user's reducer and persistence layer.
+     * Executes the user-defined Reducer logic and persists the result to the output writer.
+     *
+     * @param key     The grouping key.
+     * @param values  The collection of values associated with the key.
+     * @param reducer The Reducer implementation to apply.
+     * @param writer  The destination writer for persisting the result.
+     * @throws IOException If disk I/O fails during the write process.
      */
     private static void executeReduceAndWrite(String key, List<String> values, Reducer reducer, BufferedWriter writer) throws IOException {
         KeyValuePair reducedResult = reducer.reduce(key, values);
@@ -246,14 +237,14 @@ public class ExternalMergeSorter {
     }
 
     /**
-     * Recursively deletes a local directory.
+     * Recursively purges a local directory and its entire contents.
      *
-     * """
-     * Cleans up all temporary chunk files and the root directory after successful S3 upload.
-     * * Args:
-     * directoryToBeDeleted (Path): Target directory to purge.
-     * """
+     * <p>Cleans up temporary sorted runs and root directories after data has
+     * been successfully persisted to shared storage (S3).</p>
+     *
+     * @param directoryToBeDeleted The target directory path to be purged.
      */
+    @SuppressWarnings("ResultOfMethodCallIgnored")
     public static void cleanupDirectory(Path directoryToBeDeleted) {
         try (Stream<Path> walk = Files.walk(directoryToBeDeleted)) {
             walk.sorted(Comparator.reverseOrder())
@@ -266,10 +257,12 @@ public class ExternalMergeSorter {
     }
 
     /**
-     * Internal container tracking the state of an open file stream during the K-Way merge.
+     * Internal data container representing an active file stream during a K-Way merge operation.
      */
     private static class StreamNode {
+        /** The current key-value pair extracted from the stream. */
         KeyValuePair currentPair;
+        /** The reader associated with the active sorted run file. */
         BufferedReader reader;
 
         StreamNode(KeyValuePair currentPair, BufferedReader reader) {
@@ -277,16 +270,23 @@ public class ExternalMergeSorter {
             this.reader = reader;
         }
 
+        /**
+         * Extracts the next record from the reader and encapsulates it in a StreamNode.
+         *
+         * @param reader The active run file reader.
+         * @return A new {@code StreamNode}, or {@code null} if the end of the file is reached.
+         * @throws IOException If a disk I/O failure occurs during read.
+         */
         static StreamNode fromReader(BufferedReader reader) throws IOException {
             String line = reader.readLine();
             if (line == null || line.isBlank()) {
-                return null; // EOF reached for this specific run
+                return null;
             }
             int tabIndex = line.indexOf('\t');
             if (tabIndex > 0) {
                 return new StreamNode(new KeyValuePair(line.substring(0, tabIndex), line.substring(tabIndex + 1)), reader);
             }
-            return null; // Malformed line failsafe
+            return null;
         }
     }
 }

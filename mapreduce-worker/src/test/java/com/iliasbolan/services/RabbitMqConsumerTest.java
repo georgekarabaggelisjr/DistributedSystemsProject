@@ -1,6 +1,7 @@
-package com.iliasbolan.messaging;
+package com.iliasbolan.services;
 
 import com.iliasbolan.engine.TaskExecutor;
+import com.iliasbolan.infrastructure.RabbitMqConnectionManager;
 import com.rabbitmq.client.AMQP;
 import com.rabbitmq.client.Channel;
 import com.rabbitmq.client.Connection;
@@ -33,9 +34,9 @@ import static org.mockito.Mockito.*;
  * </p>
  *
  * @author Ilias Bolanakis
- * @version 2.4
+ * @version 2.0
  * @since 2026-03-30
- * @see com.iliasbolan.messaging.RabbitMqConsumer
+ * @see RabbitMqConsumer
  */
 class RabbitMqConsumerTest {
 
@@ -100,7 +101,7 @@ class RabbitMqConsumerTest {
         // Capture the internal deliver callback to simulate a message
         ArgumentCaptor<DeliverCallback> callbackCaptor = ArgumentCaptor.forClass(DeliverCallback.class);
 
-        // FIX: Specified any(CancelCallback.class) to resolve ambiguity
+        // Specified any(CancelCallback.class) to resolve ambiguity
         verify(mockChannel).basicConsume(eq("test-queue"), eq(false), callbackCaptor.capture(), any(CancelCallback.class));
 
         DeliverCallback internalCallback = callbackCaptor.getValue();

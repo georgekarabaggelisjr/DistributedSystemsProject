@@ -1,4 +1,4 @@
-package com.iliasbolan.engine;
+package com.iliasbolan.engine.shuffle;
 
 import com.iliasbolan.core.KeyValuePair;
 import org.junit.jupiter.api.BeforeEach;
@@ -13,22 +13,23 @@ import java.util.List;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Unit tests for the {@link ShufflePartitioner}.
- * <p>
- * This suite verifies that intermediate data is correctly hashed, partitioned,
- * and persisted to the local file system. It ensures the integrity of the
- * directory structure and serialization format required for the P2P Shuffle phase.
- * </p>
- * <p>
- * <b>Spill-to-Disk Architecture Update:</b><br>
- * These tests have been refactored to validate the new highly concurrent,
- * lock-striped disk persistence logic. They utilize JUnit 5's <code>@TempDir</code>
- * to perform real I/O operations in a safe, isolated temporary environment.
- * </p>
+ * Unit test suite for the {@link ShufflePartitioner} component.
+ *
+ * <p>This suite verifies that intermediate Map-Reduce data is correctly hashed,
+ * partitioned, and persisted to the local file system. It ensures the integrity
+ * of the directory structure and serialization format required for the
+ * Peer-to-Peer (P2P) Shuffle phase.</p>
+ *
+ * <p><b>Architectural Update: Spill-to-Disk Validation</b><br>
+ * These tests validate the high-concurrency, lock-striped disk persistence logic.
+ * They utilize JUnit 5's {@code @TempDir} to perform real I/O operations within
+ * a safe, isolated, and temporary file system environment, ensuring that
+ * concurrent flushes do not result in data corruption.</p>
  *
  * @author Ilias Bolanakis
- * @version 3.0
- * @see com.iliasbolan.engine.ShufflePartitioner
+ * @version 2.0
+ * @see ShufflePartitioner
+ * @since 2026-04-24
  */
 class ShufflePartitionerTest {
 
@@ -38,12 +39,16 @@ class ShufflePartitionerTest {
     private String baseShuffleDir;
 
     /**
-     * Utilizes JUnit 5's {@code @TempDir} to provide a safe, isolated directory
-     * for testing local P2P shuffle persistence without manual cleanup.
+     * An isolated temporary directory provided by JUnit 5 for testing local
+     * P2P shuffle persistence. Automatically cleaned up after test execution.
      */
     @TempDir
     Path tempDir;
 
+    /**
+     * Initializes the test environment, establishing the base directory for
+     * local shuffle data and configuring the partitioner with three target reducers.
+     */
     @BeforeEach
     void setUp() {
         // Set the base directory for local shuffle data
@@ -56,15 +61,12 @@ class ShufflePartitionerTest {
     }
 
     /**
-     * Verifies that the thread-safe partitioner correctly groups identical keys and
-     * safely creates directory structures for active partitions.
-     * * """
-     * Validates the core routing and disk-spill mechanism.
-     * * Proves that batches are correctly segmented by hash and written to the
-     * correct deterministic files without data loss.
-     * * Raises:
-     * IOException: If a file system error occurs during the partitioning process.
-     * """
+     * Validates the core routing and disk-spill mechanism of the partitioner.
+     *
+     * <p>Verifies that the thread-safe partitioner correctly segments keys based
+     * on their hash values, creates the necessary directory structures, and
+     * groups identical keys into the same deterministic files without data loss.</p>
+     *
      * @throws IOException If a file system error occurs during the partitioning process.
      */
     @Test
@@ -98,16 +100,14 @@ class ShufflePartitionerTest {
     }
 
     /**
-     * Verifies that the partitioner adheres to the deterministic local path
-     * naming convention required for the P2P embedded server to locate data.
-     * * """
-     * Validates the routing path generation.
-     * * Essential for the gRPC Server-Side Streaming to accurately fetch files
-     * requested by remote Reducers.
-     * * Raises:
-     * IOException: If a file system error occurs.
-     * """
-     * @throws IOException If a file system error occurs.
+     * Validates that the partitioner adheres to the deterministic path naming
+     * convention required for the Peer-to-Peer infrastructure.
+     *
+     * <p>This naming convention is essential for the embedded gRPC server to
+     * accurately locate and stream files requested by remote Reducers during
+     * the shuffle phase.</p>
+     *
+     * @throws IOException If a file system error occurs during path generation or file creation.
      */
     @Test
     void testAppendThreadSafe_DeterministicPathConvention() throws IOException {

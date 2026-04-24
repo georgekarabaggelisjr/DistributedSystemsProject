@@ -1,12 +1,12 @@
 package com.iliasbolan;
 
-import com.iliasbolan.engine.ShuffleGrpcServer;
+import com.iliasbolan.engine.shuffle.ShuffleGrpcServer;
 import com.iliasbolan.engine.TaskExecutor;
-import com.iliasbolan.messaging.RabbitMqConnectionManager;
-import com.iliasbolan.messaging.RabbitMqConsumer;
-import com.iliasbolan.messaging.RabbitMqProducer;
-import com.iliasbolan.storage.MinioConnectionManager;
-import com.iliasbolan.storage.S3ClientService;
+import com.iliasbolan.infrastructure.RabbitMqConnectionManager;
+import com.iliasbolan.services.RabbitMqConsumer;
+import com.iliasbolan.services.RabbitMqProducer;
+import com.iliasbolan.infrastructure.MinioConnectionManager;
+import com.iliasbolan.services.S3ClientService;
 import com.sun.net.httpserver.HttpServer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -28,7 +28,7 @@ import java.net.InetSocketAddress;
  * </p>
  *
  * @author Ilias Bolanakis
- * @version 3.2
+ * @version 2.0
  * @since 2026-03-30
  */
 public class App {

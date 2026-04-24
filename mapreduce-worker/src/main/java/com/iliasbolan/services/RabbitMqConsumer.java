@@ -1,9 +1,10 @@
-package com.iliasbolan.messaging;
+package com.iliasbolan.services;
 
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.iliasbolan.engine.TaskExecutor;
+import com.iliasbolan.infrastructure.RabbitMqConnectionManager;
 import com.rabbitmq.client.Channel;
 import com.rabbitmq.client.Connection;
 import com.rabbitmq.client.DeliverCallback;
@@ -38,14 +39,15 @@ import java.util.concurrent.atomic.AtomicLong;
  * </ul>
  *
  * @author Ilias Bolanakis
- * @version 2.2
+ * @version 2.0
  * @since 2026-04-07
  */
 public class RabbitMqConsumer {
 
     private static final Logger logger = LoggerFactory.getLogger(RabbitMqConsumer.class);
 
-    /** * Configured JSON mapper for task extraction.
+    /**
+     *  Configured JSON mapper for task extraction.
      * Set to ignore unknown properties to facilitate seamless communication with
      * the Python Manager's Pydantic-based schemas.
      */

@@ -1,7 +1,8 @@
-package com.iliasbolan.engine;
+package com.iliasbolan.engine.execution;
 
 import com.iliasbolan.core.KeyValuePair;
 import com.iliasbolan.core.Mapper;
+import com.iliasbolan.engine.shuffle.ShufflePartitioner;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 

@@ -1,7 +1,8 @@
-package com.iliasbolan.engine;
+package com.iliasbolan.engine.execution;
 
 import com.iliasbolan.core.KeyValuePair;
 import com.iliasbolan.core.Mapper;
+import com.iliasbolan.engine.shuffle.ShufflePartitioner;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -58,18 +59,17 @@ public class MapTaskProcessor extends RecursiveAction {
 
     /**
      * Constructs the ROOT {@code MapTaskProcessor} for a specific segment of the data chunk.
-     *
-     * """
+     * <p>
      * Initializes the root Fork/Join action for mapping records and spilling to disk.
-     * * Calculates a dynamic split threshold based on available CPU cores to ensure
+     * Calculates a dynamic split threshold based on available CPU cores to ensure
      * proper fan-out. Binds a shared Partitioner to handle concurrent disk writes.
-     * * Args:
-     * records (List[str]): The complete list of UTF-8 records parsed from the chunk.
-     * start (int): The starting index for this task's segment.
-     * end (int): The ending index for this task's segment.
-     * mapper (Mapper): The user's dynamic Mapper implementation.
-     * partitioner (ShufflePartitioner): The service handling concurrent disk spills.
-     * """
+     * </p>
+     *
+     * @param records     The complete list of UTF-8 records parsed from the chunk.
+     * @param start       The starting index for this task's segment.
+     * @param end         The ending index for this task's segment.
+     * @param mapper      The user's dynamic Mapper implementation.
+     * @param partitioner The service handling concurrent disk spills.
      */
     public MapTaskProcessor(List<String> records, int start, int end, Mapper mapper, ShufflePartitioner partitioner) {
         this.records = records;
@@ -88,10 +88,16 @@ public class MapTaskProcessor extends RecursiveAction {
 
     /**
      * Internal constructor used exclusively for instantiating recursive sub-tasks.
-     *
-     * """
+     * <p>
      * Bypasses the heavy dynamic threshold calculation for sub-tasks to maximize performance.
-     * """
+     * </p>
+     *
+     * @param records     The complete list of UTF-8 records parsed from the chunk.
+     * @param start       The starting index for this task's segment.
+     * @param end         The ending index for this task's segment.
+     * @param mapper      The user's dynamic Mapper implementation.
+     * @param partitioner The service handling concurrent disk spills.
+     * @param threshold   The calculated maximum number of records a single thread should process sequentially.
      */
     private MapTaskProcessor(List<String> records, int start, int end, Mapper mapper, ShufflePartitioner partitioner, int threshold) {
         this.records = records;
@@ -104,12 +110,11 @@ public class MapTaskProcessor extends RecursiveAction {
 
     /**
      * The core parallel computation method invoked by the {@link java.util.concurrent.ForkJoinPool}.
-     *
-     * """
+     * <p>
      * Recursively splits the workload in half until the segment size falls below the threshold.
-     * * Because this is a RecursiveAction, no data is merged or returned. Threads execute
+     * Because this is a RecursiveAction, no data is merged or returned. Threads execute
      * their batches and flush to disk independently.
-     * """
+     * </p>
      */
     @Override
     protected void compute() {
@@ -139,13 +144,12 @@ public class MapTaskProcessor extends RecursiveAction {
 
     /**
      * Iterates through the assigned segment of records, applies the Map logic, and flushes to disk.
-     *
-     * """
-     * The leaf-node execution logic. Passes lines to the user-defined `map()` function
+     * <p>
+     * The leaf-node execution logic. Passes lines to the user-defined {@code map()} function
      * and immediately flushes the intermediate results to the thread-safe Partitioner.
-     * * Raises:
-     * RuntimeException: If the disk spill operation fails.
-     * """
+     * </p>
+     *
+     * @throws RuntimeException If the disk spill operation fails.
      */
     private void processSequentially() {
         List<KeyValuePair> localBuffer = new ArrayList<>();

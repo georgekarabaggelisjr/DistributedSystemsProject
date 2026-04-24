@@ -1,7 +1,8 @@
-package com.iliasbolan.engine;
+package com.iliasbolan.engine.execution;
 
 import com.iliasbolan.core.Mapper;
 import com.iliasbolan.core.Reducer;
+import com.iliasbolan.engine.TaskExecutor;
 import org.junit.jupiter.api.Test;
 
 import java.io.File;
@@ -25,7 +26,7 @@ import static org.junit.jupiter.api.Assertions.*;
  *
  * @author Ilias Bolanakis
  * @version 2.0
- * @see com.iliasbolan.engine.DynamicClassLoader
+ * @see DynamicClassLoader
  */
 class DynamicClassLoaderTest {
 

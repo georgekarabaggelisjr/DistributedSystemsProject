@@ -1,7 +1,5 @@
-package com.iliasbolan.engine;
+package com.iliasbolan.engine.shuffle;
 
-import com.google.protobuf.ByteString;
-import com.iliasbolan.grpc.shuffle.PartitionChunk;
 import com.google.protobuf.ByteString;
 import com.iliasbolan.grpc.shuffle.PartitionChunk;
 import com.iliasbolan.grpc.shuffle.PartitionRequest;
@@ -44,7 +42,7 @@ import java.util.stream.Stream;
  * @author Ilias Bolanakis
  * @version 2.0
  * @since 2026-04-23
- * @see com.iliasbolan.engine.ShufflePartitioner
+ * @see ShufflePartitioner
  * @see com.iliasbolan.engine.TaskExecutor
  */
 public class ShuffleGrpcServer {
@@ -53,7 +51,6 @@ public class ShuffleGrpcServer {
 
     private final int port;
     private final Server server;
-    private final String baseShuffleDir;
 
     /**
      * Constructs a new Shuffle gRPC Server with the specified network and storage configuration.
@@ -64,7 +61,6 @@ public class ShuffleGrpcServer {
      */
     public ShuffleGrpcServer(int port, String baseShuffleDir) {
         this.port = port;
-        this.baseShuffleDir = baseShuffleDir;
         this.server = ServerBuilder.forPort(port)
                 // Register the core RPC handler implementation
                 .addService(new ShuffleServiceImpl(baseShuffleDir))
@@ -123,6 +119,7 @@ public class ShuffleGrpcServer {
      *
      * @throws InterruptedException If the blocking thread is interrupted.
      */
+    @SuppressWarnings("unused")
     public void blockUntilShutdown() throws InterruptedException {
         if (server != null) {
             server.awaitTermination();
@@ -221,7 +218,7 @@ public class ShuffleGrpcServer {
                 });
 
                 // Final flush for data remaining in the buffer
-                if (chunkBuilder.length() > 0) {
+                if (!chunkBuilder.isEmpty()) {
                     PartitionChunk chunk = PartitionChunk.newBuilder()
                             .setContent(ByteString.copyFromUtf8(chunkBuilder.toString()))
                             .build();

@@ -1,5 +1,6 @@
-package com.iliasbolan.storage;
+package com.iliasbolan.services;
 
+import com.iliasbolan.infrastructure.MinioConnectionManager;
 import io.github.resilience4j.core.IntervalFunction;
 import io.github.resilience4j.retry.Retry;
 import io.github.resilience4j.retry.RetryConfig;
@@ -38,7 +39,7 @@ import java.util.List;
  * </ul>
  *
  * @author Ilias Bolanakis
- * @version 1.4
+ * @version 2.0
  * @see <a href="https://resilience4j.readme.io/">Resilience4j Documentation</a>
  * @since 2026-03-30
  */
@@ -143,24 +144,29 @@ public class S3ClientService {
                             .offset(offset)
                             .build())) {
 
+                // Move the counter to track skipped bytes
+                long bytesProcessedInChunk = 0;
+
                 // SYNC PHASE: Seek to the first valid record start (newline)
                 if (offset > 0) {
                     int b;
-                    while ((b = stream.read()) != -1 && b != 0x0A);
+                    while ((b = stream.read()) != -1) {
+                        bytesProcessedInChunk++; // Count skipped bytes!
+                        if (b == 0x0A) break;
+                    }
                 }
 
                 // EXTRACTION PHASE: Read target length + finish current line
                 ByteArrayOutputStream lineBuffer = new ByteArrayOutputStream();
-                long bytesProcessedInChunk = 0;
                 int b;
 
                 while ((b = stream.read()) != -1) {
-                    bytesProcessedInChunk++;
+                    bytesProcessedInChunk++; // Continue counting
                     lineBuffer.write(b);
 
                     // UTF-8 records are separated by standard LF (0x0A)
                     if (b == 0x0A) {
-                        String line = new String(lineBuffer.toByteArray(), StandardCharsets.UTF_8).trim();
+                        String line = lineBuffer.toString(StandardCharsets.UTF_8).trim();
 
                         if (!line.isEmpty()) {
                             cleanRecords.add(line);
@@ -177,7 +183,7 @@ public class S3ClientService {
 
                 // Edge Case: Handle file trailing bytes missing a newline
                 if (lineBuffer.size() > 0) {
-                    String lastLine = new String(lineBuffer.toByteArray(), StandardCharsets.UTF_8).trim();
+                    String lastLine = lineBuffer.toString(StandardCharsets.UTF_8).trim();
                     if (!lastLine.isEmpty()) {
                         cleanRecords.add(lastLine);
                     }
@@ -234,6 +240,7 @@ public class S3ClientService {
      * @return A {@link List} of object keys ready for ingestion.
      * @throws Throwable if listing permissions are denied or network fails.
      */
+    @SuppressWarnings("unused")
     public List<String> listIntermediateFiles(String bucketName, String jobId, int partitionIndex) throws Throwable {
         return Retry.decorateCheckedSupplier(retryContext, () -> {
             String prefix = jobId + "/intermediate/";
@@ -272,6 +279,7 @@ public class S3ClientService {
      * @return The full text content of the file.
      * @throws Throwable if the object is too large for memory or retrieval fails.
      */
+    @SuppressWarnings("unused")
     public String readObject(String bucketName, String objectName) throws Throwable {
         return Retry.decorateCheckedSupplier(retryContext, () -> {
             try (InputStream stream = minioClient.getObject(

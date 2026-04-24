@@ -3,8 +3,10 @@ package com.iliasbolan.engine;
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.iliasbolan.core.TaskPayload;
-import com.iliasbolan.messaging.RabbitMqProducer;
-import com.iliasbolan.storage.S3ClientService;
+import com.iliasbolan.engine.execution.SandboxRunner;
+import com.iliasbolan.engine.shuffle.ExternalMergeSorter;
+import com.iliasbolan.services.RabbitMqProducer;
+import com.iliasbolan.services.S3ClientService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -27,23 +29,19 @@ import java.util.concurrent.TimeUnit;
 
 /**
  * The central orchestration engine for executing Map-Reduce tasks on the Worker node.
- * <p>
- * This class acts as the critical bridge between the messaging layer (RabbitMQ) and
+ * * <p>This class acts as the critical bridge between the messaging layer (RabbitMQ) and
  * the computation layer. To ensure enterprise-grade stability and security, this
  * orchestrator delegates all untrusted byte-code execution to an isolated Child JVM
- * ({@link SandboxRunner}).
- * </p>
- * <h3>Architecture Update: Reactive Lineage Recomputation (The Sentinel)</h3>
- * <p>
- * This worker acts as a Sentinel for Peer-to-Peer ephemeral data loss. During the
+ * ({@link SandboxRunner}).</p>
+ * * <h3>Architecture Update: Reactive Lineage Recomputation (The Sentinel)</h3>
+ * <p>This worker acts as a Sentinel for Peer-to-Peer ephemeral data loss. During the
  * Shuffle phase, if a remote Map pod is unresponsive (e.g., evicted by Kubernetes),
  * this executor intercepts the gRPC network failure. Instead of crashing, it gracefully
  * suspends execution, signals the exact missing chunk ID to the Orchestrator, and allows
- * the control plane to deterministically rebuild the lost lineage.
- * </p>
+ * the control plane to deterministically rebuild the lost lineage.</p>
  *
  * @author Ilias Bolanakis
- * @version 6.0
+ * @version 2.0
  * @since 2026-04-24
  */
 public class TaskExecutor {
@@ -58,6 +56,14 @@ public class TaskExecutor {
     private final RabbitMqProducer eventProducer;
     private final String podIp;
 
+    /**
+     * Constructs a new TaskExecutor with necessary infrastructure dependencies.
+     *
+     * @param s3ClientService Service for interacting with S3-compatible storage.
+     * @param baseShuffleDir  The root local directory used for intermediate data storage.
+     * @param eventProducer   Producer for signaling task status to the Manager.
+     * @param podIp           The unique IP address of the current Kubernetes pod.
+     */
     public TaskExecutor(S3ClientService s3ClientService, String baseShuffleDir, RabbitMqProducer eventProducer, String podIp) {
         this.s3ClientService = s3ClientService;
         this.baseShuffleDir = baseShuffleDir;
@@ -67,6 +73,12 @@ public class TaskExecutor {
         logger.info("Initialized TaskExecutor (Sandbox Orchestrator Mode). Pod IP: {}", podIp);
     }
 
+    /**
+     * Parses a raw JSON task payload and routes it to the appropriate phase handler.
+     *
+     * @param jsonPayload The serialized {@link TaskPayload} received from the message broker.
+     * @throws Throwable If deserialization fails or an unrecoverable error occurs during phase execution.
+     */
     public void executeTask(String jsonPayload) throws Throwable {
         TaskPayload payload = objectMapper.readValue(jsonPayload, TaskPayload.class);
         logger.info("Successfully parsed task payload. JobId: {}, TaskType: {}", payload.jobId(), payload.taskType());
@@ -83,12 +95,12 @@ public class TaskExecutor {
     /**
      * Orchestrates the complete lifecycle of a distributed MAP task.
      *
-     * <p>
-     * Prepares the environment and delegates Map execution to the Sandbox JVM.
-     * </p>
+     * <p>This method performs resource localization by downloading the required
+     * user-code from S3 and subsequently delegates the Map computation to an
+     * ephemeral Sandbox JVM to ensure process isolation.</p>
      *
-     * @param payload  The metadata required to execute the specific map chunk.
-     * @param rawJson  The unparsed JSON string, passed as an argument to the child process.
+     * @param payload The metadata required to execute the specific map chunk.
+     * @param rawJson The unparsed JSON string, passed as an argument to the child process.
      * @throws Throwable If an error occurs during resource acquisition or the child JVM fails.
      */
     private void executeMapPhase(TaskPayload payload, String rawJson) throws Throwable {
@@ -121,14 +133,12 @@ public class TaskExecutor {
     /**
      * Orchestrates the REDUCE task lifecycle utilizing gRPC and the Sandbox JVM.
      *
-     * <p>
-     * Executes the Reduce phase by streaming remote partition data directly to local disk.
+     * <p>Executes the Reduce phase by streaming remote partition data directly to local disk.
      * If a remote node is unreachable, it acts as a Sentinel, firing a highly specific
-     * telemetry event back to the Manager to trigger Reactive Lineage Recomputation.
-     * </p>
+     * telemetry event back to the Manager to trigger Reactive Lineage Recomputation.</p>
      *
-     * @param payload  The metadata required to aggregate the intermediate partition.
-     * @param rawJson  The unparsed JSON string.
+     * @param payload The metadata required to aggregate the intermediate partition.
+     * @param rawJson The unparsed JSON string.
      * @throws Throwable If a critical, non-network failure occurs.
      */
     private void executeReducePhase(TaskPayload payload, String rawJson) throws Throwable {
@@ -187,9 +197,7 @@ public class TaskExecutor {
                 // Construct a specialized error payload (Requires your RabbitMqProducer to support sending the error field)
                 String errorPayload = "SHUFFLE_FETCH_FAILED:" + lostTaskId;
 
-                // Assuming an overloaded method or unified method in your RabbitMqProducer:
-                // If your existing sendCompletionSignal doesn't accept an error field directly,
-                // you will need to update RabbitMqProducer to serialize it correctly into the JSON.
+                // Send a targeted failure signal to bypass global Fail-Fast and trigger recovery
                 eventProducer.sendErrorSignal(payload.jobId(), payload.taskId(), "FAILED", errorPayload);
 
                 // Gracefully suspend execution WITHOUT crashing the pod.
@@ -219,19 +227,16 @@ public class TaskExecutor {
     }
 
     /**
-     * Spawns an isolated Child JVM to execute untrusted user code.
+     * Spawns an isolated Child JVM to execute untrusted user code via {@link ProcessBuilder}.
      *
-     * <p>
-     * Bootstraps the SandboxRunner via a native OS ProcessBuilder. This architectural
-     * boundary prevents user-code from accessing the primary worker's memory space,
-     * avoiding ClassLoader Metaspace leaks and shielding core orchestration threads
-     * from fatal exceptions.
-     * </p>
+     * <p>This architectural boundary prevents user-code from accessing the primary
+     * worker's memory space, avoiding ClassLoader Metaspace leaks and shielding
+     * core orchestration threads from fatal exceptions.</p>
      *
      * @param payloadFile The temporary file containing the task execution instructions.
-     * @throws IOException If the OS fails to allocate process resources.
-     * @throws InterruptedException If the K8s node preempts the worker pod.
-     * @throws RuntimeException If the child JVM exits with a non-zero failure code.
+     * @throws IOException          If the OS fails to allocate process resources.
+     * @throws InterruptedException If the K8s node preempts the worker pod during execution.
+     * @throws RuntimeException     If the child JVM exits with a non-zero failure code.
      */
     private void runSandbox(Path payloadFile) throws IOException, InterruptedException {
         String javaHome = System.getProperty("java.home");
@@ -241,7 +246,7 @@ public class TaskExecutor {
         ProcessBuilder pb = new ProcessBuilder(
                 javaBin,
                 "-cp", classpath,
-                "com.iliasbolan.engine.SandboxRunner",
+                "com.iliasbolan.engine.execution.SandboxRunner",
                 payloadFile.toAbsolutePath().toString(),
                 this.baseShuffleDir
         );
@@ -252,7 +257,7 @@ public class TaskExecutor {
         Process process = pb.start();
         int exitCode = process.waitFor();
 
-        // Secure cleanup
+        // Secure cleanup of the temporary instruction file
         Files.deleteIfExists(payloadFile);
 
         if (exitCode != 0) {

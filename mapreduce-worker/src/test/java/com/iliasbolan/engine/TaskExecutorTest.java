@@ -1,9 +1,8 @@
 package com.iliasbolan.engine;
 
-import com.iliasbolan.core.TaskPayload;
 import com.iliasbolan.grpc.shuffle.ShuffleServiceGrpc;
-import com.iliasbolan.messaging.RabbitMqProducer;
-import com.iliasbolan.storage.S3ClientService;
+import com.iliasbolan.services.RabbitMqProducer;
+import com.iliasbolan.services.S3ClientService;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
 import io.grpc.Status;
@@ -16,8 +15,6 @@ import org.mockito.MockedStatic;
 import org.mockito.Mockito;
 
 import java.nio.file.Path;
-import java.util.List;
-import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.*;
@@ -36,7 +33,7 @@ import static org.mockito.Mockito.*;
  * </p>
  *
  * @author Ilias Bolanakis
- * @version 6.0
+ * @version 2.0
  * @since 2026-04-24
  */
 class TaskExecutorTest {

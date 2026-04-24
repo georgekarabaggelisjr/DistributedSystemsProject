@@ -18,7 +18,7 @@ package com.iliasbolan.core;
  * @param key   The key associated with the intermediate or final data record.
  * @param value The value associated with the intermediate or final data record.
  * @author Ilias Bolanakis
- * @version 1.1
+ * @version 2.0
  * @since 2026-03-30
  */
 public record KeyValuePair(String key, String value) {}

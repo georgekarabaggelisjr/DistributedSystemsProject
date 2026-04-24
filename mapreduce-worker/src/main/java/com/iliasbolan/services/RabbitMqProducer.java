@@ -1,6 +1,7 @@
-package com.iliasbolan.messaging;
+package com.iliasbolan.services;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.iliasbolan.infrastructure.RabbitMqConnectionManager;
 import com.rabbitmq.client.Channel;
 import com.rabbitmq.client.Connection;
 import org.slf4j.Logger;
@@ -10,24 +11,24 @@ import java.util.HashMap;
 import java.util.Map;
 
 /**
- * Handles the transmission of task lifecycle events from the Worker to the Manager.
- * <p>
- * In a distributed MapReduce architecture, the Manager must maintain an accurate
- * state of the cluster. This producer is responsible for signaling when a task
- * has transitioned to a 'COMPLETED' state and providing the network coordinates
- * (gRPC address) where the intermediate shuffle data is hosted.
- * </p>
- * <p>
- * <b>Schema Synchronization:</b><br>
- * The outgoing JSON messages are strictly formatted to match the Pydantic
- * <code>TaskCompletedRequest</code> model used by the Python-based Orchestrator,
- * ensuring seamless cross-language communication via RabbitMQ.
- * </p>
+ * Handles the transmission of task lifecycle events from the Worker node to the global Manager.
+ *
+ * <p>In a distributed MapReduce architecture, the Manager must maintain an accurate
+ * and synchronized state of the cluster. This producer is responsible for signaling
+ * state transitions—specifically when a task reaches a {@code COMPLETED} or
+ * {@code FAILED} state—and providing the necessary network coordinates (gRPC
+ * addresses) required for subsequent shuffle phases.</p>
+ *
+ * <p><b>Schema Synchronization:</b><br>
+ * Outgoing JSON payloads are strictly structured to align with the Pydantic
+ * {@code TaskCompletedRequest} model utilized by the Python-based Orchestrator.
+ * This ensures deterministic cross-language communication and type safety
+ * across the RabbitMQ message broker.</p>
  *
  * @author Ilias Bolanakis
  * @version 2.0
  * @since 2026-04-23
- * @see com.iliasbolan.messaging.RabbitMqConnectionManager
+ * @see RabbitMqConnectionManager
  */
 public class RabbitMqProducer {
 
@@ -36,9 +37,19 @@ public class RabbitMqProducer {
     /** High-performance JSON serializer for event payloads. */
     private static final ObjectMapper objectMapper = new ObjectMapper();
 
+    /** The manager responsible for providing authenticated RabbitMQ connections. */
     private final RabbitMqConnectionManager connectionManager;
+
+    /** The target routing key or queue name for task event signals. */
     private final String eventQueue;
 
+    /**
+     * Constructs a new {@code RabbitMqProducer} with a specific connection manager
+     * and target queue.
+     *
+     * @param connectionManager The manager for acquiring live RabbitMQ connections.
+     * @param eventQueue        The name of the queue where task events are published.
+     */
     public RabbitMqProducer(RabbitMqConnectionManager connectionManager, String eventQueue) {
         this.connectionManager = connectionManager;
         this.eventQueue = eventQueue;
@@ -47,11 +58,15 @@ public class RabbitMqProducer {
     /**
      * Transmits a successful task completion signal to the global Orchestrator.
      *
-     * @param jobId             The universally unique identifier of the Map-Reduce job.
-     * @param taskId            The specific partition identifier of the completed Map task.
-     * @param status            The final execution status (typically "COMPLETED").
+     * <p>This method encapsulates the payload construction and serialization logic
+     * required to notify the control plane that a specific chunk has been processed
+     * and its intermediate shuffle data is ready for retrieval.</p>
+     *
+     * @param jobId             The universally unique identifier (UUID) of the Map-Reduce job.
+     * @param taskId            The specific partition or chunk identifier of the completed task.
+     * @param status            The execution status, typically "COMPLETED".
      * @param workerBindAddress The gRPC network endpoint (e.g., "10.244.1.5:50051")
-     * where Reducers can stream shuffle data.
+     * where sibling nodes can stream the generated shuffle data.
      */
     public void sendCompletionSignal(String jobId, String taskId, String status, String workerBindAddress) {
         try (Connection connection = connectionManager.createConnection();
@@ -79,19 +94,19 @@ public class RabbitMqProducer {
     }
 
     /**
-     * Transmits a task failure event to the global Orchestrator.
-     * <p>
-     * <b>Reactive Lineage Recomputation:</b><br>
-     * Used heavily by the Sentinel interceptor during the P2P Shuffle phase. If a worker
-     * detects a remote pod has crashed (ephemeral data loss), it uses this method to
-     * safely dispatch the specific {@code SHUFFLE_FETCH_FAILED} error payload to the
-     * Manager, bypassing the global Fail-Fast teardown and triggering self-healing.
-     * </p>
+     * Transmits a targeted task failure event to the global Orchestrator.
      *
-     * @param jobId  The universally unique identifier of the Map-Reduce job.
-     * @param taskId The specific partition identifier of the task that failed.
-     * @param status The final execution status (typically "FAILED").
-     * @param error  The specific error payload (e.g., "SHUFFLE_FETCH_FAILED:map-chunk-5").
+     * <p><b>Reactive Lineage Recomputation:</b><br>
+     * This method is utilized by the <i>Sentinel Interceptor</i> during the Peer-to-Peer
+     * Shuffle phase. If a worker detects a remote pod has been evicted or crashed
+     * (ephemeral data loss), it dispatches a specialized {@code SHUFFLE_FETCH_FAILED}
+     * error payload. This bypasses the global Fail-Fast teardown and triggers
+     * the Manager's self-healing lineage recovery.</p>
+     *
+     * @param jobId  The universally unique identifier (UUID) of the Map-Reduce job.
+     * @param taskId The specific partition identifier of the task that encountered the failure.
+     * @param status The execution status, typically "FAILED".
+     * @param error  The specific error diagnostic string (e.g., "SHUFFLE_FETCH_FAILED:map-chunk-5").
      */
     public void sendErrorSignal(String jobId, String taskId, String status, String error) {
         try (Connection connection = connectionManager.createConnection();
@@ -101,7 +116,7 @@ public class RabbitMqProducer {
             payload.put("job_id", jobId);
             payload.put("task_id", taskId);
             payload.put("status", status);
-            payload.put("error", error); // Injects the error string directly for Python Pydantic parsing
+            payload.put("error", error); // Injects the error string for orchestrator-side parsing
 
             byte[] messageBody = objectMapper.writeValueAsBytes(payload);
 

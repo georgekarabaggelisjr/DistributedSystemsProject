@@ -12,7 +12,7 @@ import java.util.List;
  * </p>
  *
  * @author Ilias Bolanakis
- * @version 1.0
+ * @version 2.0
  * @since 2026-03-30
  */
 public interface Mapper {

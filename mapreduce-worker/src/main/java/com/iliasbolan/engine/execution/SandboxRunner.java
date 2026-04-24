@@ -1,12 +1,14 @@
-package com.iliasbolan.engine;
+package com.iliasbolan.engine.execution;
 
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.iliasbolan.core.Mapper;
 import com.iliasbolan.core.Reducer;
 import com.iliasbolan.core.TaskPayload;
-import com.iliasbolan.storage.S3ClientService;
-import com.iliasbolan.storage.MinioConnectionManager;
+import com.iliasbolan.engine.shuffle.ExternalMergeSorter;
+import com.iliasbolan.engine.shuffle.ShufflePartitioner;
+import com.iliasbolan.services.S3ClientService;
+import com.iliasbolan.infrastructure.MinioConnectionManager;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -18,42 +20,46 @@ import java.util.concurrent.ForkJoinPool;
 
 /**
  * The isolated entry point for executing user-defined Map-Reduce logic.
- * <p>
- * <b>Enterprise Sandboxing & Resource Isolation:</b><br>
+ *
+ * <p><b>Enterprise Sandboxing & Resource Isolation:</b><br>
  * This class is designed to be executed as a standalone Child JVM process spawned by the
- * primary Worker daemon. By physically isolating the execution of third-party bytecode:
+ * primary Worker daemon. By physically isolating the execution of third-party bytecode,
+ * the system achieves several critical architectural goals:</p>
  * <ul>
- * <li><b>Security (Sandboxing):</b> Malicious user scripts cannot crash the main worker,
- * access its memory space, or easily compromise the primary RabbitMQ/gRPC event loops.</li>
+ * <li><b>Security (Sandboxing):</b> Malicious or poorly written user scripts cannot crash the main worker,
+ * access its sensitive memory space, or compromise primary event loops.</li>
  * <li><b>Memory Management (ClassLoader Leaks):</b> Because the {@link DynamicClassLoader}
  * operates exclusively within this ephemeral JVM, all Metaspace, loaded classes, and static
- * references are completely obliterated by the OS when this process exits (System.exit),
- * mathematically guaranteeing zero memory leaks across thousands of tasks.</li>
+ * references are completely obliterated by the operating system when this process exits,
+ * guaranteeing zero memory leaks across thousands of tasks.</li>
  * </ul>
- * </p>
  *
  * @author Ilias Bolanakis
- * @version 1.0
+ * @version 2.0
  * @since 2026-04-24
  */
 public class SandboxRunner {
 
     private static final Logger logger = LoggerFactory.getLogger(SandboxRunner.class);
 
+    /**
+     * High-performance JSON serializer used for instruction extraction.
+     * Configured to ignore unknown properties for cross-version compatibility.
+     */
     private static final ObjectMapper objectMapper = new ObjectMapper()
             .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
 
     /**
      * The primary execution hook for the Child JVM.
      *
-     * """
-     * Bootstraps the isolated environment, parses the task instructions, dynamically loads
-     * the user's bytecode, and executes the designated Map or Reduce pipeline.
-     * * Args:
-     * args (String[]): Expects exactly two arguments:
-     * args[0]: The absolute path to the JSON file containing the serialized TaskPayload.
-     * args[1]: The base directory for local shuffle data persistence.
-     * """
+     * <p>Bootstraps the isolated environment, parses task instructions, dynamically loads
+     * user bytecode, and executes the designated computation pipeline.</p>
+     *
+     * @param args Command line arguments:
+     * <ul>
+     * <li>args[0]: Absolute path to the JSON file containing the serialized {@link TaskPayload}.</li>
+     * <li>args[1]: Base directory for local shuffle data persistence.</li>
+     * </ul>
      */
     public static void main(String[] args) {
         if (args.length < 2) {
@@ -100,6 +106,15 @@ public class SandboxRunner {
         }
     }
 
+    /**
+     * Orchestrates the execution of a MAP task within the sandbox environment.
+     *
+     * @param payload        The instructions and metadata for the Map task.
+     * @param localCodeDir   Local directory containing the dynamically loaded user code.
+     * @param baseShuffleDir Local directory for persisting intermediate shuffle data.
+     * @param s3             Service for interacting with S3-compatible storage.
+     * @throws Throwable If class loading, data retrieval, or parallel execution fails.
+     */
     private static void executeMap(TaskPayload payload, String localCodeDir, String baseShuffleDir, S3ClientService s3) throws Throwable {
         Mapper mapper = DynamicClassLoader.loadMapper(localCodeDir, payload.className());
 
@@ -113,6 +128,15 @@ public class SandboxRunner {
         ForkJoinPool.commonPool().invoke(rootMapTask);
     }
 
+    /**
+     * Orchestrates the execution of a REDUCE task within the sandbox environment.
+     *
+     * @param payload        The instructions and metadata for the Reduce task.
+     * @param localCodeDir   Local directory containing the dynamically loaded user code.
+     * @param baseShuffleDir Local directory for retrieving intermediate shuffle data.
+     * @param s3             Service for persisting final output to shared storage.
+     * @throws Throwable If class loading, merge-sort operations, or data persistence fails.
+     */
     private static void executeReduce(TaskPayload payload, String localCodeDir, String baseShuffleDir, S3ClientService s3) throws Throwable {
         Reducer reducer = DynamicClassLoader.loadReducer(localCodeDir, payload.className());
         int partitionIndex = Integer.parseInt(payload.taskId());
