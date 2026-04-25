@@ -15,6 +15,7 @@ class JobStatus(str, enum.Enum):
     RUNNING = "RUNNING"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
+    PENDING = "PENDING"
 
 
 class JobFormat(str, enum.Enum):

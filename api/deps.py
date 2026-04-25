@@ -5,18 +5,19 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sess
 
 from core.security import SecurityManager
 from core.config import settings
+from services.manager_router import ManagerRouter
+from services.orchestrator import JobOrchestrator
+from services.storage_client import StorageClient
 
 # --- Database Setup ---
-# 1. Δημιουργούμε τον κινητήρα (engine) που μιλάει με την PostgreSQL ασύγχρονα
 engine = create_async_engine(settings.DATABASE_URL, echo=False)
 
-# 2. Φτιάχνουμε το εργοστάσιο παραγωγής sessions (Session Factory)
+# Session Factory
 async_session_maker = async_sessionmaker(
     engine, class_=AsyncSession, expire_on_commit=False
 )
 
 # --- Security Setup ---
-# Defines where the token is extracted from (The 'Authorization' header)
 oauth_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
 # Logic to validate JWTs via the SecurityManager class
@@ -71,3 +72,29 @@ async def require_admin_role(current_user: dict = Depends(get_current_user)) -> 
         )
 
     return current_user
+
+# === Service Dependencies ===
+
+def get_storage_client() -> StorageClient:
+    return StorageClient(
+        endpoint=settings.MINIO_ENDPOINT,
+        access_key=settings.MINIO_ACCESS_KEY,
+        secret_key=settings.MINIO_SECRET_KEY
+    )
+
+def get_manager_router() -> ManagerRouter:
+    return ManagerRouter(
+        manager_service_dns=settings.MANAGER_SERVICE_DNS,
+        num_replicas=settings.MANAGER_REPLICAS
+    )
+
+async def get_orchestrator(
+    db: AsyncSession = Depends(get_db),
+    storage: StorageClient = Depends(get_storage_client),
+    router: ManagerRouter = Depends(get_manager_router)
+) -> JobOrchestrator:
+    """
+    Returns an instance of the JobOrchestrator with all the
+    dependencies (DB, MinIO, Manager Routing) connected.
+    """
+    return JobOrchestrator(db_session=db, storage=storage, router=router)

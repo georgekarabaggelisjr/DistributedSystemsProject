@@ -5,11 +5,17 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="b7aa8481-95c4-4c55-9601-6fd1ab173d2d" name="Changes" comment="">
-      <change afterPath="$PROJECT_DIR$/.env" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.env" beforeDir="false" afterPath="$PROJECT_DIR$/.env" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/api/deps.py" beforeDir="false" afterPath="$PROJECT_DIR$/api/deps.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/core/config.py" beforeDir="false" afterPath="$PROJECT_DIR$/core/config.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/core/security.py" beforeDir="false" afterPath="$PROJECT_DIR$/core/security.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/api/endpoints/admin.py" beforeDir="false" afterPath="$PROJECT_DIR$/api/endpoints/admin.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/api/endpoints/jobs.py" beforeDir="false" afterPath="$PROJECT_DIR$/api/endpoints/jobs.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/main.py" beforeDir="false" afterPath="$PROJECT_DIR$/main.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/models/dds_models.py" beforeDir="false" afterPath="$PROJECT_DIR$/models/dds_models.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/services/manager_router.py" beforeDir="false" afterPath="$PROJECT_DIR$/services/manager_router.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/services/message_broker.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/services/orchestrator.py" beforeDir="false" afterPath="$PROJECT_DIR$/services/orchestrator.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/services/storage_client.py" beforeDir="false" afterPath="$PROJECT_DIR$/services/storage_client.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -49,6 +55,7 @@
     "com.intellij.ml.llm.matterhorn.ej.ui.settings.DefaultModelSelectionForGA.v1": "true",
     "git-widget-placeholder": "UI__service",
     "junie.onboarding.icon.badge.shown": "true",
+    "last_opened_file_path": "/home/iason/Documents/HMMY/Semester_8/Distributed/Project/CLI_service",
     "to.speed.mode.migration.done": "true"
   }
 }]]></component>
