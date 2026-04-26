@@ -18,43 +18,44 @@ import org.slf4j.MDC;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Orchestrates the lifecycle of task consumption from the RabbitMQ message broker.
  * <p>
  * This class serves as the primary event-driven controller for the Worker node, implementing
- * essential distributed systems patterns to ensure reliability in containerized environments.
+ * essential distributed systems patterns—such as Competing Consumers, Poison Pill protection,
+ * and Graceful Shutdown—to ensure reliability in containerized Kubernetes environments.
  * </p>
- * <h3>Key Distributed Patterns:</h3>
- * <ul>
- * <li><b>Scale-to-Zero:</b> Implements an adaptive idle-monitoring daemon that triggers
- * graceful shutdown when the task queue remains empty, allowing Kubernetes to reclaim resources.</li>
- * <li><b>Fault Tolerance (Poison Pill):</b> Interrogates message headers for delivery counts,
- * automatically discarding tasks that cause recurring crashes to prevent infinite failure loops.</li>
- * <li><b>Dynamic Schema Resilience:</b> Leverages a lenient JSON mapper to remain compatible
- * with new metadata introduced by the Manager during system upgrades (e.g., gRPC endpoint tables).</li>
- * <li><b>Contextual Observability:</b> Utilizes Mapped Diagnostic Context (MDC) to ensure
- * all log entries are correlated with specific Job and Task IDs.</li>
- * </ul>
+ * <p>
+ * <b>Operational Intelligence & Scaling:</b><br>
+ * It utilizes Mapped Diagnostic Context (MDC) to inject <code>job_id</code> and <code>task_id</code>
+ * into every log statement triggered during message processing. Furthermore, it implements an
+ * <i>Execution-Aware Scale-to-Zero</i> daemon that actively monitors idle time without interrupting
+ * long-running sandbox computations.
+ * </p>
  *
  * @author Ilias Bolanakis
- * @version 2.0
- * @since 2026-04-07
+ * @version 2.1
+ * @since 2026-04-25
+ * @see com.iliasbolan.engine.TaskExecutor
  */
 public class RabbitMqConsumer {
 
     private static final Logger logger = LoggerFactory.getLogger(RabbitMqConsumer.class);
 
     /**
-     *  Configured JSON mapper for task extraction.
-     * Set to ignore unknown properties to facilitate seamless communication with
-     * the Python Manager's Pydantic-based schemas.
+     * Reusable JSON mapper configured to ignore unknown properties, ensuring
+     * backward compatibility with evolving Manager API schemas.
      */
     private static final ObjectMapper objectMapper = new ObjectMapper()
             .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
 
-    /** Limit for delivery attempts before a message is rejected as a "Poison Pill". */
+    /**
+     * Threshold for message redelivery before a task is classified as a 'Poison Pill'
+     * and moved to the Dead Letter Exchange (DLX).
+     */
     private static final int MAX_RETRIES = 3;
 
     private final RabbitMqConnectionManager connectionManager;
@@ -65,13 +66,13 @@ public class RabbitMqConsumer {
     private Thread mainThread;
 
     /**
-     * Constructs a consumer with integrated task execution and event signaling capabilities.
+     * Initializes the consumer with its required dependencies and operational parameters.
      *
-     * @param connectionManager Factory for acquiring authenticated TCP connections.
-     * @param queueName         The AMQP queue to monitor for workload definitions.
-     * @param idleTimeoutMillis The duration of inactivity permitted before self-termination.
-     * @param taskExecutor      The engine responsible for the physical execution of Map/Reduce logic.
-     * @param eventProducer     The utility for broadcasting execution state changes to the Manager.
+     * @param connectionManager Factory for creating RabbitMQ connections and channels.
+     * @param queueName          The specific AMQP queue to monitor for task intents.
+     * @param idleTimeoutMillis  Time in milliseconds of inactivity before the consumer triggers a self-termination signal.
+     * @param taskExecutor       The computational engine that will process the localized tasks.
+     * @param eventProducer      The signaling component for broadcasting task status back to the Manager.
      */
     public RabbitMqConsumer(RabbitMqConnectionManager connectionManager, String queueName,
                             int idleTimeoutMillis, TaskExecutor taskExecutor, RabbitMqProducer eventProducer) {
@@ -86,11 +87,8 @@ public class RabbitMqConsumer {
     }
 
     /**
-     * Interrupts the primary consumption thread to facilitate a clean application exit.
-     * <p>
-     * This method is intended for use by JVM shutdown hooks or the internal idle-checker
-     * to ensure network resources are released before the container terminates.
-     * </p>
+     * Signals the main consumer thread to interrupt its blocking loop,
+     * facilitating a clean release of AMQP resources.
      */
     public void stopConsuming() {
         if (this.mainThread != null) {
@@ -100,13 +98,14 @@ public class RabbitMqConsumer {
     }
 
     /**
-     * Establishes a persistent connection to the broker and enters the primary consumption loop.
+     * Establishes the RabbitMQ session and begins the blocking consumption loop.
      * <p>
-     * This method configures the channel QoS for fair task distribution and launches
-     * the background idle-monitoring thread before blocking until the consumer is stopped.
+     * This method configures the channel with <code>basicQos(1)</code> to ensure
+     * fair dispatching among multiple worker pods and declares the dead-letter
+     * topology for fault tolerance.
      * </p>
      *
-     * @throws Exception If broker connectivity fails or queue declarations are rejected.
+     * @throws Exception If the connection is refused or the channel fails to initialize.
      */
     public void startConsuming() throws Exception {
         this.mainThread = Thread.currentThread();
@@ -114,27 +113,38 @@ public class RabbitMqConsumer {
         try (Connection connection = connectionManager.createConnection();
              Channel channel = connection.createChannel()) {
 
-            // Configure Dead Letter Exchange for failed task redirect
+            // Define DLX arguments to prevent message loss on repeated failures
             java.util.Map<String, Object> queueArgs = new java.util.HashMap<>();
             queueArgs.put("x-dead-letter-exchange", "dead_letter_exchange");
 
             channel.queueDeclare(queueName, true, false, false, queueArgs);
-            channel.basicQos(1); // One task at a time per worker thread
 
+            // Set Prefetch count to 1 to implement the Competing Consumers pattern efficiently
+            channel.basicQos(1);
+
+            // Thread-safe activity and execution state trackers for the idle watchdog
             AtomicLong lastActivity = new AtomicLong(System.currentTimeMillis());
+            AtomicBoolean isProcessing = new AtomicBoolean(false);
 
             DeliverCallback deliverCallback = (consumerTag, delivery) -> {
-                lastActivity.set(System.currentTimeMillis());
-                handleMessage(channel, delivery);
+                isProcessing.set(true); // Signal the watchdog to pause the countdown
+                try {
+                    handleMessage(channel, delivery);
+                } finally {
+                    lastActivity.set(System.currentTimeMillis()); // Reset idle timer AFTER execution
+                    isProcessing.set(false); // Resume watchdog monitoring
+                }
             };
 
+            // Start consuming with manual acknowledgments enabled
             channel.basicConsume(queueName, false, deliverCallback, (CancelCallback) consumerTag -> {});
 
-            // Start the scale-to-zero monitor
-            Thread idleChecker = getThread(lastActivity);
+            // Initialize the background watchdog to monitor for inactivity
+            Thread idleChecker = getThread(lastActivity, isProcessing);
             idleChecker.start();
 
             try {
+                // Block the main thread until shutdown is signaled via interruption
                 Thread.currentThread().join();
             } catch (InterruptedException e) {
                 logger.warn("Main consumer thread interrupted. Releasing resources...");
@@ -144,16 +154,12 @@ public class RabbitMqConsumer {
     }
 
     /**
-     * Processes individual message deliveries, manages error states, and signals completion.
-     * <p>
-     * This method implements the "Acknowledge after Execution" pattern to ensure
-     * no data is lost if a worker crashes mid-task. It also handles the logic for
-     * discarding Poison Pills and reporting class-level exceptions to the Manager.
-     * </p>
+     * Processes an individual message delivery, handling metadata extraction,
+     * task execution, and AMQP signaling.
      *
-     * @param channel  The active AMQP channel.
-     * @param delivery The delivery envelope containing the JSON task body.
-     * @throws IOException If the broker communication for ACKs/NACKs is severed.
+     * @param channel  The active RabbitMQ channel for ACKing or NACKing.
+     * @param delivery The encapsulated AMQP delivery containing the body and envelopes.
+     * @throws IOException If a channel-level communication error occurs.
      */
     private void handleMessage(Channel channel, com.rabbitmq.client.Delivery delivery) throws IOException {
         String messageBody = new String(delivery.getBody(), StandardCharsets.UTF_8);
@@ -163,55 +169,59 @@ public class RabbitMqConsumer {
         String jobId = "UNKNOWN";
         String taskId = "UNKNOWN";
         String phase = "UNKNOWN";
+        String jobToken = null;
 
-        // Pre-parse for logging context
+        // Metadata extraction for log correlation and security authorization
         try {
             JsonNode jsonNode = objectMapper.readTree(messageBody);
             jobId = jsonNode.path("jobId").asText("UNKNOWN");
             taskId = jsonNode.path("taskId").asText("UNKNOWN");
             phase = jsonNode.path("taskType").asText("UNKNOWN");
+            jobToken = jsonNode.path("jobToken").asText(null);
         } catch (Exception e) {
             logger.warn("Metadata extraction failed; logging correlation will be degraded.");
         }
 
         try {
-            // Tag all subsequent logs with the Job and Task identifiers
+            // Contextual Logging: Inject IDs into MDC for distributed tracing
             MDC.put("job_id", jobId);
             MDC.put("task_id", taskId);
 
-            // Safety check for infinite retry loops
+            // Poison Pill Check: Prevent infinite retry loops of faulty tasks
             if (deliveryCount > MAX_RETRIES) {
                 logger.error("Poison Pill Detected! Task exceeded MAX_RETRIES ({}).", MAX_RETRIES);
-                eventProducer.sendCompletionSignal(jobId, taskId, "FAILED", "MAX_RETRIES_EXCEEDED");
-                channel.basicNack(deliveryTag, false, false); // Send to DLX
+                eventProducer.sendErrorSignal(jobId, taskId, jobToken, "FAILED", "MAX_RETRIES_EXCEEDED");
+                channel.basicNack(deliveryTag, false, false); // Drop and route to DLX
                 return;
             }
 
             try {
+                // Delegate computation to the TaskExecutor (Sandbox)
                 taskExecutor.executeTask(messageBody);
 
-                // Reduce tasks signal here; Map tasks signal within executor to include network identity
+                // Map phase handles its own signaling due to locality hints
                 if (!"MAP".equalsIgnoreCase(phase)) {
-                    eventProducer.sendCompletionSignal(jobId, taskId, "COMPLETED", null);
+                    eventProducer.sendCompletionSignal(jobId, taskId, jobToken, "COMPLETED", null);
                 }
 
+                // Explicit positive acknowledgment
                 channel.basicAck(deliveryTag, false);
 
             } catch (Throwable t) {
                 logger.error("Transient task failure. Re-queuing and signaling FAILED state.", t);
-                eventProducer.sendCompletionSignal(jobId, taskId, "FAILED", t.getClass().getSimpleName());
-                channel.basicNack(deliveryTag, false, true); // Re-queue for another worker
+                eventProducer.sendErrorSignal(jobId, taskId, jobToken, "FAILED", t.getClass().getSimpleName());
+                channel.basicNack(deliveryTag, false, true); // Re-queue for another worker to attempt
             }
         } finally {
-            MDC.clear();
+            MDC.clear(); // Ensure thread-local context is purged for the next delivery
         }
     }
 
     /**
-     * Extracts the current delivery attempt count from message properties.
+     * Extracts the delivery count from AMQP headers to support Poison Pill detection.
      *
-     * @param properties The RabbitMQ message properties.
-     * @return The delivery count, defaulting to 1 if the header is absent.
+     * @param properties The AMQP properties associated with the current delivery.
+     * @return The number of times this message has been delivered.
      */
     private long getDeliveryCount(AMQP.BasicProperties properties) {
         Map<String, Object> headers = properties.getHeaders();
@@ -222,25 +232,33 @@ public class RabbitMqConsumer {
     }
 
     /**
-     * Creates a daemon background thread to monitor worker inactivity.
+     * Creates a daemon thread that monitors inactivity and initiates a pod shutdown
+     * once the idle threshold is crossed.
      * <p>
-     * Uses an adaptive sleep interval based on the remaining time until the
-     * threshold is reached, ensuring low CPU overhead.
+     * The thread is execution-aware; it pauses its countdown while the worker is actively
+     * executing a task to prevent premature termination during long-running computations.
      * </p>
      *
-     * @param lastActivity Atomic timestamp reflecting the most recent message delivery.
-     * @return A configured daemon {@link Thread} ready for execution.
+     * @param lastActivity A thread-safe pointer to the last timestamp of message delivery.
+     * @param isProcessing A thread-safe flag indicating if the worker is currently computing a task.
+     * @return A pre-configured background thread for idle monitoring.
      */
     @NotNull
-    private Thread getThread(AtomicLong lastActivity) {
+    private Thread getThread(AtomicLong lastActivity, AtomicBoolean isProcessing) {
         Thread idleChecker = new Thread(() -> {
             try {
-                while (true) {
+                while (!Thread.currentThread().isInterrupted()) {
+                    // Execution-Aware Check: Pause countdown if actively working
+                    if (isProcessing.get()) {
+                        Thread.sleep(1000);
+                        continue;
+                    }
+
                     long elapsed = System.currentTimeMillis() - lastActivity.get();
                     long remainingToWait = idleTimeoutMillis - elapsed;
 
                     if (remainingToWait <= 0) {
-                        logger.info("Inactivity threshold reached ({}s). Terminating.", (idleTimeoutMillis / 1000));
+                        logger.info("Inactivity threshold reached ({}s). Terminating pod.", (idleTimeoutMillis / 1000));
                         stopConsuming();
                         break;
                     }

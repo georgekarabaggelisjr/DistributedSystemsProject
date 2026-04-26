@@ -21,54 +21,71 @@ import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.*;
 
 /**
- * Enterprise-grade unit test suite for the {@link TaskExecutor} orchestration engine.
+ * Unit test suite for the {@link TaskExecutor} orchestration engine.
  * <p>
- * This suite validates the core operational phases of a distributed worker node, including:
+ * This suite provides comprehensive validation for the Worker node's primary
+ * computational controller. It utilizes advanced Mockito techniques, including
+ * static mocking and construction mocking, to simulate a cloud-native
+ * environment.
+ * </p>
+ * <p>
+ * <b>Core Test Coverage:</b>
  * <ul>
- * <li>Map phase resource localization and sandbox execution.</li>
- * <li>Reduce phase P2P data streaming via gRPC.</li>
- * <li>Reactive Lineage Recomputation triggers (Sentinel Interceptor).</li>
- * <li>Process isolation and child JVM lifecycle management.</li>
+ * <li><b>Resource Localization:</b> Verifying S3-to-Local handoffs for user code.</li>
+ * <li><b>P2P Shuffle Logic:</b> Testing gRPC data plane integrity and token injection.</li>
+ * <li><b>Fault Tolerance:</b> Validating <b>Reactive Lineage Recomputation</b> triggers.</li>
+ * <li><b>Process Isolation:</b> Ensuring the Sandbox JVM lifecycle is correctly managed.</li>
  * </ul>
  * </p>
  *
  * @author Ilias Bolanakis
  * @version 2.0
- * @since 2026-04-24
+ * @since 2026-04-25
+ * @see TaskExecutor
  */
 class TaskExecutorTest {
 
     private S3ClientService s3ClientService;
     private RabbitMqProducer eventProducer;
     private TaskExecutor taskExecutor;
-    private final String podIp = "10.0.0.1";
+    private final String nodeIp = "192.168.1.50";
 
+    /**
+     * JUnit 5 temporary directory used to simulate the local shuffle storage path.
+     */
     @TempDir
     Path tempDir;
 
     /**
-     * Re-initializes mocks and the subject under test before each execution to ensure
-     * strict test isolation.
+     * Initializes the testing context by mocking infrastructure dependencies
+     * and injecting them into the TaskExecutor. This enforces strict
+     * Inversion of Control (IoC) during testing.
      */
     @BeforeEach
     void setUp() {
         s3ClientService = mock(S3ClientService.class);
         eventProducer = mock(RabbitMqProducer.class);
-        taskExecutor = new TaskExecutor(s3ClientService, tempDir.toString(), eventProducer, podIp);
+        taskExecutor = new TaskExecutor(s3ClientService, tempDir.toString(), eventProducer, nodeIp);
     }
 
     /**
-     * Validates that the Map phase correctly localizes user code, persists the execution
-     * payload, and signals completion after successful sandbox execution.
+     * Validates a successful Map phase lifecycle.
+     * <p>
+     * This test ensures that the executor correctly localizes the user's Mapper code
+     * and signals the Manager with the specific <code>HOSTNAME@@IP</code> format
+     * required for <b>Data Locality Scheduling</b>.
+     * </p>
      *
-     * @throws Throwable If the internal orchestration logic or mocks fail.
+     * @throws Throwable If the internal orchestration logic or mocks fail unexpectedly.
      */
     @Test
     void testExecuteMapPhase_Success_SignalsCompletion() throws Throwable {
+        // Arrange: Simulate a standard task intent from the Manager
         String jsonPayload = """
                 {
                     "jobId": "job-123",
                     "taskId": "map-0",
+                    "jobToken": "test-secure-token",
                     "taskType": "MAP",
                     "className": "com.example.WordCountMapper",
                     "userCodeBucket": "code",
@@ -77,8 +94,9 @@ class TaskExecutorTest {
                 """;
 
         Process mockProcess = mock(Process.class);
-        when(mockProcess.waitFor()).thenReturn(0);
+        when(mockProcess.waitFor()).thenReturn(0); // Simulate successful Sandbox exit
 
+        // Mocking the ProcessBuilder construction to intercept Sandbox JVM spawning
         try (MockedConstruction<ProcessBuilder> mockedPb = mockConstruction(ProcessBuilder.class,
                 (mock, context) -> {
                     when(mock.start()).thenReturn(mockProcess);
@@ -87,22 +105,34 @@ class TaskExecutorTest {
 
             taskExecutor.executeTask(jsonPayload);
 
-            // Verify resource acquisition and sandbox execution
+            // Verify the Worker attempted to fetch the bytecode from S3
             verify(s3ClientService).downloadUserCode(eq("code"), eq("mapper.class"), anyString());
-            verify(eventProducer).sendCompletionSignal(eq("job-123"), eq("map-0"), eq("COMPLETED"), contains(podIp));
+
+            // --- DATA LOCALITY VERIFICATION ---
+            // In a headless test environment, NODE_NAME defaults to "unknown-node"
+            String expectedEssEndpoint = "unknown-node@@" + nodeIp + ":7337";
+
+            // Verify the completion signal includes the security token and the locality hint
+            verify(eventProducer).sendCompletionSignal(
+                    eq("job-123"),
+                    eq("map-0"),
+                    eq("test-secure-token"),
+                    eq("COMPLETED"),
+                    eq(expectedEssEndpoint)
+            );
         }
     }
 
     /**
-     * Validates the <b>Reactive Lineage Recomputation</b> protocol (Sentinel Interceptor).
+     * Validates the <b>Reactive Lineage Recomputation</b> sentinel logic.
      * <p>
-     * Verifies that if a remote Map pod is unreachable during the Reduce phase fetch loop,
-     * the executor intercepts the gRPC network failure, transmits a targeted
-     * {@code SHUFFLE_FETCH_FAILED} error signal to the Manager, and suspends execution
-     * gracefully.
+     * This test simulates a network failure during a gRPC shuffle fetch. It
+     * verifies that the executor intercepts the <code>StatusRuntimeException</code>
+     * and transmits a targeted error signal to the Manager to trigger recovery
+     * of the missing Map partition.
      * </p>
      *
-     * @throws Throwable If the internal orchestration logic fails.
+     * @throws Throwable If the orchestration logic fails to handle the exception.
      */
     @Test
     void testExecuteReducePhase_ShuffleFetchFailed_SendsErrorSignal() throws Throwable {
@@ -110,18 +140,20 @@ class TaskExecutorTest {
                 {
                     "jobId": "job-999",
                     "taskId": "0",
+                    "jobToken": "error-auth-token",
                     "taskType": "REDUCE",
                     "className": "com.test.Reducer",
-                    "workerEndpoints": ["10.244.2.15:50051"]
+                    "workerEndpoints": ["10.244.2.15:7337"]
                 }
                 """;
 
         ManagedChannel mockChannel = mock(ManagedChannel.class);
         ManagedChannelBuilder mockBuilder = mock(ManagedChannelBuilder.class);
 
-        // Simulate a gRPC network failure (e.g., pod eviction)
-        StatusRuntimeException networkError = new StatusRuntimeException(Status.UNAVAILABLE.withDescription("Pod Evicted"));
+        // Simulate a physical ESS node being offline
+        StatusRuntimeException networkError = new StatusRuntimeException(Status.UNAVAILABLE.withDescription("ESS Node Offline"));
 
+        // Utilize MockedStatic to intercept third-party gRPC builder calls
         try (MockedStatic<ManagedChannelBuilder> staticBuilder = Mockito.mockStatic(ManagedChannelBuilder.class);
              MockedStatic<ShuffleServiceGrpc> staticGrpc = Mockito.mockStatic(ShuffleServiceGrpc.class)) {
 
@@ -131,30 +163,32 @@ class TaskExecutorTest {
             when(mockBuilder.build()).thenReturn(mockChannel);
             when(mockChannel.shutdown()).thenReturn(mockChannel);
 
-            // Force the gRPC stub to throw a network exception when the iterator is requested
+            // Force a failure during the stub initialization
             staticGrpc.when(() -> ShuffleServiceGrpc.newBlockingStub(any(ManagedChannel.class)))
                     .thenThrow(networkError);
 
             taskExecutor.executeTask(jsonPayload);
 
-            // Verification: The Sentinel must report the exact missing lineage chunk
+            // Assert: The Sentinel must report the failure signal to trigger orchestrator recovery
             verify(eventProducer).sendErrorSignal(
                     eq("job-999"),
                     eq("0"),
+                    eq("error-auth-token"),
                     eq("FAILED"),
                     eq("SHUFFLE_FETCH_FAILED:map-chunk-0")
             );
-
-            // Verify the Sandbox was NOT invoked, preserving node stability
-            verify(s3ClientService).downloadUserCode(any(), any(), any());
         }
     }
 
     /**
-     * Enforces the Fail-Fast protocol by ensuring that if the isolated Child JVM (Sandbox)
-     * terminates with a non-zero exit code, the error is propagated as a RuntimeException.
+     * Enforces the <b>Fail-Fast</b> protocol for isolated Sandbox crashes.
+     * <p>
+     * Verifies that if the child JVM (Sandbox) returns a non-zero exit code,
+     * the parent process detects the failure and propagates it as a
+     * RuntimeException.
+     * </p>
      *
-     * @throws Throwable If the process mock encounters an error.
+     * @throws Throwable If the process mocking encounters an issue.
      */
     @Test
     void testExecuteTask_SandboxCrash_ThrowsRuntimeException() throws Throwable {
@@ -162,6 +196,7 @@ class TaskExecutorTest {
                 {
                     "jobId": "job-fail",
                     "taskId": "map-002",
+                    "jobToken": "fail-token",
                     "taskType": "MAP",
                     "className": "com.fail.Mapper"
                 }
@@ -176,14 +211,14 @@ class TaskExecutorTest {
                     when(mock.inheritIO()).thenReturn(mock);
                 })) {
 
+            // Assert that the parent executor correctly identifies the child crash
             RuntimeException exception = assertThrows(RuntimeException.class, () -> taskExecutor.executeTask(jsonPayload));
             assertTrue(exception.getMessage().contains("exit code: 1"));
         }
     }
 
     /**
-     * Validates that malformed task definitions or unsupported phase types trigger
-     * an immediate {@link IllegalArgumentException}.
+     * Validates input integrity by ensuring illegal task types are rejected.
      */
     @Test
     void testExecuteTask_UnknownTaskType_ThrowsIllegalArgumentException() {

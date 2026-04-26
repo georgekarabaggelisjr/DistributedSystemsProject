@@ -1,6 +1,5 @@
 package com.iliasbolan;
 
-import com.iliasbolan.engine.shuffle.ShuffleGrpcServer;
 import com.iliasbolan.engine.TaskExecutor;
 import com.iliasbolan.infrastructure.RabbitMqConnectionManager;
 import com.iliasbolan.services.RabbitMqConsumer;
@@ -17,34 +16,46 @@ import java.net.InetSocketAddress;
 /**
  * The primary entry point for the distributed Map-Reduce Worker node.
  * <p>
- * This class handles the bootstrap sequence of the worker, including:
+ * This class orchestrates the bootstrap sequence of a stateless compute worker, ensuring all
+ * infrastructure dependencies are resolved before entering the task consumption loop.
+ * Key responsibilities include:
+ * </p>
  * <ul>
- * <li>Parsing environment-based configuration for cloud-native deployment.</li>
- * <li>Initializing connection managers for RabbitMQ and S3-compatible storage (MinIO).</li>
- * <li>Spawning the gRPC Shuffle Server for peer-to-peer data streaming.</li>
- * <li>Exposing a lightweight HTTP health probe for Kubernetes orchestration.</li>
- * <li>Managing a graceful shutdown hook to prevent data loss during pod termination.</li>
+ * <li><b>Configuration Management:</b> Resolving environment-based parameters for cloud-native deployment.</li>
+ * <li><b>Resource Wiring:</b> Initializing connection managers for RabbitMQ and S3-compatible storage (MinIO).</li>
+ * <li><b>Computational Steering:</b> Wiring the execution engine for Map and Reduce phases.</li>
+ * <li><b>Observability:</b> Exposing a lightweight HTTP health probe for Kubernetes liveness and readiness checks.</li>
+ * <li><b>Lifecycle Management:</b> Implementing graceful shutdown hooks to handle pod eviction and signal termination.</li>
  * </ul>
+ * * <h3>Architecture Context: ESS Integration</h3>
+ * <p>
+ * In alignment with the <b>Version 2.0</b> specification, this worker operates in a sidecar-dependent
+ * mode where gRPC Shuffle Server responsibilities are delegated to the <b>External Shuffle Service (ESS)</b>
+ * DaemonSet. This architecture ensures compute nodes remain entirely ephemeral and stateless.
  * </p>
  *
  * @author Ilias Bolanakis
  * @version 2.0
- * @since 2026-03-30
+ * @since 2026-04-25
  */
 public class App {
 
+    /**
+     * Standard SLF4J logger for bootstrap and lifecycle events.
+     */
     private static final Logger logger = LoggerFactory.getLogger(App.class);
 
     /**
-     * Application execution starts here.
+     * Application execution entry point. Performs dependency injection and starts the
+     * blocking event-driven consumer loop.
      *
-     * @param args Command line arguments (unused; configuration is driven by environment variables).
+     * @param args Command line arguments (Configuration is derived from Environment Variables).
      */
     public static void main(String[] args) {
-        logger.info("====== [ Map-Reduce Worker Initializing ] ======");
+        logger.info("====== [ Map-Reduce Ephemeral Compute Worker Initializing ] ======");
 
         // 1. Environment-Based Configuration
-        // Control Plane (RabbitMQ)
+        // Control Plane (RabbitMQ) parameters for managing task distribution and signaling.
         String rabbitHost = System.getenv().getOrDefault("RABBITMQ_HOST", "localhost");
         String rabbitUser = System.getenv().getOrDefault("RABBITMQ_USER", "guest");
         String rabbitPass = System.getenv().getOrDefault("RABBITMQ_PASS", "guest");
@@ -52,49 +63,41 @@ public class App {
         String eventQueue = System.getenv().getOrDefault("EVENT_QUEUE", "job_events_queue");
         int idleTimeout = Integer.parseInt(System.getenv().getOrDefault("IDLE_TIMEOUT_MILLIS", "5000"));
 
-        // Storage Plane (MinIO/S3)
+        // Storage Plane (MinIO/S3) parameters for user-code and dataset retrieval.
         String minioEndpoint = System.getenv().getOrDefault("MINIO_ENDPOINT", "http://localhost:9000");
         String minioUser = System.getenv().getOrDefault("MINIO_ROOT_USER", "minioadmin");
         String minioPass = System.getenv().getOrDefault("MINIO_ROOT_PASSWORD", "minioadmin");
 
-        // Data Plane (gRPC P2P Shuffle & Network Identity)
-        String baseShuffleDir = System.getenv().getOrDefault("SHUFFLE_DIR", "/tmp/shuffle-data");
-        int grpcPort = Integer.parseInt(System.getenv().getOrDefault("SHUFFLE_GRPC_PORT", "50051"));
+        // Data Plane (Local Disk for ESS Handoff)
+        // This directory serves as the handoff point between the compute pod and the host ESS.
+        String baseShuffleDir = System.getenv().getOrDefault("SHUFFLE_DIR", "/mnt/mapreduce-shuffle");
 
-        // VITAL: Read the internal Pod IP provided by the Kubernetes Downward API.
-        // This IP is used to build the callback address for the P2P Shuffle phase.
-        String podIp = System.getenv().getOrDefault("POD_IP", "127.0.0.1");
+        // VITAL: Node IP extracted via K8s Downward API for ESS routing and Data Locality scheduling.
+        String nodeIp = System.getenv().getOrDefault("NODE_IP", "127.0.0.1");
 
         try {
-            logger.info("Configuration Loaded. Pod IP: {}, gRPC Port: {}, Storage: {}",
-                    podIp, grpcPort, minioEndpoint);
-
             // 2. Initialize Core Infrastructure Managers
+            // These managers maintain stateful pools to RabbitMQ and S3 (MinIO).
             RabbitMqConnectionManager rabbitManager = new RabbitMqConnectionManager(rabbitHost, rabbitUser, rabbitPass);
             MinioConnectionManager minioManager = new MinioConnectionManager(minioEndpoint, minioUser, minioPass);
             S3ClientService s3ClientService = new S3ClientService(minioManager);
 
             // 3. Initialize Messaging Components
-            // The Producer signals the Manager when tasks transition to 'COMPLETED'.
+            // The Producer acts as the feedback loop signaling task transitions back to the Manager.
             RabbitMqProducer eventProducer = new RabbitMqProducer(rabbitManager, eventQueue);
 
             // 4. Initialize the Computational Engine
-            // TaskExecutor now receives the podIp to report its exact location for shuffle data.
-            TaskExecutor taskExecutor = new TaskExecutor(s3ClientService, baseShuffleDir, eventProducer, podIp);
+            // TaskExecutor encapsulates the logic for sandbox isolation and cross-node shuffle fetches.
+            TaskExecutor taskExecutor = new TaskExecutor(s3ClientService, baseShuffleDir, eventProducer, nodeIp);
 
             // 5. Initialize the Consumer
-            // Manages the RabbitMQ message loop and routes tasks to the executor.
+            // RabbitMqConsumer implements the competing consumers pattern to drain the task queue.
             RabbitMqConsumer consumer = new RabbitMqConsumer(rabbitManager, taskQueue, idleTimeout, taskExecutor, eventProducer);
-
-            /* --------------------------------------------------- */
-            /* --- gRPC SERVER (DATA PLANE: P2P SHUFFLE)       --- */
-            /* --------------------------------------------------- */
-            ShuffleGrpcServer grpcServer = new ShuffleGrpcServer(grpcPort, baseShuffleDir);
-            grpcServer.start();
 
             /* --------------------------------------------------- */
             /* --- HTTP SERVER (CONTROL PLANE: K8S PROBES)     --- */
             /* --------------------------------------------------- */
+            // Exposes port 8080 to satisfy Kubernetes Readiness and Liveness probes.
             HttpServer healthServer = HttpServer.create(new InetSocketAddress(8080), 0);
             healthServer.createContext("/health", exchange -> {
                 String response = "OK";
@@ -103,18 +106,18 @@ public class App {
                     os.write(response.getBytes());
                 }
             });
-            healthServer.setExecutor(null);
+            healthServer.setExecutor(null); // Use the default executor
             healthServer.start();
             logger.info("Health probe server active on port 8080 [/health]");
 
             // --- GRACEFUL SHUTDOWN LOGIC ---
+            // Ensures that AMQP channels are closed and in-flight tasks are handled before pod termination.
             Runtime.getRuntime().addShutdownHook(new Thread(() -> {
                 logger.warn(">>> Shutdown signal received. Cleaning up worker resources... <<<");
                 try {
-                    grpcServer.stop();
                     healthServer.stop(0);
                     consumer.stopConsuming();
-                    Thread.sleep(1000); // Allow remaining network packets to drain
+                    Thread.sleep(1000); // Wait for the network stack to flush pending ACKs
                 } catch (Exception e) {
                     logger.error("Error during graceful shutdown: {}", e.getMessage());
                 }
@@ -122,16 +125,17 @@ public class App {
             }));
 
             // 6. Enter Main Execution Loop
+            // Blocking call: the worker will stay in this loop until the queue is drained or interrupted.
             logger.info("Entering event-driven task loop for queue: {}", taskQueue);
             consumer.startConsuming();
 
             // 7. Cleanup and Exit
             logger.info("Task queue drained. Shutting down worker.");
-            grpcServer.stop();
             healthServer.stop(0);
             System.exit(0);
 
         } catch (Throwable e) {
+            // Fatal errors during initialization trigger a non-zero exit code to alert K8s.
             logger.error("Fatal initialization error. Worker process terminating.", e);
             System.exit(1);
         }
