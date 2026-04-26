@@ -2,7 +2,6 @@ package com.iliasbolan.engine.execution;
 
 import com.iliasbolan.core.KeyValuePair;
 import com.iliasbolan.core.Reducer;
-import com.iliasbolan.engine.shuffle.ExternalMergeSorter;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
