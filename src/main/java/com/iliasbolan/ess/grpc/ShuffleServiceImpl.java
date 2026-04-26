@@ -40,7 +40,7 @@ import java.util.stream.Stream;
  * </p>
  *
  * @author Ilias Bolanakis
- * @version 1.0
+ * @version 1.1
  * @since 2026-04-25
  */
 public class ShuffleServiceImpl extends ShuffleServiceImplBase {
@@ -79,6 +79,7 @@ public class ShuffleServiceImpl extends ShuffleServiceImplBase {
      * Implementation Details:
      * <ol>
      * <li>Performs constant-time HMAC verification of the Job Authorization Token.</li>
+     * <li>Sanitizes inputs to prevent Path Traversal attacks.</li>
      * <li>Localizes the physical partition directory based on Job and Partition IDs.</li>
      * <li>Initiates a sequential NIO stream of all segment files within the partition.</li>
      * </ol>
@@ -89,28 +90,38 @@ public class ShuffleServiceImpl extends ShuffleServiceImplBase {
      */
     @Override
     public void getPartition(PartitionRequest request, StreamObserver<PartitionChunk> responseObserver) {
-        String jobId = request.getJobId();
+        String rawJobId = request.getJobId();
         int partitionId = request.getPartitionId();
 
-        logger.info("ESS Stream Request: [Job: {}, Partition: {}]", jobId, partitionId);
+        logger.info("ESS Stream Request: [Job: {}, Partition: {}]", rawJobId, partitionId);
 
         // --- 1. ZERO-TRUST AUTHORIZATION GATEWAY ---
-        // Retrieve the token injected by the Interceptor from the thread-local Context
         String providedToken = ShuffleDaemon.AUTH_TOKEN_KEY.get();
-        String expectedToken = computeHmacSha256(jobId, secretKey);
+        String expectedToken = computeHmacSha256(rawJobId, secretKey);
 
-        // Use constant-time comparison to mitigate side-channel timing attacks
         if (providedToken == null || !MessageDigest.isEqual(providedToken.getBytes(), expectedToken.getBytes())) {
-            logger.warn("SECURITY BREACH ATTEMPT: Unauthorized access to Job {}. Token Rejected.", jobId);
+            logger.warn("SECURITY BREACH ATTEMPT: Unauthorized access to Job {}. Token Rejected.", rawJobId);
             responseObserver.onError(io.grpc.Status.UNAUTHENTICATED
                     .withDescription("Missing or Invalid Cryptographic Authorization Token.")
                     .asRuntimeException());
             return;
         }
 
-        // --- 2. DATA LOCALIZATION ---
-        // Construct the physical path on the host node
-        Path partitionDir = Paths.get(baseShuffleDir, jobId, String.valueOf(partitionId));
+        // --- 2. INPUT SANITIZATION ---
+        // Prevent Arbitrary Path Traversal by Reducer pods
+        String safeJobId;
+        try {
+            safeJobId = sanitizeId(rawJobId);
+        } catch (SecurityException se) {
+            logger.error("SECURITY BREACH ATTEMPT: Path traversal payload detected in JobId: {}", rawJobId);
+            responseObserver.onError(io.grpc.Status.INVALID_ARGUMENT
+                    .withDescription("Malformed JobId structure.")
+                    .asRuntimeException());
+            return;
+        }
+
+        // --- 3. DATA LOCALIZATION ---
+        Path partitionDir = Paths.get(baseShuffleDir, safeJobId, String.valueOf(partitionId));
 
         if (!Files.exists(partitionDir)) {
             logger.warn("Target partition directory missing: {}", partitionDir);
@@ -118,14 +129,13 @@ public class ShuffleServiceImpl extends ShuffleServiceImplBase {
             return;
         }
 
-        // --- 3. HIGH-PERFORMANCE STREAMING ---
+        // --- 4. HIGH-PERFORMANCE STREAMING ---
         try (Stream<Path> filePaths = Files.list(partitionDir)) {
-            // Stream each file segment sequentially as a gRPC chunk sequence
             filePaths.filter(Files::isRegularFile)
                     .forEach(file -> streamFileContent(file, responseObserver));
 
             responseObserver.onCompleted();
-            logger.info("Secure stream concluded for Partition {} (Job: {})", partitionId, jobId);
+            logger.info("Secure stream concluded for Partition {} (Job: {})", partitionId, safeJobId);
 
         } catch (Exception e) {
             logger.error("Internal streaming failure for directory: {}", partitionDir, e);
@@ -134,11 +144,22 @@ public class ShuffleServiceImpl extends ShuffleServiceImplBase {
     }
 
     /**
+     * Validates structural identifiers to prevent Arbitrary Path Traversal attacks.
+     * Ensures IDs only contain alphanumeric characters and standard delimiters.
+     *
+     * @param input The untrusted JobId provided by the gRPC client.
+     * @return The validated and sanitized ID.
+     * @throws SecurityException If malicious path-traversal characters are detected.
+     */
+    private String sanitizeId(String input) {
+        if (input == null || !input.matches("^[a-zA-Z0-9\\-]+$")) {
+            throw new SecurityException("Invalid ID format. Potential path traversal detected.");
+        }
+        return input;
+    }
+
+    /**
      * Computes an HMAC-SHA256 signature to validate the request origin.
-     * <p>
-     * This ensures the ESS remains stateless while maintaining strong security
-     * by verifying that the requester has been authorized by the central Manager.
-     * </p>
      *
      * @param data The Job ID to sign.
      * @param key  The pre-shared secret key.
@@ -151,7 +172,6 @@ public class ShuffleServiceImpl extends ShuffleServiceImplBase {
             mac.init(secretKeySpec);
             byte[] hashBytes = mac.doFinal(data.getBytes(StandardCharsets.UTF_8));
 
-            // Convert to Hex String to ensure parity with the Manager's Python-based signature
             StringBuilder hexString = new StringBuilder();
             for (byte b : hashBytes) {
                 String hex = Integer.toHexString(0xff & b);
@@ -166,11 +186,6 @@ public class ShuffleServiceImpl extends ShuffleServiceImplBase {
 
     /**
      * Streams the content of a physical file using NIO Direct Buffers.
-     * <p>
-     * This method bypasses heap-based copying by allocating memory outside the
-     * standard JVM garbage-collected heap, significantly reducing GC pressure
-     * during high-throughput shuffle operations.
-     * </p>
      *
      * @param file             The physical file segment to stream.
      * @param responseObserver The gRPC observer for chunk transmission.
@@ -179,14 +194,12 @@ public class ShuffleServiceImpl extends ShuffleServiceImplBase {
         ServerCallStreamObserver<PartitionChunk> flowController =
                 (ServerCallStreamObserver<PartitionChunk>) responseObserver;
 
-        // Allocate memory directly in the OS to facilitate zero-copy-like transfers
         ByteBuffer buffer = ByteBuffer.allocateDirect(CHUNK_SIZE_BYTES);
 
         try (FileChannel fileChannel = FileChannel.open(file, StandardOpenOption.READ)) {
             while (fileChannel.read(buffer) > 0) {
                 buffer.flip();
 
-                // Respect gRPC backpressure to prevent buffer overflows
                 waitForFlowControl(flowController);
                 transmitChunk(buffer, flowController);
 
@@ -200,10 +213,6 @@ public class ShuffleServiceImpl extends ShuffleServiceImplBase {
 
     /**
      * Implements a spin-lock wait to respect gRPC flow control signals.
-     * <p>
-     * This prevents the ESS from overwhelming the client's receive buffer,
-     * ensuring stable transmission over unreliable networks.
-     * </p>
      *
      * @param observer The observer providing the <code>isReady</code> status.
      */
