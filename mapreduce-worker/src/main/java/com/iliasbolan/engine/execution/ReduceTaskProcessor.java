@@ -15,25 +15,22 @@ import java.util.concurrent.RecursiveTask;
  * Executes the Reduce phase for a bounded batch of Map-Reduce data utilizing
  * Java's Fork/Join Framework for optimal intra-node parallelism.
  *
- * <p><b>Architectural Evolution: Spill-to-Disk Integration</b><br>
- * In legacy versions, this processor attempted to load entire datasets into memory,
- * leading to potential {@link OutOfMemoryError} states. Under the current external merge
- * sort pipeline, this class operates as a high-speed batch processor. The
- * {@link ExternalMergeSorter} streams sorted data from disk, groups a manageable
- * number of distinct keys, and dispatches them to this task for parallel reduction.</p>
+ * <p><b>Dynamic Parallelism Model:</b><br>
+ * This processor implements a container-aware resource discovery pattern. It utilizes the
+ * {@link Runtime#availableProcessors()} method—which in Java 17 accurately reflects 
+ * Kubernetes CPU limits—and applies a configurable <code>PARALLELISM_FACTOR</code>. 
+ * This allows the worker to over-provision virtual threads to mask I/O latency 
+ * during disk-based merge-sort operations.</p>
  *
- * <p><b>Work-Stealing and Resource Efficiency</b><br>
- * This implementation is optimized for containerized environments (Kubernetes).
- * It dynamically calculates a processing threshold based on available CPU quotas
- * and batch size, ensuring that the {@link java.util.concurrent.ForkJoinPool}
- * work-stealing algorithm is utilized effectively without causing thread starvation.</p>
+ * <p><b>Work-Stealing Optimization:</b><br>
+ * The split threshold is calculated dynamically to ensure a high fan-out ratio 
+ * (roughly 10-12 tasks per target thread). This maximizes the efficiency of the 
+ * {@link java.util.concurrent.ForkJoinPool} work-stealing algorithm, preventing 
+ * thread starvation in multitenant clusters.</p>
  *
  * @author Ilias Bolanakis
- * @version 2.0
- * @since 2026-04-24
- * @see java.util.concurrent.RecursiveTask
- * @see java.util.concurrent.ForkJoinPool
- * @see com.iliasbolan.core.Reducer
+ * @version 2.2
+ * @since 2026-04-26
  */
 public class ReduceTaskProcessor extends RecursiveTask<List<KeyValuePair>> {
 
@@ -59,12 +56,11 @@ public class ReduceTaskProcessor extends RecursiveTask<List<KeyValuePair>> {
     private final Reducer reducer;
 
     /**
-     * Constructs a root {@code ReduceTaskProcessor} to handle a specific
-     * memory-bounded batch of grouped data.
+     * Constructs a root {@code ReduceTaskProcessor} with dynamic resource discovery.
      *
-     * <p>This constructor initializes the primary Fork/Join task and calculates
-     * a dynamic split threshold based on active CPU cores to ensure effective
-     * fan-out, even for constrained batch sizes.</p>
+     * <p>Detects Kubernetes vCPU quotas and applies a scaling factor (default 2.0) 
+     * to determine the target thread count. It then establishes a task-split 
+     * threshold tailored to the current batch size.</p>
      *
      * @param groupedBatch A memory-bounded list of grouped records (Key mapped to Values).
      * @param start        The starting index for this task's segment.
@@ -77,20 +73,26 @@ public class ReduceTaskProcessor extends RecursiveTask<List<KeyValuePair>> {
         this.end = end;
         this.reducer = reducer;
 
-        // Dynamically calculate the threshold based on batch size and available K8s CPU limits.
-        // Minimum threshold of 10 ensures small batches still distribute across cores.
-        int cores = Runtime.getRuntime().availableProcessors();
-        this.threshold = Math.max(10, groupedBatch.size() / (cores * 5));
+        // --- DYNAMIC PARALLELISM DISCOVERY ---
+        // 1. Detect K8s vCPU quota (Java 17 is container-aware)
+        int vCpus = Runtime.getRuntime().availableProcessors();
 
-        logger.debug("Initialized ROOT ReduceTaskProcessor for Batch. Unique Keys: {}, Cores: {}, Threshold: {}",
-                groupedBatch.size(), cores, this.threshold);
+        // 2. Load the scaling factor from environment variables
+        // Defaulting to 2.0 to account for External Sorter disk I/O wait times
+        double factor = Double.parseDouble(
+                System.getenv().getOrDefault("PARALLELISM_FACTOR", "2.0")
+        );
+        int targetThreads = (int) Math.ceil(vCpus * factor);
+
+        // 3. Calculate Threshold (Aim for ~10-12 tasks per target thread to enable work-stealing)
+        this.threshold = Math.max(10, groupedBatch.size() / (targetThreads * 10));
+
+        logger.info("Dynamic Parallelism Discovery (Reduce): [vCPUs: {}, Factor: {}, Target Threads: {}, Threshold: {}]",
+                vCpus, factor, targetThreads, this.threshold);
     }
 
     /**
      * Internal constructor for instantiating recursive sub-tasks.
-     *
-     * <p>Bypasses dynamic threshold recalculation to minimize overhead
-     * during the task-splitting process.</p>
      *
      * @param groupedBatch The data batch shared across tasks.
      * @param start        Starting index of the sub-segment.
@@ -108,11 +110,6 @@ public class ReduceTaskProcessor extends RecursiveTask<List<KeyValuePair>> {
 
     /**
      * Orchestrates the parallel computation via a divide-and-conquer strategy.
-     *
-     * <p>Recursively partitions the workload until the segment size is below
-     * the defined {@code threshold}. Sub-tasks are forked into the
-     * {@link java.util.concurrent.ForkJoinPool}, and results are merged
-     * as the recursion unwinds.</p>
      *
      * @return A consolidated {@link List} of {@link KeyValuePair} objects
      * representing the finalized reduced data for this task tree.
@@ -132,13 +129,13 @@ public class ReduceTaskProcessor extends RecursiveTask<List<KeyValuePair>> {
         ReduceTaskProcessor leftTask = new ReduceTaskProcessor(groupedBatch, start, middle, reducer, threshold);
         ReduceTaskProcessor rightTask = new ReduceTaskProcessor(groupedBatch, middle, end, reducer, threshold);
 
-        // Fork the left task to run asynchronously
+        // Fork the left task for asynchronous execution
         leftTask.fork();
 
         // Compute the right task immediately on the current thread
         List<KeyValuePair> rightResult = rightTask.compute();
 
-        // Wait for the left task to complete and join results
+        // Wait for the left task and merge the results
         List<KeyValuePair> leftResult = leftTask.join();
 
         List<KeyValuePair> mergedResult = new ArrayList<>(leftResult);
@@ -150,10 +147,6 @@ public class ReduceTaskProcessor extends RecursiveTask<List<KeyValuePair>> {
     /**
      * Sequentially processes a segment of the batch using the Reducer logic.
      *
-     * <p>This method represents the leaf-node execution where the user-defined
-     * {@code reduce()} function is applied to distinct keys and their associated
-     * value collections.</p>
-     *
      * @return A {@link List} of {@link KeyValuePair} objects generated by
      * applying the Reduce logic to this specific segment.
      */
@@ -163,7 +156,7 @@ public class ReduceTaskProcessor extends RecursiveTask<List<KeyValuePair>> {
         for (int i = start; i < end; i++) {
             Map.Entry<String, List<String>> entry = groupedBatch.get(i);
 
-            // Invoke the user's custom reduce function
+            // Execute user-defined reduction logic
             KeyValuePair reducedResult = reducer.reduce(entry.getKey(), entry.getValue());
 
             if (reducedResult != null) {

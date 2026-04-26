@@ -78,12 +78,19 @@ public class MapTaskProcessor extends RecursiveAction {
         this.mapper = mapper;
         this.partitioner = partitioner;
 
-        // Dynamically calculate the threshold based on the total records and available K8s CPU limits
-        int cores = Runtime.getRuntime().availableProcessors();
-        this.threshold = Math.max(100, records.size() / (cores * 15));
+        // 1. Detect K8s CPU quota (Container Aware)
+        int vCpus = Runtime.getRuntime().availableProcessors();
 
-        logger.info("Initialized ROOT MapTaskProcessor. Total Records: {}, Detected Cores: {}, Calculated Threshold: {}",
-                records.size(), cores, this.threshold);
+        // 2. Load Scaling Factor from environment (Allows 2.0x for I/O masking)
+        double factor = Double.parseDouble(System.getenv().getOrDefault("PARALLELISM_FACTOR", "2.0"));
+        int targetThreads = (int) Math.ceil(vCpus * factor);
+
+        // 3. Calculate Threshold to ensure enough tasks exist for work-stealing
+        // Aiming for ~12 tasks per target thread to keep the ForkJoinPool saturated.
+        this.threshold = Math.max(100, records.size() / (targetThreads * 12));
+
+        logger.info("Dynamic Parallelism discovery: [vCPUs: {}, Factor: {}, Target Threads: {}, Threshold: {}]",
+                vCpus, factor, targetThreads, this.threshold);
     }
 
     /**
