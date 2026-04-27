@@ -126,4 +126,35 @@ public class RabbitMqProducer {
             logger.error("Critical Failure: Could not transmit error signal for task {} to the Manager.", taskId, e);
         }
     }
+
+    /**
+     * Transmits an 'IN_PROGRESS' heartbeat signal to the global Orchestrator.
+     * <p>
+     * This continuous heartbeat prevents the Orchestrator's Watchdog service from
+     * prematurely terminating long-running tasks that process massive datasets.
+     * </p>
+     *
+     * @param jobId    The universally unique identifier (UUID) of the Map-Reduce job.
+     * @param taskId   The specific partition identifier of the task in progress.
+     * @param jobToken The secure token echoed back to the Manager for signal authentication.
+     */
+    public void sendProgressSignal(String jobId, String taskId, String jobToken) {
+        try (Connection connection = connectionManager.createConnection();
+             Channel channel = connection.createChannel()) {
+
+            Map<String, Object> payload = new HashMap<>();
+            payload.put("job_id", jobId);
+            payload.put("task_id", taskId);
+            payload.put("jobToken", jobToken); // Injected Secure Token for Manager verification
+            payload.put("status", "IN_PROGRESS");
+
+            byte[] messageBody = objectMapper.writeValueAsBytes(payload);
+            channel.basicPublish("", eventQueue, null, messageBody);
+
+            logger.debug("Transmitted IN_PROGRESS heartbeat to Manager. Job: {}, Task: {}", jobId, taskId);
+
+        } catch (Exception e) {
+            logger.warn("Failed to transmit heartbeat signal for task {}. Watchdog may intervene if prolonged.", taskId, e);
+        }
+    }
 }

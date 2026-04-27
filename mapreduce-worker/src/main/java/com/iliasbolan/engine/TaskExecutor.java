@@ -134,7 +134,7 @@ public class TaskExecutor {
 
         // Step 3: Run the user code in an isolated process
         logger.info("Delegating Map computation to Ephemeral Sandbox JVM...");
-        runSandbox(payloadFile);
+        runSandbox(payloadFile, payload);
 
         if (this.nodeIp == null || this.nodeIp.trim().isEmpty()) {
             throw new IllegalStateException("CRITICAL FATAL: NODE_IP environment variable missing.");
@@ -236,7 +236,7 @@ public class TaskExecutor {
         Files.writeString(payloadFile, rawJson);
 
         logger.info("Streams persisted. Delegating aggregation to Sandbox...");
-        runSandbox(payloadFile);
+        runSandbox(payloadFile, payload);
 
         // Step 4: Reclamation of local shuffle space
         ExternalMergeSorter.cleanupDirectory(rawDataDir);
@@ -246,13 +246,15 @@ public class TaskExecutor {
     }
 
     /**
-     * Executes the user code in a dedicated JVM process to protect the worker from heap crashes.
+     * Executes the user code in a dedicated JVM process to protect the worker from heap crashes,
+     * while maintaining a continuous heartbeat to the Orchestrator.
      *
      * @param payloadFile The JSON task manifest which the sandbox JVM will parse.
+     * @param payload     The deserialized task metadata used for heartbeat signaling.
      * @throws IOException          If the sandbox process cannot be started.
      * @throws InterruptedException If the executor is interrupted while waiting for the sandbox.
      */
-    private void runSandbox(Path payloadFile) throws IOException, InterruptedException {
+    private void runSandbox(Path payloadFile, TaskPayload payload) throws IOException, InterruptedException {
         String javaHome = System.getProperty("java.home");
         String javaBin = Paths.get(javaHome, "bin", "java").toString();
         String classpath = System.getProperty("java.class.path");
@@ -267,14 +269,30 @@ public class TaskExecutor {
         );
 
         pb.inheritIO();
-        Process process = pb.start();
-        int exitCode = process.waitFor();
 
-        // Ensure temporary manifests are purged
-        Files.deleteIfExists(payloadFile);
+        // --- ARCHITECTURAL FIX: Long-Running Task Heartbeats ---
+        java.util.concurrent.ScheduledExecutorService heartbeatExecutor =
+                java.util.concurrent.Executors.newSingleThreadScheduledExecutor();
 
-        if (exitCode != 0) {
-            throw new RuntimeException("Sandbox JVM terminated with exit code: " + exitCode);
+        try {
+            // Schedule the heartbeat to fire every 10 minutes
+            heartbeatExecutor.scheduleAtFixedRate(
+                    () -> eventProducer.sendProgressSignal(payload.jobId(), payload.taskId(), payload.jobToken()),
+                    10, 10, TimeUnit.MINUTES
+            );
+
+            Process process = pb.start();
+            int exitCode = process.waitFor();
+
+            if (exitCode != 0) {
+                throw new RuntimeException("Sandbox JVM terminated with exit code: " + exitCode);
+            }
+        } finally {
+            // Guarantee the background thread terminates when the task finishes or crashes
+            heartbeatExecutor.shutdownNow();
+
+            // Ensure temporary manifests are purged
+            Files.deleteIfExists(payloadFile);
         }
     }
 
