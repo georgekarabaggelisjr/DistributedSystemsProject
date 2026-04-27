@@ -4,9 +4,9 @@ import com.iliasbolan.core.KeyValuePair;
 import com.iliasbolan.core.Mapper;
 import com.iliasbolan.engine.shuffle.ShufflePartitioner;
 import org.junit.jupiter.api.Test;
-import org.mockito.ArgumentCaptor;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.ForkJoinPool;
 
@@ -24,25 +24,24 @@ import static org.mockito.Mockito.*;
  * </p>
  *
  * @author Ilias Bolanakis
- * @version 2.0
+ * @version 3.0
  */
 class MapTaskProcessorTest {
 
     /**
      * A simple, reusable Word Count Mapper for our testing purposes.
-     * It splits lines by spaces and emits (word, "1") for each word.
+     * It splits lines by spaces and emits words directly to the Context.
+     * Updated to comply with the Streaming Context Pattern.
      */
-    private final Mapper dummyWordCountMapper = (key, value) -> {
-        List<KeyValuePair> results = new ArrayList<>();
+    private final Mapper dummyWordCountMapper = (value, context) -> {
         // Replace invalid characters with a space instead of deleting them to prevent empty outputs
         String cleanValue = value.replaceAll("[^a-zA-Z0-9 ]", " ");
         String[] words = cleanValue.split("\\s+");
         for (String word : words) {
             if (!word.trim().isEmpty()) {
-                results.add(new KeyValuePair(word, "1"));
+                context.write(word, "1"); // Stream directly to context!
             }
         }
-        return results;
     };
 
     /**
@@ -61,6 +60,15 @@ class MapTaskProcessorTest {
         );
 
         ShufflePartitioner mockPartitioner = mock(ShufflePartitioner.class);
+
+        // We use a synchronized list to safely capture flushed data before buffer.clear() is called
+        List<KeyValuePair> interceptedResults = Collections.synchronizedList(new ArrayList<>());
+        doAnswer(invocation -> {
+            List<KeyValuePair> flushedBuffer = invocation.getArgument(0);
+            interceptedResults.addAll(new ArrayList<>(flushedBuffer)); // Deep copy before clearance
+            return null;
+        }).when(mockPartitioner).appendThreadSafe(anyList());
+
         MapTaskProcessor processor = new MapTaskProcessor(records, 0, records.size(), dummyWordCountMapper, mockPartitioner);
         ForkJoinPool pool = new ForkJoinPool();
 
@@ -68,20 +76,17 @@ class MapTaskProcessorTest {
             // Act: Run the void task
             pool.invoke(processor);
 
-            // Assert: Intercept the flush to the partitioner
-            ArgumentCaptor<List<KeyValuePair>> captor = ArgumentCaptor.forClass(List.class);
-            verify(mockPartitioner, times(1)).appendThreadSafe(captor.capture());
-
-            List<KeyValuePair> results = captor.getValue();
+            // Assert: Verify the partitioner was called
+            verify(mockPartitioner, times(1)).appendThreadSafe(anyList());
 
             // It should output exactly 4 KeyValuePairs
-            assertEquals(4, results.size(), "Should have emitted exactly 4 pairs to the partitioner.");
+            assertEquals(4, interceptedResults.size(), "Should have emitted exactly 4 pairs to the partitioner.");
 
             // Verify the actual data matches our math
-            assertEquals("hello", results.get(0).key());
-            assertEquals("world", results.get(1).key());
-            assertEquals("hello", results.get(2).key());
-            assertEquals("george", results.get(3).key());
+            assertEquals("hello", interceptedResults.get(0).key());
+            assertEquals("world", interceptedResults.get(1).key());
+            assertEquals("hello", interceptedResults.get(2).key());
+            assertEquals("george", interceptedResults.get(3).key());
         } finally {
             // Cleanly shut down the pool to prevent thread leaks
             pool.shutdown();
@@ -104,6 +109,15 @@ class MapTaskProcessorTest {
         }
 
         ShufflePartitioner mockPartitioner = mock(ShufflePartitioner.class);
+
+        // Use a synchronized list to safely aggregate results across all Fork/Join threads
+        List<KeyValuePair> allInterceptedResults = Collections.synchronizedList(new ArrayList<>());
+        doAnswer(invocation -> {
+            List<KeyValuePair> flushedBuffer = invocation.getArgument(0);
+            allInterceptedResults.addAll(new ArrayList<>(flushedBuffer)); // Deep copy
+            return null;
+        }).when(mockPartitioner).appendThreadSafe(anyList());
+
         MapTaskProcessor processor = new MapTaskProcessor(records, 0, records.size(), dummyWordCountMapper, mockPartitioner);
         ForkJoinPool pool = new ForkJoinPool();
 
@@ -112,14 +126,7 @@ class MapTaskProcessorTest {
             pool.invoke(processor);
 
             // Assert: Intercept all concurrent flushes across all Fork/Join threads
-            ArgumentCaptor<List<KeyValuePair>> captor = ArgumentCaptor.forClass(List.class);
-            verify(mockPartitioner, atLeastOnce()).appendThreadSafe(captor.capture());
-
-            // Aggregate intercepted batches to prove mathematical correctness
-            List<KeyValuePair> allInterceptedResults = new ArrayList<>();
-            for (List<KeyValuePair> batch : captor.getAllValues()) {
-                allInterceptedResults.addAll(batch);
-            }
+            verify(mockPartitioner, atLeastOnce()).appendThreadSafe(anyList());
 
             // 300 lines * 2 words per line = 600 total emitted KeyValuePairs
             assertEquals(600, allInterceptedResults.size(), "Fork/Join failed to flush all split results correctly");

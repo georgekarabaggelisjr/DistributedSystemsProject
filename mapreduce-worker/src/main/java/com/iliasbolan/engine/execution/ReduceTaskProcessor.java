@@ -13,19 +13,27 @@ import java.util.concurrent.RecursiveTask;
 /**
  * Executes the Reduce phase for a bounded batch of Map-Reduce data utilizing
  * Java's Fork/Join Framework for optimal intra-node parallelism.
- *
- * <p><b>Dynamic Parallelism Model:</b><br>
+ * <p>
+ * <b>Dynamic Parallelism Model:</b><br>
  * This processor implements a container-aware resource discovery pattern. It utilizes the
- * {@link Runtime#availableProcessors()} method—which in Java 17 accurately reflects 
- * Kubernetes CPU limits—and applies a configurable <code>PARALLELISM_FACTOR</code>. 
- * This allows the worker to over-provision virtual threads to mask I/O latency 
- * during disk-based merge-sort operations.</p>
- *
- * <p><b>Work-Stealing Optimization:</b><br>
- * The split threshold is calculated dynamically to ensure a high fan-out ratio 
- * (roughly 10-12 tasks per target thread). This maximizes the efficiency of the 
- * {@link java.util.concurrent.ForkJoinPool} work-stealing algorithm, preventing 
- * thread starvation in multitenant clusters.</p>
+ * {@link Runtime#availableProcessors()} method—which in Java 17 accurately reflects
+ * Kubernetes CPU limits—and applies a configurable <code>PARALLELISM_FACTOR</code>.
+ * This allows the worker to over-provision virtual threads to mask I/O latency
+ * during disk-based merge-sort operations.
+ * </p>
+ * <p>
+ * <b>Work-Stealing Optimization:</b><br>
+ * The split threshold is calculated dynamically to ensure a high fan-out ratio
+ * (roughly 10-12 tasks per target thread). This maximizes the efficiency of the
+ * {@link java.util.concurrent.ForkJoinPool} work-stealing algorithm, preventing
+ * thread starvation in multitenant clusters.
+ * </p>
+ * <p>
+ * <i>Architectural Note:</i> While this class provides excellent intra-node parallelism
+ * for memory-bounded datasets, workloads processing massive, highly skewed datasets
+ * (e.g., Zipfian distributions) should prefer lazy-evaluated disk streaming
+ * (e.g., via iterators) to guarantee O(1) memory safety.
+ * </p>
  *
  * @author Ilias Bolanakis
  * @version 2.2
@@ -56,14 +64,15 @@ public class ReduceTaskProcessor extends RecursiveTask<List<KeyValuePair>> {
 
     /**
      * Constructs a root {@code ReduceTaskProcessor} with dynamic resource discovery.
-     *
-     * <p>Detects Kubernetes vCPU quotas and applies a scaling factor (default 2.0) 
-     * to determine the target thread count. It then establishes a task-split 
-     * threshold tailored to the current batch size.</p>
+     * <p>
+     * Detects Kubernetes vCPU quotas and applies a scaling factor (default 2.0)
+     * to determine the target thread count. It then establishes a task-split
+     * threshold tailored to the current batch size.
+     * </p>
      *
      * @param groupedBatch A memory-bounded list of grouped records (Key mapped to Values).
-     * @param start        The starting index for this task's segment.
-     * @param end          The ending index for this task's segment.
+     * @param start        The starting index (inclusive) for this task's segment.
+     * @param end          The ending index (exclusive) for this task's segment.
      * @param reducer      The user-provided implementation of the {@link Reducer} interface.
      */
     public ReduceTaskProcessor(List<Map.Entry<String, List<String>>> groupedBatch, int start, int end, Reducer reducer) {
@@ -94,8 +103,8 @@ public class ReduceTaskProcessor extends RecursiveTask<List<KeyValuePair>> {
      * Internal constructor for instantiating recursive sub-tasks.
      *
      * @param groupedBatch The data batch shared across tasks.
-     * @param start        Starting index of the sub-segment.
-     * @param end          Ending index of the sub-segment.
+     * @param start        Starting index (inclusive) of the sub-segment.
+     * @param end          Ending index (exclusive) of the sub-segment.
      * @param reducer      The Reducer implementation.
      * @param threshold    The pre-calculated split threshold.
      */
@@ -156,7 +165,7 @@ public class ReduceTaskProcessor extends RecursiveTask<List<KeyValuePair>> {
             Map.Entry<String, List<String>> entry = groupedBatch.get(i);
 
             // Execute user-defined reduction logic
-            KeyValuePair reducedResult = reducer.reduce(entry.getKey(), entry.getValue());
+            KeyValuePair reducedResult = reducer.reduce(entry.getKey(), entry.getValue().iterator());
 
             if (reducedResult != null) {
                 finalResults.add(reducedResult);

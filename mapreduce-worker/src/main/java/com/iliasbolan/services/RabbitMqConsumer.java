@@ -199,11 +199,6 @@ public class RabbitMqConsumer {
                 // Delegate computation to the TaskExecutor (Sandbox)
                 taskExecutor.executeTask(messageBody);
 
-                // Map phase handles its own signaling due to locality hints
-                if (!"MAP".equalsIgnoreCase(phase)) {
-                    eventProducer.sendCompletionSignal(jobId, taskId, jobToken, "COMPLETED", null);
-                }
-
                 // Explicit positive acknowledgment
                 channel.basicAck(deliveryTag, false);
 

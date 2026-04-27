@@ -137,31 +137,36 @@ public class S3ClientService {
 
             List<String> cleanRecords = new ArrayList<>();
 
-            try (InputStream stream = minioClient.getObject(
+            // PERFORMANCE OPTIMIZATION:
+            // Wrapping the raw MinIO InputStream in a BufferedInputStream (32KB buffer)
+            // mitigates extreme network latency caused by single-byte sequential reads.
+            try (InputStream rawStream = minioClient.getObject(
                     GetObjectArgs.builder()
                             .bucket(bucketName)
                             .object(objectName)
                             .offset(offset)
-                            .build())) {
+                            .build());
+                 java.io.BufferedInputStream stream = new java.io.BufferedInputStream(rawStream, 32768)) {
 
-                // Move the counter to track skipped bytes
                 long bytesProcessedInChunk = 0;
 
                 // SYNC PHASE: Seek to the first valid record start (newline)
                 if (offset > 0) {
                     int b;
                     while ((b = stream.read()) != -1) {
-                        bytesProcessedInChunk++; // Count skipped bytes!
+                        bytesProcessedInChunk++;
                         if (b == 0x0A) break;
                     }
                 }
 
                 // EXTRACTION PHASE: Read target length + finish current line
-                ByteArrayOutputStream lineBuffer = new ByteArrayOutputStream();
+                // OPTIMIZATION: Pre-sizing buffer to 256 bytes minimizes internal array
+                // reallocation overhead during continuous string building.
+                ByteArrayOutputStream lineBuffer = new ByteArrayOutputStream(256);
                 int b;
 
                 while ((b = stream.read()) != -1) {
-                    bytesProcessedInChunk++; // Continue counting
+                    bytesProcessedInChunk++;
                     lineBuffer.write(b);
 
                     // UTF-8 records are separated by standard LF (0x0A)

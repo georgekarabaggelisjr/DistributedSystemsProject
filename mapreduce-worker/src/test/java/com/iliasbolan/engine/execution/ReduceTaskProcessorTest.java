@@ -31,7 +31,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
  * </p>
  *
  * @author Ilias Bolanakis
- * @version 2.0
+ * @version 2.1
  * @see ReduceTaskProcessor
  * @see java.util.concurrent.ForkJoinPool
  */
@@ -39,12 +39,14 @@ class ReduceTaskProcessorTest {
 
     /**
      * A functional {@link Reducer} implementation used for verification purposes.
-     * Sums a list of numeric strings and returns the result as a {@link KeyValuePair}.
+     * Sums a stream of numeric strings via an Iterator and returns the result as a {@link KeyValuePair}.
      */
     private final Reducer dummySumReducer = (key, values) -> {
-        int sum = values.stream()
-                .mapToInt(Integer::parseInt)
-                .sum();
+        int sum = 0;
+        // Updated to use Iterator instead of List.stream() to match the new OOM-safe contract
+        while (values.hasNext()) {
+            sum += Integer.parseInt(values.next());
+        }
         return new KeyValuePair(key, String.valueOf(sum));
     };
 

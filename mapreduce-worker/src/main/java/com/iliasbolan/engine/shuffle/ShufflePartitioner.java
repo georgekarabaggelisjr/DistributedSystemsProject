@@ -92,8 +92,8 @@ public class ShufflePartitioner {
         Map<Integer, StringBuilder> localPartitions = new HashMap<>();
 
         for (KeyValuePair pair : buffer) {
-            // Use Math.abs to ensure the hash is positive before the modulo operation
-            int partitionIndex = Math.abs(pair.key().hashCode()) % numReducers;
+            // Correctly ensures a positive integer by stripping the sign bit
+            int partitionIndex = (pair.key().hashCode() & Integer.MAX_VALUE) % numReducers;
 
             localPartitions.computeIfAbsent(partitionIndex, k -> new StringBuilder())
                     .append(pair.key()).append("\t").append(pair.value()).append("\n");

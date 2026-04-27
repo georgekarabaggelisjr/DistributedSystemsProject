@@ -14,55 +14,61 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.Iterator;
 import java.util.List;
+import java.util.NoSuchElementException;
 import java.util.PriorityQueue;
 import java.util.concurrent.ForkJoinPool;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 /**
- * External merge sort utility for distributed data processing.
- *
- * <p>To prevent {@link OutOfMemoryError} (OOM) exceptions on highly skewed or massive
- * data partitions, this engine processes data using disk-backed buffers.
- * The process is strictly divided into two distinct phases:
+ * Enterprise-grade external merge sort utility for distributed data processing.
+ * <p>
+ * This engine guarantees stable memory consumption (O(1) memory footprint during reduction)
+ * regardless of data skew or absolute partition size. It achieves this by strictly
+ * separating the processing pipeline into two disk-backed phases:
+ * </p>
  * <ol>
- * <li><b>Chunking &amp; Sorting:</b> Raw streams are read into constrained memory buffers.
- * Once the buffer reaches capacity, it is sorted and persisted to disk as a "Sorted Run".</li>
- * <li><b>K-Way Merge &amp; Reduce:</b> All sorted runs are opened concurrently. A {@link PriorityQueue}
- * is utilized to extract the absolute minimum key across all active runs, grouping identical keys
- * into collections that are streamed directly into the user-defined {@link Reducer}.</li>
+ * <li><b>Chunking &amp; Sorting:</b> Raw gRPC streams are read into memory-bounded buffers.
+ * Once a buffer reaches {@value #CHUNK_RECORD_LIMIT}, it is sorted in memory and flushed
+ * to disk as an intermediate "Sorted Run".</li>
+ * <li><b>Lazy K-Way Merge:</b> All sorted runs are accessed concurrently via file streams.
+ * A {@link PriorityQueue} maintains the absolute minimum key across all active runs.
+ * Identical keys are wrapped in a custom {@link Iterator} and streamed directly to the
+ * user's {@link Reducer}, ensuring data is only loaded into the heap at the exact moment of computation.</li>
  * </ol>
+ * <p>
+ * <b>Character Encoding:</b> All I/O operations mandate UTF-8 encoding to guarantee
+ * cross-platform byte-boundary safety.
  * </p>
  *
- * <p><b>Character Encoding:</b> All I/O operations strictly enforce UTF-8 encoding to
- * guarantee byte-boundary safety and optimize the storage footprint on the local container disk.</p>
- *
  * @author Ilias Bolanakis
- * @version 2.0
+ * @version 3.0
  * @since 2026-04-24
  */
 public class ExternalMergeSorter {
 
     private static final Logger logger = LoggerFactory.getLogger(ExternalMergeSorter.class);
 
-    /** * Limits the in-memory buffer to 500,000 records per chunk.
-     * This threshold ensures that the JVM remains within the memory limits
-     * typically assigned to Kubernetes worker containers.
+    /**
+     * The maximum number of records permitted in the JVM heap before triggering a disk spill.
+     * Tuned specifically to accommodate Kubernetes container memory limits (e.g., 2Gi limits).
      */
     private static final int CHUNK_RECORD_LIMIT = 500_000;
 
     /**
      * Orchestrates the complete Spill-to-Disk sort and reduce pipeline.
+     * <p>
+     * Initializes the external merge sort on raw partition data, generates intermediate
+     * sorted runs, and subsequently applies the user's reduction logic via lazy streaming.
+     * </p>
      *
-     * <p>This method initializes the external merge sort on raw partition data
-     * and subsequently applies the user's reduction logic to the sorted streams.</p>
-     *
-     * @param rawDataDir The local directory containing the raw gRPC stream files.
+     * @param rawDataDir The local directory containing the raw, un-sorted gRPC stream files.
      * @param reducer    The user-defined Reducer implementation dynamically loaded into the JVM.
-     * @param pool       The shared thread pool (Note: Currently reserved for future parallel expansion).
+     * @param pool       The shared thread pool (reserved for future parallel external sorting).
      * @return The {@link Path} to the final serialized file containing the reduced output.
-     * @throws IOException If a disk I/O failure occurs during chunking, merging, or resource cleanup.
+     * @throws IOException If a disk I/O failure occurs during chunking, merging, or resource allocation.
      */
     @SuppressWarnings("unused")
     public static Path sortReduceAndSpill(Path rawDataDir, Reducer reducer, ForkJoinPool pool) throws IOException {
@@ -73,7 +79,7 @@ public class ExternalMergeSorter {
 
         // Phase 1: Create Sorted Runs
         List<Path> sortedRuns = createSortedRuns(rawDataDir, runsDir);
-        logger.info("Generated {} sorted runs on disk. Commencing K-Way Merge...", sortedRuns.size());
+        logger.info("Generated {} sorted runs on disk. Commencing Lazy K-Way Merge...", sortedRuns.size());
 
         // Phase 2: K-Way Merge and Execute Reduce
         Path finalOutputFile = rawDataDir.resolve("final_reduced_output.txt");
@@ -84,10 +90,11 @@ public class ExternalMergeSorter {
 
     /**
      * Reads raw input files and spills sorted chunks to the local file system.
-     *
-     * <p>Scans all gRPC stream files in the target directory and groups data into
-     * memory-safe segments. Each segment is sorted alphabetically by Key and
-     * written to an isolated 'run' file to ensure total order partitioning.</p>
+     * <p>
+     * Scans all incoming streams, parses them into {@link KeyValuePair} objects, and
+     * flushes them to disk once the {@value #CHUNK_RECORD_LIMIT} is reached. Each run
+     * is guaranteed to be totally ordered by key.
+     * </p>
      *
      * @param rawDataDir The directory containing raw gRPC stream files.
      * @param runsDir    The directory where sorted chunk files will be persisted.
@@ -156,12 +163,12 @@ public class ExternalMergeSorter {
     }
 
     /**
-     * Merges multiple sorted runs and streams grouped keys to the user-defined Reducer.
-     *
-     * <p>Utilizes a K-Way Merge algorithm powered by a {@link PriorityQueue} across
-     * multiple open file streams. Identical keys from different runs are grouped
-     * into a single collection and streamed directly to the Reducer to maintain
-     * a minimal memory footprint.</p>
+     * Merges multiple sorted runs and streams grouped keys lazily to the user-defined Reducer.
+     * <p>
+     * Utilizes a K-Way Merge algorithm powered by a {@link PriorityQueue}. Instead of
+     * buffering values into lists, it delegates disk-read control to a {@link StreamGroupingIterator}.
+     * This protects the JVM from {@link OutOfMemoryError} during severe data skew events (Zipfian distributions).
+     * </p>
      *
      * @param sortedRuns The collection of sorted run files to be merged.
      * @param outputFile The destination file for the final reduced results.
@@ -174,6 +181,7 @@ public class ExternalMergeSorter {
 
         try (BufferedWriter writer = Files.newBufferedWriter(outputFile, StandardCharsets.UTF_8, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING)) {
 
+            // Initialize the Priority Queue with the first element of every run
             for (Path runFile : sortedRuns) {
                 BufferedReader reader = Files.newBufferedReader(runFile, StandardCharsets.UTF_8);
                 activeReaders.add(reader);
@@ -183,34 +191,20 @@ public class ExternalMergeSorter {
                 }
             }
 
-            String currentGroupingKey = null;
-            List<String> currentValuesGroup = new ArrayList<>();
-
             while (!pq.isEmpty()) {
-                StreamNode minNode = pq.poll();
-                KeyValuePair pair = minNode.currentPair;
+                String currentGroupingKey = pq.peek().currentPair.key();
 
-                if (currentGroupingKey == null) {
-                    currentGroupingKey = pair.key();
+                // Create a lazy iterator bound specifically to the current key
+                StreamGroupingIterator lazyIterator = new StreamGroupingIterator(pq, currentGroupingKey);
+
+                // Pass the iterator directly to the Reducer. Data streams straight from disk to the user's logic.
+                executeReduceAndWrite(currentGroupingKey, lazyIterator, reducer, writer);
+
+                // Safety Guard: If the user's Reducer returned early without consuming the iterator,
+                // we must drain it manually to advance the PriorityQueue to the next distinct key.
+                while (lazyIterator.hasNext()) {
+                    lazyIterator.next();
                 }
-
-                if (!currentGroupingKey.equals(pair.key())) {
-                    executeReduceAndWrite(currentGroupingKey, currentValuesGroup, reducer, writer);
-
-                    currentGroupingKey = pair.key();
-                    currentValuesGroup.clear();
-                }
-
-                currentValuesGroup.add(pair.value());
-
-                StreamNode nextNode = StreamNode.fromReader(minNode.reader);
-                if (nextNode != null) {
-                    pq.add(nextNode);
-                }
-            }
-
-            if (currentGroupingKey != null && !currentValuesGroup.isEmpty()) {
-                executeReduceAndWrite(currentGroupingKey, currentValuesGroup, reducer, writer);
             }
 
         } finally {
@@ -223,14 +217,14 @@ public class ExternalMergeSorter {
     /**
      * Executes the user-defined Reducer logic and persists the result to the output writer.
      *
-     * @param key     The grouping key.
-     * @param values  The collection of values associated with the key.
-     * @param reducer The Reducer implementation to apply.
-     * @param writer  The destination writer for persisting the result.
+     * @param key      The grouping key.
+     * @param iterator The lazy stream of values associated with the key.
+     * @param reducer  The Reducer implementation to apply.
+     * @param writer   The destination writer for persisting the result.
      * @throws IOException If disk I/O fails during the write process.
      */
-    private static void executeReduceAndWrite(String key, List<String> values, Reducer reducer, BufferedWriter writer) throws IOException {
-        KeyValuePair reducedResult = reducer.reduce(key, values);
+    private static void executeReduceAndWrite(String key, Iterator<String> iterator, Reducer reducer, BufferedWriter writer) throws IOException {
+        KeyValuePair reducedResult = reducer.reduce(key, iterator);
         if (reducedResult != null) {
             writer.write(reducedResult.key() + "\t" + reducedResult.value() + "\n");
         }
@@ -238,9 +232,10 @@ public class ExternalMergeSorter {
 
     /**
      * Recursively purges a local directory and its entire contents.
-     *
-     * <p>Cleans up temporary sorted runs and root directories after data has
-     * been successfully persisted to shared storage (S3).</p>
+     * <p>
+     * Cleans up temporary sorted runs and root directories after data has
+     * been successfully merged and persisted.
+     * </p>
      *
      * @param directoryToBeDeleted The target directory path to be purged.
      */
@@ -253,6 +248,52 @@ public class ExternalMergeSorter {
             logger.info("Successfully cleaned up temporary directory: {}", directoryToBeDeleted);
         } catch (IOException e) {
             logger.warn("Failed to clean up temporary directory {}. Space may be leaked.", directoryToBeDeleted, e);
+        }
+    }
+
+    /**
+     * A lazy-evaluating Iterator that pulls data continuously from the K-Way merge PriorityQueue
+     * as long as the incoming keys match the targeted grouping key.
+     */
+    private static class StreamGroupingIterator implements Iterator<String> {
+        private final PriorityQueue<StreamNode> pq;
+        private final String currentKey;
+
+        /**
+         * Constructs the grouping iterator.
+         *
+         * @param pq         The shared PriorityQueue managing active file streams.
+         * @param currentKey The key this iterator is permitted to consume.
+         */
+        public StreamGroupingIterator(PriorityQueue<StreamNode> pq, String currentKey) {
+            this.pq = pq;
+            this.currentKey = currentKey;
+        }
+
+        @Override
+        public boolean hasNext() {
+            return !pq.isEmpty() && pq.peek().currentPair.key().equals(currentKey);
+        }
+
+        @Override
+        public String next() {
+            if (!hasNext()) throw new NoSuchElementException("No more values for key: " + currentKey);
+
+            // 1. Extract the minimum node
+            StreamNode minNode = pq.poll();
+            String valueToReturn = minNode.currentPair.value();
+
+            // 2. Advance the stream (read next line from the specific disk run)
+            try {
+                StreamNode nextNode = StreamNode.fromReader(minNode.reader);
+                if (nextNode != null) {
+                    pq.add(nextNode); // 3. Reinsert into the Priority Queue
+                }
+            } catch (IOException e) {
+                throw new RuntimeException("Fatal disk read error during lazy stream evaluation", e);
+            }
+
+            return valueToReturn;
         }
     }
 

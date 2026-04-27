@@ -28,15 +28,15 @@ import static org.mockito.Mockito.*;
  * back to the Orchestrator.
  * </p>
  * <p>
- * <b>Security & Signal Verification (Architecture v2.0):</b><br>
+ * <b>Security & Signal Verification (Architecture v2.1):</b><br>
  * These tests specifically verify the <b>Zero-Trust security model</b> by ensuring
  * the consumer correctly extracts HMAC <code>jobToken</code> payloads and echoes
- * them in all completion and error signals. This validates the authenticity of
- * the feedback loop between the compute nodes and the Manager.
+ * them in error signals. Note: Successful completion signaling is now exclusively
+ * delegated to the {@link TaskExecutor} to prevent duplicate network events.
  * </p>
  *
  * @author Ilias Bolanakis
- * @version 2.0
+ * @version 2.1
  * @since 2026-04-25
  * @see com.iliasbolan.services.RabbitMqConsumer
  */
@@ -89,13 +89,13 @@ class RabbitMqConsumerTest {
 
     /**
      * Verifies the "Happy Path" lifecycle: successful message delivery, task execution,
-     * positive AMQP acknowledgment, and a signed completion signal to the Manager.
+     * and positive AMQP acknowledgment.
      *
      * @throws Throwable If thread management or mock verifications fail.
      */
     @Test
     @SuppressWarnings("unchecked")
-    void testHandleDelivery_SuccessfulTaskExecution_IssuesPositiveAckAndSignal() throws Throwable {
+    void testHandleDelivery_SuccessfulTaskExecution_IssuesPositiveAck() throws Throwable {
         RabbitMqConsumer consumer = new RabbitMqConsumer(mockManager, "test-queue", 5000, mockTaskExecutor, mockEventProducer);
 
         // Launch consumer in a background thread to simulate asynchronous delivery
@@ -124,14 +124,8 @@ class RabbitMqConsumerTest {
         verify(mockTaskExecutor).executeTask(anyString());
         verify(mockChannel).basicAck(eq(deliveryTag), eq(false));
 
-        // Assert: Verify completion signal matches the new 5-argument security signature
-        verify(mockEventProducer).sendCompletionSignal(
-                eq("job-001"),
-                eq("reduce-0"),
-                eq("token-123"), // Verifies extraction of the security token
-                eq("COMPLETED"),
-                isNull()
-        );
+        // Note: We no longer verify sendCompletionSignal here because TaskExecutor handles it now.
+        verify(mockEventProducer, never()).sendCompletionSignal(anyString(), anyString(), anyString(), anyString(), anyString());
 
         consumer.stopConsuming();
         consumerThread.join();

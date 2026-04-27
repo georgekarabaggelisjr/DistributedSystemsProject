@@ -1,5 +1,6 @@
 package com.iliasbolan.engine.execution;
 
+import com.iliasbolan.core.Context;
 import com.iliasbolan.core.KeyValuePair;
 import com.iliasbolan.core.Mapper;
 import com.iliasbolan.engine.shuffle.ShufflePartitioner;
@@ -16,10 +17,9 @@ import java.util.concurrent.RecursiveAction;
  * <p>
  * <b>Spill-to-Disk Memory Optimization:</b><br>
  * Upgraded to a {@link RecursiveAction} to completely bypass in-memory list aggregation.
- * Instead of merging millions of intermediate records into a single master list, each
- * thread processes a small subset of the data chunk and immediately delegates the
- * results to a thread-safe {@link ShufflePartitioner}. This guarantees a flat memory
- * footprint regardless of chunk density.
+ * By utilizing the {@link Context} streaming pattern, each thread processes its subset
+ * of data and delegates records dynamically to a thread-safe {@link ShufflePartitioner}.
+ * This guarantees a flat memory footprint regardless of chunk density.
  * </p>
  * <p>
  * <b>Dynamic Resource Allocation:</b><br>
@@ -29,7 +29,7 @@ import java.util.concurrent.RecursiveAction;
  * </p>
  *
  * @author Ilias Bolanakis
- * @version 2.0
+ * @version 3.0
  * @see java.util.concurrent.RecursiveAction
  * @see java.util.concurrent.ForkJoinPool
  * @see com.iliasbolan.core.Mapper
@@ -152,30 +152,44 @@ public class MapTaskProcessor extends RecursiveAction {
     /**
      * Iterates through the assigned segment of records, applies the Map logic, and flushes to disk.
      * <p>
-     * The leaf-node execution logic. Passes lines to the user-defined {@code map()} function
-     * and immediately flushes the intermediate results to the thread-safe Partitioner.
+     * Instantiates a dynamic streaming {@link Context} that flushes to the Partitioner
+     * periodically to prevent OutOfMemory errors on massive single records.
      * </p>
      *
      * @throws RuntimeException If the disk spill operation fails.
      */
     private void processSequentially() {
-        List<KeyValuePair> localBuffer = new ArrayList<>();
+        List<KeyValuePair> microBuffer = new ArrayList<>();
+
+        // Create a local Context that streams directly to disk
+        Context streamingContext = (key, value) -> {
+            microBuffer.add(new KeyValuePair(key, value));
+
+            // MICRO-BATCH FLUSH: Keep memory entirely flat
+            if (microBuffer.size() >= 5000) {
+                flushToDisk(microBuffer);
+            }
+        };
 
         for (int i = start; i < end; i++) {
             String record = records.get(i);
-            String key = String.valueOf(i);
-
-            List<KeyValuePair> mappedPairs = mapper.map(key, record);
-
-            if (mappedPairs != null) {
-                localBuffer.addAll(mappedPairs);
-            }
+            // Apply user logic, streaming outputs back through the Context
+            mapper.map(record, streamingContext);
         }
 
-        // Flush directly to disk via the partitioner, completely bypassing root list aggregation
-        if (!localBuffer.isEmpty()) {
+        // Flush any remaining records after the loop ends
+        flushToDisk(microBuffer);
+    }
+
+    /**
+     * Safely flushes the micro-buffer to the thread-safe Partitioner and clears memory.
+     * * @param buffer The local list of mapped KeyValuePairs.
+     */
+    private void flushToDisk(List<KeyValuePair> buffer) {
+        if (!buffer.isEmpty()) {
             try {
-                partitioner.appendThreadSafe(localBuffer);
+                partitioner.appendThreadSafe(buffer);
+                buffer.clear(); // Instantly free RAM for the next batch
             } catch (Exception e) {
                 logger.error("Failed to spill mapped records to disk", e);
                 throw new RuntimeException("Disk spill failed during Map phase", e);
