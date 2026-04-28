@@ -54,3 +54,27 @@ The ESS is designed to run as a **Kubernetes DaemonSet** to provide data localit
 ```bash
 # Apply the infrastructure template
 kubectl apply -f app/k8s/templates/ess-daemonset.yaml
+```
+
+## 🚀 Building & Containerization
+
+### Build the Jar
+```bash
+mvn clean package
+```
+
+### Build the Docker Image
+```bash
+docker build -t mapreduce-ess:v2 .
+```
+
+## 📜 API Definition (ShuffleService.proto)
+
+```proto
+service ShuffleService {
+  // Streams a specific partition for a JobId to the requester.
+  rpc GetPartition (PartitionRequest) returns (stream PartitionChunk);
+}
+```
+
+Project for the 2026 Distributed Systems class for the Technical Univeristy of Crete.
