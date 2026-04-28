@@ -92,6 +92,11 @@ mvn test
 Implement your logic by extending the core interfaces:
 
 ```java 
+import com.iliasbolan.core.Mapper;
+import com.iliasbolan.core.Context;
+import java.util.HashMap;
+import java.util.Map;
+
 public class WordCountMapper implements Mapper {
 
     @Override
@@ -113,6 +118,10 @@ public class WordCountMapper implements Mapper {
 }
 ```
 ```java 
+import com.iliasbolan.core.KeyValuePair;
+import com.iliasbolan.core.Reducer;
+import java.util.Iterator;
+
 public class WordCountReducer implements Reducer {
 
     @Override
