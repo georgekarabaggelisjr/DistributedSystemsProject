@@ -35,7 +35,7 @@ import java.net.InetSocketAddress;
  * </p>
  *
  * @author Ilias Bolanakis
- * @version 2.0
+ * @version 2.1
  * @since 2026-04-25
  */
 public class App {
@@ -59,7 +59,22 @@ public class App {
         String rabbitHost = System.getenv().getOrDefault("RABBITMQ_HOST", "localhost");
         String rabbitUser = System.getenv().getOrDefault("RABBITMQ_USER", "guest");
         String rabbitPass = System.getenv().getOrDefault("RABBITMQ_PASS", "guest");
-        String taskQueue = System.getenv().getOrDefault("RABBITMQ_QUEUE", "map_tasks_queue");
+
+        // DYNAMIC QUEUE RESOLUTION
+        // Construct the isolated queue name using the injected Kubernetes environment variables.
+        String jobId = System.getenv("JOB_ID");
+        String phase = System.getenv().getOrDefault("PHASE", "map").toLowerCase();
+        String taskQueue;
+
+        if (jobId != null && !jobId.trim().isEmpty()) {
+            taskQueue = phase + "_tasks_" + jobId;
+        } else {
+            // Fallback to legacy queue for local offline development
+            taskQueue = System.getenv().getOrDefault("RABBITMQ_QUEUE", "map_tasks_queue");
+            logger.warn("JOB_ID not found in environment. Falling back to default queue: {}", taskQueue);
+        }
+        // --------------------------------------------------
+
         String eventQueue = System.getenv().getOrDefault("EVENT_QUEUE", "job_events_queue");
         int idleTimeout = Integer.parseInt(System.getenv().getOrDefault("IDLE_TIMEOUT_MILLIS", "5000"));
 
