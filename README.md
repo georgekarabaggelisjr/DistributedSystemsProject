@@ -73,7 +73,7 @@ mvn clean install
 ```bash
 # Build the compute worker
 cd mapreduce-worker
-docker build -t mapreduce-worker:v9 .
+docker build -t mapreduce-worker:v10 .
 
 # Build the shuffle service
 cd ../mapreduce-ess
