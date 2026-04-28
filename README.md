@@ -5,14 +5,12 @@
 [![JitPack](https://jitpack.io/v/georgekarabaggelisjr/distributedsystemsproject.svg)](https://jitpack.io/#georgekarabaggelisjr/distributedsystemsproject)
 [![Architecture](https://img.shields.io/badge/Architecture-Stateless_Compute-brightgreen.svg)]()
 
-This repository contains the high-performance execution engine and core API for a distributed MapReduce framework orchestrated on Kubernetes. The system is split into a multi-module Maven project to separate the developer-facing API from the internal worker logic.
+This repository contains the high-performance parallel execution engine and core API for a distributed MapReduce framework orchestrated on Kubernetes. The system is split into a multi-module Maven project to separate the developer-facing API from the internal worker logic.
 
 ## 📂 Project Structure
 
 * **`mapreduce-core`**: The public library containing the `Mapper`, `Reducer`, and `Context` interfaces.
 * **`mapreduce-worker`**: The ephemeral compute node that localizes bytecode, manages JVM sandboxing, and performs P2P shuffles.
-* **`mapreduce-ess`**: The External Shuffle Service (DaemonSet) providing the stateful data plane for cross-node fetches.
-
 ---
 
 ## 📦 Developer Integration (JitPack)
@@ -68,16 +66,12 @@ Building from the root installs all modules, including the core library needed b
 ```bash
 mvn clean install
 ```
-### Build the Docker Images
+### Build the Docker Image
 
 ```bash
 # Build the compute worker
 cd mapreduce-worker
 docker build -t mapreduce-worker:v10 .
-
-# Build the shuffle service
-cd ../mapreduce-ess
-docker build -t mapreduce-ess:v2 .
 ```
 
 ### Local Testing
