@@ -41,7 +41,7 @@ import java.util.stream.Stream;
  * </p>
  *
  * @author Ilias Bolanakis
- * @version 1.0
+ * @version 1.1
  * @since 2026-04-25
  */
 public class StorageJanitor {
@@ -121,12 +121,26 @@ public class StorageJanitor {
     }
 
     /**
+     * Temporary data structure to hold file paths and their pre-fetched creation times,
+     * allowing for O(N) disk reads instead of O(N log N) during sorting.
+     */
+    private static class JobDirectory {
+        final Path path;
+        final long creationTime;
+
+        JobDirectory(Path path, long creationTime) {
+            this.path = path;
+            this.creationTime = creationTime;
+        }
+    }
+
+    /**
      * Identifies and purges the oldest job directories until disk usage is restored
      * to the Low-Watermark buffer.
      * <p>
-     * This method utilizes the NIO {@code creationTime} attribute to ensure that the
-     * most stale data is targeted first, preserving the integrity of active,
-     * recently submitted jobs.
+     * <b>Performance Optimization:</b> Utilizes the Decorate-Sort-Undecorate pattern.
+     * Creation times are pre-fetched into a wrapper object before sorting to guarantee
+     * exactly O(N) disk I/O reads, preventing severe disk thrashing during cluster cleanup.
      * </p>
      *
      * @param rootPath   The directory to scan for jobs.
@@ -137,16 +151,19 @@ public class StorageJanitor {
     private static void reclaimSpace(Path rootPath, FileStore store, long totalSpace) throws IOException {
         List<Path> sortedJobs;
 
-        // Collect and sort all subdirectories by creation time (Oldest First)
+        // Collect and sort all subdirectories by pre-fetched creation time (Oldest First)
         try (Stream<Path> stream = Files.list(rootPath)) {
             sortedJobs = stream.filter(Files::isDirectory)
-                    .sorted(Comparator.comparingLong(p -> {
+                    .map(p -> {
                         try {
-                            return Files.readAttributes(p, BasicFileAttributes.class).creationTime().toMillis();
+                            long time = Files.readAttributes(p, BasicFileAttributes.class).creationTime().toMillis();
+                            return new JobDirectory(p, time);
                         } catch (IOException e) {
-                            return Long.MAX_VALUE; // Place errors at the end to prevent accidental deletion
+                            return new JobDirectory(p, Long.MAX_VALUE); // Place errors at the end
                         }
-                    }))
+                    })
+                    .sorted(Comparator.comparingLong(jd -> jd.creationTime)) // Sort purely in RAM
+                    .map(jd -> jd.path) // Extract the path back out
                     .collect(Collectors.toList());
         }
 

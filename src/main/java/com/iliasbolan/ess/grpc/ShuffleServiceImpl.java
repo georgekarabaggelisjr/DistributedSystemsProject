@@ -21,7 +21,7 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
 import java.security.MessageDigest;
-import java.util.concurrent.TimeUnit;
+import java.util.regex.Pattern;
 import java.util.stream.Stream;
 
 /**
@@ -40,7 +40,7 @@ import java.util.stream.Stream;
  * </p>
  *
  * @author Ilias Bolanakis
- * @version 1.1
+ * @version 1.2
  * @since 2026-04-25
  */
 public class ShuffleServiceImpl extends ShuffleServiceImplBase {
@@ -58,11 +58,13 @@ public class ShuffleServiceImpl extends ShuffleServiceImplBase {
      */
     private static final int CHUNK_SIZE_BYTES = 65536;
 
-    /**
-     * Pre-shared key used for HMAC signature verification.
-     * Loaded once at instantiation to minimize environment overhead during high-frequency streaming.
-     */
-    private final String secretKey = System.getenv().getOrDefault("ESS_SECRET_KEY", "dev-insecure-shared-secret");
+    // PERFORMANCE OPTIMIZATION: Pre-compiled Regex
+    // Eliminates the massive CPU penalty of compiling the validation regex on every request.
+    private static final Pattern ID_PATTERN = Pattern.compile("^[a-zA-Z0-9\\-]+$");
+
+    // PERFORMANCE OPTIMIZATION: Cached Cryptographic Key Spec
+    // Prevents instantiating the key byte array and object on every single HMAC validation.
+    private final SecretKeySpec secretKeySpec;
 
     /**
      * Constructs a new Shuffle Service implementation.
@@ -71,19 +73,13 @@ public class ShuffleServiceImpl extends ShuffleServiceImplBase {
      */
     public ShuffleServiceImpl(String baseShuffleDir) {
         this.baseShuffleDir = baseShuffleDir;
+
+        String secretKey = System.getenv().getOrDefault("ESS_SECRET_KEY", "dev-insecure-shared-secret");
+        this.secretKeySpec = new SecretKeySpec(secretKey.getBytes(StandardCharsets.UTF_8), "HmacSHA256");
     }
 
     /**
      * Streams a specific shuffle partition to a requesting Reducer pod.
-     * <p>
-     * Implementation Details:
-     * <ol>
-     * <li>Performs constant-time HMAC verification of the Job Authorization Token.</li>
-     * <li>Sanitizes inputs to prevent Path Traversal attacks.</li>
-     * <li>Localizes the physical partition directory based on Job and Partition IDs.</li>
-     * <li>Initiates a sequential NIO stream of all segment files within the partition.</li>
-     * </ol>
-     * </p>
      *
      * @param request          Contains the JobId and PartitionId to be fetched.
      * @param responseObserver Stream observer for transmitting asynchronous {@link PartitionChunk} sequences.
@@ -95,11 +91,11 @@ public class ShuffleServiceImpl extends ShuffleServiceImplBase {
 
         logger.info("ESS Stream Request: [Job: {}, Partition: {}]", rawJobId, partitionId);
 
-        // --- 1. ZERO-TRUST AUTHORIZATION GATEWAY ---
+        // 1. ZERO-TRUST AUTHORIZATION GATEWAY
         String providedToken = ShuffleDaemon.AUTH_TOKEN_KEY.get();
-        String expectedToken = computeHmacSha256(rawJobId, secretKey);
+        String expectedToken = computeHmacSha256(rawJobId);
 
-        if (providedToken == null || !MessageDigest.isEqual(providedToken.getBytes(), expectedToken.getBytes())) {
+        if (providedToken == null || !MessageDigest.isEqual(providedToken.getBytes(StandardCharsets.UTF_8), expectedToken.getBytes(StandardCharsets.UTF_8))) {
             logger.warn("SECURITY BREACH ATTEMPT: Unauthorized access to Job {}. Token Rejected.", rawJobId);
             responseObserver.onError(io.grpc.Status.UNAUTHENTICATED
                     .withDescription("Missing or Invalid Cryptographic Authorization Token.")
@@ -107,8 +103,7 @@ public class ShuffleServiceImpl extends ShuffleServiceImplBase {
             return;
         }
 
-        // --- 2. INPUT SANITIZATION ---
-        // Prevent Arbitrary Path Traversal by Reducer pods
+        // 2. INPUT SANITIZATION
         String safeJobId;
         try {
             safeJobId = sanitizeId(rawJobId);
@@ -120,7 +115,7 @@ public class ShuffleServiceImpl extends ShuffleServiceImplBase {
             return;
         }
 
-        // --- 3. DATA LOCALIZATION ---
+        // 3. DATA LOCALIZATION
         Path partitionDir = Paths.get(baseShuffleDir, safeJobId, String.valueOf(partitionId));
 
         if (!Files.exists(partitionDir)) {
@@ -129,13 +124,28 @@ public class ShuffleServiceImpl extends ShuffleServiceImplBase {
             return;
         }
 
-        // --- 4. HIGH-PERFORMANCE STREAMING ---
+        // 4. HIGH-PERFORMANCE STREAMING
+        ServerCallStreamObserver<PartitionChunk> flowController =
+                (ServerCallStreamObserver<PartitionChunk>) responseObserver;
+
+        // PERFORMANCE OPTIMIZATION: Reactive Flow Control Monitor
+        // Defines a synchronized monitor that allows the gRPC network stack to
+        // instantly wake up the disk-reader thread when buffer capacity is available.
+        final Object flowLock = new Object();
+        flowController.setOnReadyHandler(() -> {
+            synchronized (flowLock) {
+                flowLock.notifyAll();
+            }
+        });
+
         try (Stream<Path> filePaths = Files.list(partitionDir)) {
             filePaths.filter(Files::isRegularFile)
-                    .forEach(file -> streamFileContent(file, responseObserver));
+                    .forEach(file -> streamFileContent(file, flowController, flowLock));
 
-            responseObserver.onCompleted();
-            logger.info("Secure stream concluded for Partition {} (Job: {})", partitionId, safeJobId);
+            if (!flowController.isCancelled()) {
+                responseObserver.onCompleted();
+                logger.info("Secure stream concluded for Partition {} (Job: {})", partitionId, safeJobId);
+            }
 
         } catch (Exception e) {
             logger.error("Internal streaming failure for directory: {}", partitionDir, e);
@@ -145,14 +155,12 @@ public class ShuffleServiceImpl extends ShuffleServiceImplBase {
 
     /**
      * Validates structural identifiers to prevent Arbitrary Path Traversal attacks.
-     * Ensures IDs only contain alphanumeric characters and standard delimiters.
      *
      * @param input The untrusted JobId provided by the gRPC client.
      * @return The validated and sanitized ID.
-     * @throws SecurityException If malicious path-traversal characters are detected.
      */
     private String sanitizeId(String input) {
-        if (input == null || !input.matches("^[a-zA-Z0-9\\-]+$")) {
+        if (input == null || !ID_PATTERN.matcher(input).matches()) {
             throw new SecurityException("Invalid ID format. Potential path traversal detected.");
         }
         return input;
@@ -162,14 +170,12 @@ public class ShuffleServiceImpl extends ShuffleServiceImplBase {
      * Computes an HMAC-SHA256 signature to validate the request origin.
      *
      * @param data The Job ID to sign.
-     * @param key  The pre-shared secret key.
      * @return A hexadecimal string representation of the HMAC signature.
      */
-    private String computeHmacSha256(String data, String key) {
+    private String computeHmacSha256(String data) {
         try {
             Mac mac = Mac.getInstance("HmacSHA256");
-            SecretKeySpec secretKeySpec = new SecretKeySpec(key.getBytes(StandardCharsets.UTF_8), "HmacSHA256");
-            mac.init(secretKeySpec);
+            mac.init(secretKeySpec); // Reuse cached spec
             byte[] hashBytes = mac.doFinal(data.getBytes(StandardCharsets.UTF_8));
 
             StringBuilder hexString = new StringBuilder();
@@ -187,12 +193,12 @@ public class ShuffleServiceImpl extends ShuffleServiceImplBase {
     /**
      * Streams the content of a physical file using NIO Direct Buffers.
      *
-     * @param file             The physical file segment to stream.
-     * @param responseObserver The gRPC observer for chunk transmission.
+     * @param file           The physical file segment to stream.
+     * @param flowController The gRPC observer controlling the network flow.
+     * @param flowLock       The synchronized monitor for instant thread resumption.
      */
-    private void streamFileContent(Path file, StreamObserver<PartitionChunk> responseObserver) {
-        ServerCallStreamObserver<PartitionChunk> flowController =
-                (ServerCallStreamObserver<PartitionChunk>) responseObserver;
+    private void streamFileContent(Path file, ServerCallStreamObserver<PartitionChunk> flowController, Object flowLock) {
+        if (flowController.isCancelled()) return;
 
         ByteBuffer buffer = ByteBuffer.allocateDirect(CHUNK_SIZE_BYTES);
 
@@ -200,30 +206,28 @@ public class ShuffleServiceImpl extends ShuffleServiceImplBase {
             while (fileChannel.read(buffer) > 0) {
                 buffer.flip();
 
-                waitForFlowControl(flowController);
-                transmitChunk(buffer, flowController);
+                // Reactive backpressure wait loop
+                synchronized (flowLock) {
+                    while (!flowController.isReady() && !flowController.isCancelled()) {
+                        try {
+                            flowLock.wait(); // Eliminates the 5ms penalty. Sleeps until strictly necessary.
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            return;
+                        }
+                    }
+                }
 
+                if (flowController.isCancelled()) {
+                    break;
+                }
+
+                transmitChunk(buffer, flowController);
                 buffer.clear();
             }
         } catch (IOException e) {
             logger.error("NIO Channel failure while reading segment: {}", file, e);
             throw new RuntimeException(e);
-        }
-    }
-
-    /**
-     * Implements a spin-lock wait to respect gRPC flow control signals.
-     *
-     * @param observer The observer providing the <code>isReady</code> status.
-     */
-    private void waitForFlowControl(ServerCallStreamObserver<PartitionChunk> observer) {
-        while (!observer.isReady() && !observer.isCancelled()) {
-            try {
-                TimeUnit.MILLISECONDS.sleep(5);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                break;
-            }
         }
     }
 
