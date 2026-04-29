@@ -116,12 +116,6 @@ public class ReduceTaskProcessor extends RecursiveTask<List<KeyValuePair>> {
         this.threshold = threshold;
     }
 
-    /**
-     * Orchestrates the parallel computation via a divide-and-conquer strategy.
-     *
-     * @return A consolidated {@link List} of {@link KeyValuePair} objects
-     * representing the finalized reduced data for this task tree.
-     */
     @Override
     protected List<KeyValuePair> compute() {
         int length = end - start;
@@ -146,7 +140,10 @@ public class ReduceTaskProcessor extends RecursiveTask<List<KeyValuePair>> {
         // Wait for the left task and merge the results
         List<KeyValuePair> leftResult = leftTask.join();
 
-        List<KeyValuePair> mergedResult = new ArrayList<>(leftResult);
+        // PERFORMANCE OPTIMIZATION: Pre-allocate merged list capacity
+        // Prevents array reallocation when adding the right tree results
+        List<KeyValuePair> mergedResult = new ArrayList<>(leftResult.size() + rightResult.size());
+        mergedResult.addAll(leftResult);
         mergedResult.addAll(rightResult);
 
         return mergedResult;
@@ -159,7 +156,8 @@ public class ReduceTaskProcessor extends RecursiveTask<List<KeyValuePair>> {
      * applying the Reduce logic to this specific segment.
      */
     private List<KeyValuePair> processSequentially() {
-        List<KeyValuePair> finalResults = new ArrayList<>();
+        // PERFORMANCE OPTIMIZATION: Pre-allocate to maximum possible size
+        List<KeyValuePair> finalResults = new ArrayList<>(end - start);
 
         for (int i = start; i < end; i++) {
             Map.Entry<String, List<String>> entry = groupedBatch.get(i);

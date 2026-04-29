@@ -159,7 +159,9 @@ public class MapTaskProcessor extends RecursiveAction {
      * @throws RuntimeException If the disk spill operation fails.
      */
     private void processSequentially() {
-        List<KeyValuePair> microBuffer = new ArrayList<>();
+        // PERFORMANCE OPTIMIZATION: Pre-size the ArrayList to the exact micro-batch threshold.
+        // Prevents dynamic array reallocation (O(N) copying) as the buffer grows.
+        List<KeyValuePair> microBuffer = new ArrayList<>(5000);
 
         // Create a local Context that streams directly to disk
         Context streamingContext = (key, value) -> {

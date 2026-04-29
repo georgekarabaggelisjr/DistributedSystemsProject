@@ -26,39 +26,36 @@ import java.util.concurrent.ForkJoinPool;
  * primary Worker daemon. By physically isolating the execution of third-party bytecode,
  * the system achieves several critical architectural goals:</p>
  * <ul>
- * <li><b>Security (Sandboxing):</b> Malicious or poorly written user scripts cannot crash the main worker,
- * access its sensitive memory space, or compromise primary event loops.</li>
- * <li><b>Memory Management (ClassLoader Leaks):</b> Because the {@link DynamicClassLoader}
- * operates exclusively within this ephemeral JVM, all Metaspace, loaded classes, and static
- * references are completely obliterated by the operating system when this process exits,
- * guaranteeing zero memory leaks across thousands of tasks.</li>
+ * <li><b>Security (Sandboxing):</b> Malicious or poorly written user scripts cannot crash the main worker.</li>
+ * <li><b>Memory Management (ClassLoader Leaks):</b> All Metaspace and loaded classes are completely
+ * obliterated by the OS when this process exits, guaranteeing zero memory leaks across thousands of tasks.</li>
  * </ul>
  *
  * @author Ilias Bolanakis
- * @version 2.0
+ * @version 2.1
  * @since 2026-04-24
  */
 public class SandboxRunner {
 
+    /** The SLF4J logger instance for recording sandbox lifecycle events and fatal JVM errors. */
     private static final Logger logger = LoggerFactory.getLogger(SandboxRunner.class);
 
-    /**
-     * High-performance JSON serializer used for instruction extraction.
-     * Configured to ignore unknown properties for cross-version compatibility.
-     */
+    /** High-performance JSON serializer configured to ignore unknown properties for resilient deserialization. */
     private static final ObjectMapper objectMapper = new ObjectMapper()
             .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
 
     /**
-     * The primary execution hook for the Child JVM.
+     * The primary execution hook for the isolated Child JVM.
+     * <p>
+     * Bootstraps the ephemeral environment, parses the injected task instructions,
+     * establishes an independent connection to the S3 storage layer, and routes
+     * execution to the appropriate Map or Reduce phase handler.
+     * </p>
      *
-     * <p>Bootstraps the isolated environment, parses task instructions, dynamically loads
-     * user bytecode, and executes the designated computation pipeline.</p>
-     *
-     * @param args Command line arguments:
+     * @param args Command line arguments injected by the parent {@code TaskExecutor}:
      * <ul>
-     * <li>args[0]: Absolute path to the JSON file containing the serialized {@link TaskPayload}.</li>
-     * <li>args[1]: Base directory for local shuffle data persistence.</li>
+     * <li>{@code args[0]}: Absolute path to the serialized JSON {@link TaskPayload} file.</li>
+     * <li>{@code args[1]}: The root physical directory for ephemeral shuffle data bounding.</li>
      * </ul>
      */
     public static void main(String[] args) {
@@ -76,9 +73,6 @@ public class SandboxRunner {
             String jsonPayload = Files.readString(payloadFile);
             TaskPayload payload = objectMapper.readValue(jsonPayload, TaskPayload.class);
 
-            // Establish a temporary isolated connection for data retrieval
-            // Note: In a true zero-trust sandbox, the main worker would download the data
-            // and pass local file paths to the sandbox. For Phase 2, we allow the sandbox to fetch.
             MinioConnectionManager manager = new MinioConnectionManager(
                     System.getenv().getOrDefault("MINIO_ENDPOINT", "http://localhost:9000"),
                     System.getenv().getOrDefault("MINIO_ACCESS_KEY", "minioadmin"),
@@ -86,7 +80,8 @@ public class SandboxRunner {
             );
             S3ClientService s3ClientService = new S3ClientService(manager);
 
-            String localCodeDir = "/tmp/mapreduce/usercode/" + payload.jobId() + "/";
+            // Unified pathing ensures StorageJanitor automatically cleans user code
+            String localCodeDir = Paths.get(baseShuffleDir, payload.jobId(), "usercode") + "/";
 
             if ("MAP".equalsIgnoreCase(payload.taskType())) {
                 executeMap(payload, localCodeDir, baseShuffleDir, s3ClientService);
@@ -96,24 +91,28 @@ public class SandboxRunner {
                 throw new IllegalArgumentException("Unsupported task type in Sandbox: " + payload.taskType());
             }
 
-            // Normal termination: OS reclaims all memory
             logger.info("Sandbox execution completed successfully. Terminating JVM.");
             System.exit(0);
 
         } catch (Throwable t) {
             logger.error("FATAL: Sandbox JVM encountered an unrecoverable exception.", t);
-            System.exit(1); // Non-zero exit code signals failure to the master Orchestrator
+            System.exit(1);
         }
     }
 
     /**
-     * Orchestrates the execution of a MAP task within the sandbox environment.
+     * Orchestrates the execution of a Map task within the isolated sandbox boundary.
+     * <p>
+     * Dynamically loads the user's {@link Mapper} implementation, streams a bounded
+     * chunk of records from S3 into memory, and submits the workload to the
+     * {@link ForkJoinPool} for highly parallelized, work-stealing execution.
+     * </p>
      *
-     * @param payload        The instructions and metadata for the Map task.
-     * @param localCodeDir   Local directory containing the dynamically loaded user code.
-     * @param baseShuffleDir Local directory for persisting intermediate shuffle data.
-     * @param s3             Service for interacting with S3-compatible storage.
-     * @throws Throwable If class loading, data retrieval, or parallel execution fails.
+     * @param payload        The deserialized task instructions and metadata.
+     * @param localCodeDir   The local directory containing the dynamically loaded user bytecode.
+     * @param baseShuffleDir The root local directory for persisting intermediate partitioned data.
+     * @param s3             The configured service client for interacting with S3-compatible storage.
+     * @throws Throwable If class loading, data retrieval, or parallel execution encounters a fatal error.
      */
     private static void executeMap(TaskPayload payload, String localCodeDir, String baseShuffleDir, S3ClientService s3) throws Throwable {
         Mapper mapper = DynamicClassLoader.loadMapper(localCodeDir, payload.className());
@@ -129,24 +128,31 @@ public class SandboxRunner {
     }
 
     /**
-     * Orchestrates the execution of a REDUCE task within the sandbox environment.
+     * Orchestrates the execution of a Reduce task within the isolated sandbox boundary.
+     * <p>
+     * Dynamically loads the user's {@link Reducer} implementation, initiates the
+     * O(1) memory External Merge Sort on the raw gRPC data streams, and securely
+     * streams the final aggregated results directly to S3, bypassing the JVM heap.
+     * </p>
      *
-     * @param payload        The instructions and metadata for the Reduce task.
-     * @param localCodeDir   Local directory containing the dynamically loaded user code.
-     * @param baseShuffleDir Local directory for retrieving intermediate shuffle data.
-     * @param s3             Service for persisting final output to shared storage.
-     * @throws Throwable If class loading, merge-sort operations, or data persistence fails.
+     * @param payload        The deserialized task instructions and metadata.
+     * @param localCodeDir   The local directory containing the dynamically loaded user bytecode.
+     * @param baseShuffleDir The root local directory used to resolve the job's ephemeral boundary.
+     * @param s3             The configured service client for persisting final output to shared storage.
+     * @throws Throwable If class loading, K-Way merge-sort operations, or data persistence fails.
      */
     private static void executeReduce(TaskPayload payload, String localCodeDir, String baseShuffleDir, S3ClientService s3) throws Throwable {
         Reducer reducer = DynamicClassLoader.loadReducer(localCodeDir, payload.className());
         int partitionIndex = Integer.parseInt(payload.taskId());
 
-        Path rawDataDir = Paths.get(baseShuffleDir, "reduce_raw", payload.jobId(), String.valueOf(partitionIndex));
+        // Raw Data strictly isolated within the Job's directory boundary for Janitor collection
+        Path rawDataDir = Paths.get(baseShuffleDir, payload.jobId(), "reduce_raw", String.valueOf(partitionIndex));
 
-        // Execute the K-Way Merge Sort utilizing the isolated classloader's Reducer
         Path finalReducedFile = ExternalMergeSorter.sortReduceAndSpill(rawDataDir, reducer, ForkJoinPool.commonPool());
 
         String finalPath = String.format("%s/output/result_part_%d.txt", payload.jobId(), partitionIndex);
-        s3.writeData(payload.bucketName(), finalPath, Files.readString(finalReducedFile));
+
+        // O(1) memory upload. Streams directly from disk, preventing "Finish-Line" OOM crashes.
+        s3.uploadFileFromDisk(payload.bucketName(), finalPath, finalReducedFile);
     }
 }

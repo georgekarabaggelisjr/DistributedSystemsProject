@@ -37,7 +37,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * </p>
  *
  * @author Ilias Bolanakis
- * @version 2.1
+ * @version 2.2
  * @since 2026-04-25
  * @see com.iliasbolan.engine.TaskExecutor
  */
@@ -162,21 +162,20 @@ public class RabbitMqConsumer {
      * @throws IOException If a channel-level communication error occurs.
      */
     private void handleMessage(Channel channel, com.rabbitmq.client.Delivery delivery) throws IOException {
-        String messageBody = new String(delivery.getBody(), StandardCharsets.UTF_8);
+        byte[] rawBody = delivery.getBody();
         long deliveryTag = delivery.getEnvelope().getDeliveryTag();
         long deliveryCount = getDeliveryCount(delivery.getProperties());
 
         String jobId = "UNKNOWN";
         String taskId = "UNKNOWN";
-        String phase = "UNKNOWN";
         String jobToken = null;
 
-        // Metadata extraction for log correlation and security authorization
+        // PERFORMANCE OPTIMIZATION: Zero-Copy JSON Parsing
+        // Bypasses intermediate String creation, allowing Jackson to parse the byte array directly.
         try {
-            JsonNode jsonNode = objectMapper.readTree(messageBody);
+            JsonNode jsonNode = objectMapper.readTree(rawBody);
             jobId = jsonNode.path("jobId").asText("UNKNOWN");
             taskId = jsonNode.path("taskId").asText("UNKNOWN");
-            phase = jsonNode.path("taskType").asText("UNKNOWN");
             jobToken = jsonNode.path("jobToken").asText(null);
         } catch (Exception e) {
             logger.warn("Metadata extraction failed; logging correlation will be degraded.");
@@ -196,6 +195,9 @@ public class RabbitMqConsumer {
             }
 
             try {
+                // Decode string exactly once for the Executor sandbox
+                String messageBody = new String(rawBody, StandardCharsets.UTF_8);
+
                 // Delegate computation to the TaskExecutor (Sandbox)
                 taskExecutor.executeTask(messageBody);
 
@@ -204,8 +206,17 @@ public class RabbitMqConsumer {
 
             } catch (Throwable t) {
                 logger.error("Transient task failure. Re-queuing and signaling FAILED state.", t);
-                eventProducer.sendErrorSignal(jobId, taskId, jobToken, "FAILED", t.getClass().getSimpleName());
-                channel.basicNack(deliveryTag, false, true); // Re-queue for another worker to attempt
+
+                try {
+                    // Isolate the network call so a secondary failure doesn't hijack the NACK
+                    eventProducer.sendErrorSignal(jobId, taskId, jobToken, "FAILED", t.getClass().getSimpleName());
+                } catch (Exception networkError) {
+                    logger.error("Failed to broadcast error signal to Manager. Proceeding with local NACK.", networkError);
+                } finally {
+                    // ROBUSTNESS FIX: Guaranteed NACK execution
+                    // Ensures the RabbitMQ QoS slot is always released, preventing worker deadlocks.
+                    channel.basicNack(deliveryTag, false, true); // Re-queue for another worker to attempt
+                }
             }
         } finally {
             MDC.clear(); // Ensure thread-local context is purged for the next delivery
@@ -240,7 +251,7 @@ public class RabbitMqConsumer {
      */
     @NotNull
     private Thread getThread(AtomicLong lastActivity, AtomicBoolean isProcessing) {
-        Thread idleChecker = new Thread(() -> {
+        return new Thread(() -> {
             try {
                 while (!Thread.currentThread().isInterrupted()) {
                     // Execution-Aware Check: Pause countdown if actively working
@@ -260,10 +271,9 @@ public class RabbitMqConsumer {
                     Thread.sleep(Math.max(1000, remainingToWait));
                 }
             } catch (InterruptedException e) {
+                logger.info("Idle monitor interrupted. Shutting down.");
                 Thread.currentThread().interrupt();
             }
         });
-        idleChecker.setDaemon(true);
-        return idleChecker;
     }
 }

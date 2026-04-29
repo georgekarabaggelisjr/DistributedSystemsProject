@@ -39,12 +39,14 @@ import java.util.stream.Stream;
  * user's {@link Reducer}, ensuring data is only loaded into the heap at the exact moment of computation.</li>
  * </ol>
  * <p>
- * <b>Character Encoding:</b> All I/O operations mandate UTF-8 encoding to guarantee
- * cross-platform byte-boundary safety.
+ * <b>Architectural Update (Zero-Allocation Merge):</b><br>
+ * The K-Way merge algorithm has been upgraded to a mutable object-reuse pattern.
+ * This entirely eliminates ephemeral object creation (StringBuilders, wrapper nodes)
+ * during the disk-read loops, starving the Garbage Collector and maximizing raw I/O throughput.
  * </p>
  *
  * @author Ilias Bolanakis
- * @version 3.0
+ * @version 3.1
  * @since 2026-04-24
  */
 public class ExternalMergeSorter {
@@ -155,7 +157,13 @@ public class ExternalMergeSorter {
         Path runFile = runsDir.resolve("run_" + runId + ".txt");
         try (BufferedWriter writer = Files.newBufferedWriter(runFile, StandardCharsets.UTF_8, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING)) {
             for (KeyValuePair pair : chunk) {
-                writer.write(pair.key() + "\t" + pair.value() + "\n");
+                // PERFORMANCE OPTIMIZATION: Eliminate String Concatenation Overhead.
+                // Replaces `writer.write(key + "\t" + val + "\n")` to prevent the JVM
+                // from allocating ephemeral StringBuilders for every record.
+                writer.write(pair.key());
+                writer.write('\t');
+                writer.write(pair.value());
+                writer.write('\n');
             }
         }
         logger.debug("Spilled sorted run to disk: {} ({} records)", runFile.getFileName(), chunk.size());
@@ -167,7 +175,7 @@ public class ExternalMergeSorter {
      * <p>
      * Utilizes a K-Way Merge algorithm powered by a {@link PriorityQueue}. Instead of
      * buffering values into lists, it delegates disk-read control to a {@link StreamGroupingIterator}.
-     * This protects the JVM from {@link OutOfMemoryError} during severe data skew events (Zipfian distributions).
+     * This protects the JVM from {@link OutOfMemoryError} during severe data skew events.
      * </p>
      *
      * @param sortedRuns The collection of sorted run files to be merged.
@@ -176,8 +184,9 @@ public class ExternalMergeSorter {
      * @throws IOException If disk I/O failures occur during merging or reducing.
      */
     private static void performNWayMergeAndReduce(List<Path> sortedRuns, Path outputFile, Reducer reducer) throws IOException {
-        PriorityQueue<StreamNode> pq = new PriorityQueue<>(Comparator.comparing(n -> n.currentPair.key()));
-        List<BufferedReader> activeReaders = new ArrayList<>();
+        // StreamNode now implements Comparable naturally
+        PriorityQueue<StreamNode> pq = new PriorityQueue<>();
+        List<BufferedReader> activeReaders = new ArrayList<>(sortedRuns.size());
 
         try (BufferedWriter writer = Files.newBufferedWriter(outputFile, StandardCharsets.UTF_8, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING)) {
 
@@ -185,14 +194,15 @@ public class ExternalMergeSorter {
             for (Path runFile : sortedRuns) {
                 BufferedReader reader = Files.newBufferedReader(runFile, StandardCharsets.UTF_8);
                 activeReaders.add(reader);
-                StreamNode initialNode = StreamNode.fromReader(reader);
-                if (initialNode != null) {
-                    pq.add(initialNode);
+
+                StreamNode node = new StreamNode(reader);
+                if (node.advance()) {
+                    pq.add(node);
                 }
             }
 
             while (!pq.isEmpty()) {
-                String currentGroupingKey = pq.peek().currentPair.key();
+                String currentGroupingKey = pq.peek().currentKey;
 
                 // Create a lazy iterator bound specifically to the current key
                 StreamGroupingIterator lazyIterator = new StreamGroupingIterator(pq, currentGroupingKey);
@@ -226,7 +236,11 @@ public class ExternalMergeSorter {
     private static void executeReduceAndWrite(String key, Iterator<String> iterator, Reducer reducer, BufferedWriter writer) throws IOException {
         KeyValuePair reducedResult = reducer.reduce(key, iterator);
         if (reducedResult != null) {
-            writer.write(reducedResult.key() + "\t" + reducedResult.value() + "\n");
+            // PERFORMANCE OPTIMIZATION: Eliminate ephemeral StringBuilders
+            writer.write(reducedResult.key());
+            writer.write('\t');
+            writer.write(reducedResult.value());
+            writer.write('\n');
         }
     }
 
@@ -252,82 +266,86 @@ public class ExternalMergeSorter {
     }
 
     /**
-     * A lazy-evaluating Iterator that pulls data continuously from the K-Way merge PriorityQueue
-     * as long as the incoming keys match the targeted grouping key.
-     */
-    private static class StreamGroupingIterator implements Iterator<String> {
-        private final PriorityQueue<StreamNode> pq;
-        private final String currentKey;
-
+         * A lazy-evaluating Iterator that pulls data continuously from the K-Way merge PriorityQueue
+         * as long as the incoming keys match the targeted grouping key.
+         */
+        private record StreamGroupingIterator(PriorityQueue<StreamNode> pq, String currentKey) implements Iterator<String> {
         /**
          * Constructs the grouping iterator.
          *
          * @param pq         The shared PriorityQueue managing active file streams.
          * @param currentKey The key this iterator is permitted to consume.
          */
-        public StreamGroupingIterator(PriorityQueue<StreamNode> pq, String currentKey) {
-            this.pq = pq;
-            this.currentKey = currentKey;
+        private StreamGroupingIterator {
         }
 
-        @Override
-        public boolean hasNext() {
-            return !pq.isEmpty() && pq.peek().currentPair.key().equals(currentKey);
-        }
-
-        @Override
-        public String next() {
-            if (!hasNext()) throw new NoSuchElementException("No more values for key: " + currentKey);
-
-            // 1. Extract the minimum node
-            StreamNode minNode = pq.poll();
-            String valueToReturn = minNode.currentPair.value();
-
-            // 2. Advance the stream (read next line from the specific disk run)
-            try {
-                StreamNode nextNode = StreamNode.fromReader(minNode.reader);
-                if (nextNode != null) {
-                    pq.add(nextNode); // 3. Reinsert into the Priority Queue
-                }
-            } catch (IOException e) {
-                throw new RuntimeException("Fatal disk read error during lazy stream evaluation", e);
+            @Override
+            public boolean hasNext() {
+                return !pq.isEmpty() && pq.peek().currentKey.equals(currentKey);
             }
 
-            return valueToReturn;
+            @Override
+            public String next() {
+                if (!hasNext()) throw new NoSuchElementException("No more values for key: " + currentKey);
+
+                // 1. Extract the minimum node
+                StreamNode minNode = pq.poll();
+                assert minNode != null;
+                String valueToReturn = minNode.currentValue;
+
+                // 2. PERFORMANCE OPTIMIZATION: Zero-Allocation Advance
+                // Rather than instantiating a new node, we mutate the exact same object
+                // and re-insert it into the queue.
+                try {
+                    if (minNode.advance()) {
+                        pq.add(minNode); // 3. Reinsert into the Priority Queue
+                    }
+                } catch (IOException e) {
+                    throw new RuntimeException("Fatal disk read error during lazy stream evaluation", e);
+                }
+
+                return valueToReturn;
+            }
         }
-    }
 
     /**
      * Internal data container representing an active file stream during a K-Way merge operation.
+     * <p>
+     * Designed as a highly optimized, mutable wrapper that implements {@link Comparable}
+     * to eliminate GC churn during priority queue evaluations.
+     * </p>
      */
-    private static class StreamNode {
-        /** The current key-value pair extracted from the stream. */
-        KeyValuePair currentPair;
-        /** The reader associated with the active sorted run file. */
-        BufferedReader reader;
+    private static class StreamNode implements Comparable<StreamNode> {
+        String currentKey;
+        String currentValue;
+        final BufferedReader reader;
 
-        StreamNode(KeyValuePair currentPair, BufferedReader reader) {
-            this.currentPair = currentPair;
+        StreamNode(BufferedReader reader) {
             this.reader = reader;
         }
 
         /**
-         * Extracts the next record from the reader and encapsulates it in a StreamNode.
-         *
-         * @param reader The active run file reader.
-         * @return A new {@code StreamNode}, or {@code null} if the end of the file is reached.
-         * @throws IOException If a disk I/O failure occurs during read.
+         * Reads the next line from disk and updates the internal state mutably.
+         * * @return True if a valid record was parsed; false if EOF is reached.
+         * @throws IOException If disk I/O fails.
          */
-        static StreamNode fromReader(BufferedReader reader) throws IOException {
+        boolean advance() throws IOException {
             String line = reader.readLine();
             if (line == null || line.isBlank()) {
-                return null;
+                return false;
             }
             int tabIndex = line.indexOf('\t');
             if (tabIndex > 0) {
-                return new StreamNode(new KeyValuePair(line.substring(0, tabIndex), line.substring(tabIndex + 1)), reader);
+                this.currentKey = line.substring(0, tabIndex);
+                this.currentValue = line.substring(tabIndex + 1);
+                return true;
             }
-            return null;
+            return false;
+        }
+
+        @Override
+        public int compareTo(StreamNode other) {
+            return this.currentKey.compareTo(other.currentKey);
         }
     }
 }

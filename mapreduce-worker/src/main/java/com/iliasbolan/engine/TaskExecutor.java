@@ -33,49 +33,51 @@ import java.util.concurrent.TimeUnit;
  * The central orchestration engine for executing Map-Reduce tasks on a Worker node.
  * <p>
  * This class serves as the primary controller for the Worker's lifecycle, managing
- * the transition between Map and Reduce phases. It handles resource localization
- * from S3, gRPC-based peer-to-peer data transfers, and delegates heavy computational
- * logic to an isolated Sandbox JVM to ensure worker stability.
+ * the transition between Map and Reduce phases. It handles resource localization,
+ * gRPC-based data transfers, and delegation to isolated ephemeral sandbox environments.
  * </p>
  * <p>
- * <b>Architecture Highlight: Secure Data Plane (Token Authentication).</b><br>
- * For zero-trust security, this executor captures a 'jobToken' issued by the Manager
- * and injects it into gRPC metadata during shuffle fetches. This ensures that the
- * External Shuffle Service (ESS) only serves data to authorized Reducer pods belonging
- * to the same job.
+ * <b>Architecture Update: Global Ephemeral Bounding</b><br>
+ * All ephemeral files (Bytecode, Payloads, Raw gRPC Streams) are strictly confined
+ * to the {@code baseShuffleDir/{jobId}/} directory. This guarantees that the
+ * ESS {@code StorageJanitor} cleans up all disk traces seamlessly without leaving orphans.
  * </p>
  *
  * @author Ilias Bolanakis
- * @version 2.0
+ * @version 2.2
  * @since 2026-04-25
  */
 public class TaskExecutor {
 
+    /** The SLF4J logger instance for recording operational events and distributed telemetry. */
     private static final Logger logger = LoggerFactory.getLogger(TaskExecutor.class);
 
-    /**
-     * Pre-configured Jackson mapper for robust JSON deserialization of task intents.
-     */
+    /** High-performance JSON serializer configured for robust, forward-compatible deserialization. */
     private static final ObjectMapper objectMapper = new ObjectMapper()
             .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
 
+    /** Service client for interfacing with the S3-compatible storage layer. */
     private final S3ClientService s3ClientService;
+
+    /** The root physical directory on the host node for ephemeral shuffle data persistence. */
     private final String baseShuffleDir;
+
+    /** AMQP publisher for transmitting asynchronous lifecycle signals back to the Orchestrator. */
     private final RabbitMqProducer eventProducer;
+
+    /** The physical IP address of the Kubernetes node, utilized for P2P data locality routing. */
     private final String nodeIp;
 
-    /**
-     * Global gRPC Metadata key for transmitting the Job Authorization Token.
-     */
+    /** The gRPC metadata key used for injecting and extracting cryptographic authorization tokens. */
     private static final Metadata.Key<String> AUTH_KEY =
             Metadata.Key.of("authorization", Metadata.ASCII_STRING_MARSHALLER);
 
     /**
-     * Constructs a new TaskExecutor with the required infrastructure services.
+     * Initializes the orchestration engine with its required dependencies.
      *
-     * @param s3ClientService Client for downloading user-provided JARs and class files.
+     * @param s3ClientService Service for downloading user-provided JARs and class files.
      * @param baseShuffleDir  Root local directory for persisting intermediate shuffle data.
-     * @param eventProducer   Producer for signaling task status (COMPLETED/FAILED) back to the Manager.
+     * @param eventProducer   Producer for signaling task status (COMPLETED/FAILED) to the Manager.
      * @param nodeIp          The physical IP of the host node, used for data locality signaling.
      */
     public TaskExecutor(S3ClientService s3ClientService, String baseShuffleDir, RabbitMqProducer eventProducer, String nodeIp) {
@@ -86,10 +88,11 @@ public class TaskExecutor {
     }
 
     /**
-     * Parses a raw JSON task payload and routes it to the appropriate execution phase.
+     * Parses the serialized task intent and routes execution to the appropriate phase handler.
      *
-     * @param jsonPayload The serialized {@link TaskPayload} containing job metadata and task intents.
-     * @throws Throwable If deserialization fails or if an unrecoverable error occurs during execution.
+     * @param jsonPayload The raw JSON string containing the {@link TaskPayload} metadata.
+     * @throws Throwable If parsing fails, or an unrecoverable error occurs during phase execution.
+     * @throws IllegalArgumentException If the specified task type is neither MAP nor REDUCE.
      */
     public void executeTask(String jsonPayload) throws Throwable {
         TaskPayload payload = objectMapper.readValue(jsonPayload, TaskPayload.class);
@@ -105,11 +108,17 @@ public class TaskExecutor {
     }
 
     /**
-     * Handles the Map phase lifecycle: localizing code, running the logic, and signaling data availability.
+     * Orchestrates the complete lifecycle of a Map task.
+     * <p>
+     * This method handles code localization, payload staging, sandbox delegation, and
+     * positive completion signaling. All generated artifacts are strictly bounded to the
+     * ESS Janitor's ephemeral directory structure to prevent disk leaks.
+     * </p>
      *
-     * @param payload Pre-parsed task metadata.
-     * @param rawJson The original payload to be passed into the Sandbox JVM.
-     * @throws Throwable If code download or sandbox execution fails.
+     * @param payload The deserialized task metadata.
+     * @param rawJson The original JSON payload to be ingested by the Sandbox JVM.
+     * @throws Throwable If S3 retrieval, sandbox execution, or network signaling fails.
+     * @throws IllegalStateException If the NODE_IP environment variable is unresolved.
      */
     private void executeMapPhase(TaskPayload payload, String rawJson) throws Throwable {
         String safeJobId = sanitizeId(payload.jobId());
@@ -118,21 +127,20 @@ public class TaskExecutor {
 
         logger.info("--- [ STARTING MAP PHASE: Task {} ] ---", safeTaskId);
 
-        // Step 1: Localize the user-provided Mapper class safely
+        // Code localized within the ESS Janitor boundary
         String packagePath = safeClassName.replace(".", "/");
-        String localCodeDir = "/tmp/mapreduce/usercode/" + safeJobId + "/";
+        String localCodeDir = Paths.get(baseShuffleDir, safeJobId, "usercode") + "/";
         String localCodePath = localCodeDir + packagePath + ".class";
 
         java.io.File fileObj = new java.io.File(localCodePath);
         fileObj.getParentFile().mkdirs();
         s3ClientService.downloadUserCode(payload.userCodeBucket(), payload.userCodeObject(), localCodePath);
 
-        // Step 2: Persist the task payload for Sandbox ingestion
-        Path payloadFile = Paths.get("/tmp/mapreduce/payloads", safeJobId + "_map_" + safeTaskId + ".json");
+        // Payload localized within the ESS Janitor boundary
+        Path payloadFile = Paths.get(baseShuffleDir, safeJobId, "payloads", safeTaskId + ".json");
         Files.createDirectories(payloadFile.getParent());
         Files.writeString(payloadFile, rawJson);
 
-        // Step 3: Run the user code in an isolated process
         logger.info("Delegating Map computation to Ephemeral Sandbox JVM...");
         runSandbox(payloadFile, payload);
 
@@ -140,7 +148,6 @@ public class TaskExecutor {
             throw new IllegalStateException("CRITICAL FATAL: NODE_IP environment variable missing.");
         }
 
-        // Step 4: Broadcast locality hint (HOSTNAME@@IP) to the Manager
         String nodeName = System.getenv().getOrDefault("NODE_NAME", "unknown-node");
         String essBindAddress = nodeName + "@@" + this.nodeIp + ":7337";
 
@@ -151,11 +158,17 @@ public class TaskExecutor {
     }
 
     /**
-     * Handles the Reduce phase lifecycle: fetching partition data across nodes and performing final aggregation.
+     * Orchestrates the complete lifecycle of a Reduce task.
+     * <p>
+     * This phase executes a secure Peer-to-Peer (P2P) gRPC fetch to gather intermediate
+     * partitions from active Map nodes, stages the data locally, and delegates aggregation
+     * to the Sandbox JVM. Eager disk cleanup is strictly enforced via a {@code finally} block.
+     * </p>
      *
-     * @param payload Pre-parsed task metadata.
-     * @param rawJson The original payload to be passed into the Sandbox JVM.
-     * @throws Throwable If gRPC streaming or sandbox aggregation fails.
+     * @param payload The deserialized task metadata containing upstream worker endpoints.
+     * @param rawJson The original JSON payload to be ingested by the Sandbox JVM.
+     * @throws Throwable If P2P fetches fail, data loss is detected, or sandbox execution faults.
+     * @throws RuntimeException If a critical network error disrupts the gRPC shuffle stream.
      */
     private void executeReducePhase(TaskPayload payload, String rawJson) throws Throwable {
         String safeJobId = sanitizeId(payload.jobId());
@@ -164,9 +177,8 @@ public class TaskExecutor {
 
         logger.info("--- [ STARTING REDUCE PHASE: Partition {} for Job {} ] ---", safeTaskId, safeJobId);
 
-        // Step 1: Localize the Reducer class safely
         String packagePath = safeClassName.replace(".", "/");
-        String localCodeDir = "/tmp/mapreduce/usercode/" + safeJobId + "/";
+        String localCodeDir = Paths.get(baseShuffleDir, safeJobId, "usercode") + "/";
         String localCodePath = localCodeDir + packagePath + ".class";
 
         java.io.File fileObj = new java.io.File(localCodePath);
@@ -174,92 +186,94 @@ public class TaskExecutor {
         s3ClientService.downloadUserCode(payload.userCodeBucket(), payload.userCodeObject(), localCodePath);
 
         int partitionIndex = Integer.parseInt(safeTaskId);
-        Path rawDataDir = Paths.get(baseShuffleDir, "reduce_raw", safeJobId, String.valueOf(partitionIndex));
+        // Raw gRPC streams strictly bounded to the Job Directory
+        Path rawDataDir = Paths.get(baseShuffleDir, safeJobId, "reduce_raw", String.valueOf(partitionIndex));
         Files.createDirectories(rawDataDir);
 
-        List<String> endpoints = payload.workerEndpoints();
-        logger.info("Initiating SECURE gRPC P2P transfer from {} ESS nodes...", endpoints.size());
+        try {
+            List<String> endpoints = payload.workerEndpoints();
+            logger.info("Initiating SECURE gRPC P2P transfer from {} ESS nodes...", endpoints.size());
 
-        // Step 2: Peer-to-Peer shuffle fetch
-        for (int i = 0; i < endpoints.size(); i++) {
-            String endpoint = endpoints.get(i);
-            String[] addressParts = endpoint.split(":");
-            String host = addressParts[0];
-            int port = (addressParts.length > 1) ? Integer.parseInt(addressParts[1]) : 7337;
+            for (int i = 0; i < endpoints.size(); i++) {
+                String endpoint = endpoints.get(i);
+                String[] addressParts = endpoint.split(":");
+                String host = addressParts[0];
+                int port = (addressParts.length > 1) ? Integer.parseInt(addressParts[1]) : 7337;
 
-            ManagedChannel channel = ManagedChannelBuilder.forAddress(host, port)
-                    .usePlaintext()
-                    .keepAliveTime(30, TimeUnit.SECONDS)
-                    .build();
-
-            try (BufferedOutputStream bos = new BufferedOutputStream(new FileOutputStream(rawDataDir.resolve("grpc_stream_" + i + ".txt").toFile()))) {
-
-                // Inject security headers using a client interceptor
-                Metadata header = new Metadata();
-                header.put(AUTH_KEY, payload.jobToken());
-
-                ClientInterceptor authInterceptor = MetadataUtils.newAttachHeadersInterceptor(header);
-
-                // Create a secure stub for the shuffle fetch
-                ShuffleServiceGrpc.ShuffleServiceBlockingStub stub = ShuffleServiceGrpc.newBlockingStub(channel)
-                        .withInterceptors(authInterceptor);
-
-                PartitionRequest request = PartitionRequest.newBuilder()
-                        .setJobId(safeJobId)
-                        .setPartitionId(partitionIndex)
+                ManagedChannel channel = ManagedChannelBuilder.forAddress(host, port)
+                        .usePlaintext()
+                        .keepAliveTime(30, TimeUnit.SECONDS)
                         .build();
 
-                // Stream intermediate data chunks directly to disk
-                Iterator<PartitionChunk> chunkStream = stub.getPartition(request);
-                while (chunkStream.hasNext()) {
-                    chunkStream.next().getContent().writeTo(bos);
+                try (BufferedOutputStream bos = new BufferedOutputStream(new FileOutputStream(rawDataDir.resolve("grpc_stream_" + i + ".txt").toFile()))) {
+                    Metadata header = new Metadata();
+                    header.put(AUTH_KEY, payload.jobToken());
+
+                    ClientInterceptor authInterceptor = MetadataUtils.newAttachHeadersInterceptor(header);
+                    ShuffleServiceGrpc.ShuffleServiceBlockingStub stub = ShuffleServiceGrpc.newBlockingStub(channel)
+                            .withInterceptors(authInterceptor);
+
+                    PartitionRequest request = PartitionRequest.newBuilder()
+                            .setJobId(safeJobId)
+                            .setPartitionId(partitionIndex)
+                            .build();
+
+                    Iterator<PartitionChunk> chunkStream = stub.getPartition(request);
+                    while (chunkStream.hasNext()) {
+                        chunkStream.next().getContent().writeTo(bos);
+                    }
+                } catch (StatusRuntimeException grpcEx) {
+                    String lostTaskId = "map-chunk-" + i;
+                    logger.warn("P2P Data Loss Detected! Triggering Lineage Recovery for {}.", lostTaskId);
+
+                    String errorPayload = "SHUFFLE_FETCH_FAILED:" + lostTaskId;
+                    eventProducer.sendErrorSignal(safeJobId, safeTaskId, payload.jobToken(), "FAILED", errorPayload);
+                    return;
+                } catch (Exception e) {
+                    logger.error("Critical gRPC shuffle failure at node {}", endpoint, e);
+                    throw new RuntimeException(e);
+                } finally {
+                    channel.shutdown().awaitTermination(5, TimeUnit.SECONDS);
                 }
-            } catch (StatusRuntimeException grpcEx) {
-                // Signal partial data loss to trigger orchestrator recovery (Lineage Recovery)
-                String lostTaskId = "map-chunk-" + i;
-                logger.warn("P2P Data Loss Detected! Triggering Lineage Recovery for {}.", lostTaskId);
-
-                String errorPayload = "SHUFFLE_FETCH_FAILED:" + lostTaskId;
-                eventProducer.sendErrorSignal(safeJobId, safeTaskId, payload.jobToken(), "FAILED", errorPayload);
-                return;
-            } catch (Exception e) {
-                logger.error("Critical gRPC shuffle failure at node {}", endpoint, e);
-                throw new RuntimeException(e);
-            } finally {
-                channel.shutdown().awaitTermination(5, TimeUnit.SECONDS);
             }
+
+            Path payloadFile = Paths.get(baseShuffleDir, safeJobId, "payloads", safeTaskId + ".json");
+            Files.createDirectories(payloadFile.getParent());
+            Files.writeString(payloadFile, rawJson);
+
+            logger.info("Streams persisted. Delegating aggregation to Sandbox...");
+            runSandbox(payloadFile, payload);
+
+            eventProducer.sendCompletionSignal(safeJobId, safeTaskId, payload.jobToken(), "COMPLETED", null);
+            logger.info("--- [ SUCCESSFULLY COMPLETED REDUCE PHASE ] ---");
+
+        } finally {
+            // Guaranteed Eager Cleanup
+            // Eagerly purges the massive, multi-GB gRPC streams the instant the Reducer finishes.
+            // Prevents the disk from prematurely hitting the 85% Janitor high-watermark.
+            ExternalMergeSorter.cleanupDirectory(rawDataDir);
         }
-
-        // Step 3: Run the Reducer sandbox to aggregate the fetched streams
-        Path payloadFile = Paths.get("/tmp/mapreduce/payloads", safeJobId + "_reduce_" + safeTaskId + ".json");
-        Files.createDirectories(payloadFile.getParent());
-        Files.writeString(payloadFile, rawJson);
-
-        logger.info("Streams persisted. Delegating aggregation to Sandbox...");
-        runSandbox(payloadFile, payload);
-
-        // Step 4: Reclamation of local shuffle space
-        ExternalMergeSorter.cleanupDirectory(rawDataDir);
-
-        eventProducer.sendCompletionSignal(safeJobId, safeTaskId, payload.jobToken(), "COMPLETED", null);
-        logger.info("--- [ SUCCESSFULLY COMPLETED REDUCE PHASE ] ---");
     }
 
     /**
-     * Executes the user code in a dedicated JVM process to protect the worker from heap crashes,
-     * while maintaining a continuous heartbeat to the Orchestrator.
+     * Spawns an isolated, ephemeral Child JVM to execute user-defined computation logic.
+     * <p>
+     * This method protects the primary Worker node from Out-Of-Memory (OOM) crashes and
+     * malicious code. It establishes a background heartbeat monitor to prevent the
+     * Orchestrator's Watchdog from prematurely terminating long-running processes.
+     * </p>
      *
-     * @param payloadFile The JSON task manifest which the sandbox JVM will parse.
-     * @param payload     The deserialized task metadata used for heartbeat signaling.
-     * @throws IOException          If the sandbox process cannot be started.
-     * @throws InterruptedException If the executor is interrupted while waiting for the sandbox.
+     * @param payloadFile The physical path to the staged JSON payload on disk.
+     * @param payload     The deserialized metadata used for periodic heartbeat signaling.
+     * @throws IOException If the child process cannot be spawned due to OS resource limits.
+     * @throws InterruptedException If the executor thread is interrupted while waiting for the sandbox.
+     * @throws RuntimeException If the Sandbox JVM terminates with a non-zero exit code.
      */
     private void runSandbox(Path payloadFile, TaskPayload payload) throws IOException, InterruptedException {
         String javaHome = System.getProperty("java.home");
         String javaBin = Paths.get(javaHome, "bin", "java").toString();
         String classpath = System.getProperty("java.class.path");
 
-        // Spawn child JVM with inherited classpath and custom sandbox entry point
         ProcessBuilder pb = new ProcessBuilder(
                 javaBin,
                 "-cp", classpath,
@@ -270,12 +284,10 @@ public class TaskExecutor {
 
         pb.inheritIO();
 
-        // --- ARCHITECTURAL FIX: Long-Running Task Heartbeats ---
         java.util.concurrent.ScheduledExecutorService heartbeatExecutor =
                 java.util.concurrent.Executors.newSingleThreadScheduledExecutor();
 
         try {
-            // Schedule the heartbeat to fire every 10 minutes
             heartbeatExecutor.scheduleAtFixedRate(
                     () -> eventProducer.sendProgressSignal(payload.jobId(), payload.taskId(), payload.jobToken()),
                     10, 10, TimeUnit.MINUTES
@@ -288,20 +300,20 @@ public class TaskExecutor {
                 throw new RuntimeException("Sandbox JVM terminated with exit code: " + exitCode);
             }
         } finally {
-            // Guarantee the background thread terminates when the task finishes or crashes
             heartbeatExecutor.shutdownNow();
-
-            // Ensure temporary manifests are purged
             Files.deleteIfExists(payloadFile);
         }
     }
 
     /**
      * Validates structural identifiers to prevent Arbitrary Path Traversal attacks.
+     * <p>
      * Ensures IDs only contain alphanumeric characters and standard delimiters.
+     * </p>
      *
-     * @param input The id to be sanitized.
-     * @return The sanitized id.
+     * @param input The raw identifier string to be sanitized.
+     * @return The validated and structurally safe identifier.
+     * @throws SecurityException If the input fails structural validation.
      */
     private String sanitizeId(String input) {
         if (input == null || !input.matches("^[a-zA-Z0-9\\-]+$")) {
@@ -311,11 +323,14 @@ public class TaskExecutor {
     }
 
     /**
-     * Validates class names to ensure they adhere to safe Java package structures,
-     * mitigating nested directory escapes during file extraction.
+     * Validates class names to ensure they adhere to safe Java package structures.
+     * <p>
+     * Mitigates nested directory escape vectors during bytecode extraction and loading.
+     * </p>
      *
-     * @param input The class name to be sanitized.
-     * @return The sanitized class name.
+     * @param input The fully qualified class name to be sanitized.
+     * @return The validated and structurally safe class name.
+     * @throws SecurityException If the input violates standard Java package naming conventions.
      */
     private String sanitizeClassName(String input) {
         if (input == null || !input.matches("^[a-zA-Z0-9_.]+$")) {

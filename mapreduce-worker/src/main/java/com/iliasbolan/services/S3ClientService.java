@@ -6,7 +6,6 @@ import io.github.resilience4j.retry.Retry;
 import io.github.resilience4j.retry.RetryConfig;
 import io.github.resilience4j.retry.RetryRegistry;
 import io.minio.*;
-import io.minio.messages.Item;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -28,18 +27,18 @@ import java.util.List;
  * storage layer (MinIO). It is engineered to handle massive data throughput while
  * maintaining strict record-level consistency during parallel file reads.
  * </p>
- * * <h3>Key Architectural Features:</h3>
+ * <h3>Key Architectural Features:</h3>
  * <ul>
  * <li><b>Resilience:</b> Implements {@code Resilience4j} retries with exponential backoff
  * and random jitter to survive transient network partitions.</li>
  * <li><b>Boundary Correction:</b> Implements a specialized synchronization algorithm
  * to ensure UTF-8 records are never bifurcated across Map chunks.</li>
- * <li><b>Idempotent Operations:</b> Ensures that task retries do not result in corrupted
- * or duplicated intermediate data.</li>
+ * <li><b>O(1) Memory Streaming:</b> Utilizes array pre-allocation and buffered streams
+ * to guarantee stable heap usage and prevent K8s OOMKilled container terminations.</li>
  * </ul>
  *
  * @author Ilias Bolanakis
- * @version 2.0
+ * @version 2.2
  * @see <a href="https://resilience4j.readme.io/">Resilience4j Documentation</a>
  * @since 2026-03-30
  */
@@ -120,14 +119,12 @@ public class S3ClientService {
      * <li>It reads the requested {@code length}, but continues reading until the
      * current line is finalized.</li>
      * </ol>
-     * This ensures the <i>preceding</i> worker handles the fragment we skipped,
-     * and <i>we</i> handle the fragment that the <i>following</i> worker will skip.
      * </p>
      *
      * @param bucketName S3 bucket containing the input data.
      * @param objectName S3 key of the source file.
      * @param offset     The logical starting byte (from the Manager).
-     * @param length     The target chunk size (typically 64MB).
+     * @param length     The target chunk size (typically 128MB).
      * @return A {@link List} of UTF-8 encoded, sanitized text records.
      * @throws Throwable if the stream is interrupted or the data cannot be decoded.
      */
@@ -135,9 +132,13 @@ public class S3ClientService {
         return Retry.decorateCheckedSupplier(retryContext, () -> {
             logger.info(" Offset: {}, Target Length: {} bytes", offset, length);
 
-            List<String> cleanRecords = new ArrayList<>();
+            // PERFORMANCE OPTIMIZATION: Memory Pre-allocation
+            // Assumes an average line length of 100 bytes to pre-size the array.
+            // Eliminates O(N) array copying and extreme GC pressure during 128MB chunk ingestion.
+            int estimatedRecordCount = (int) (length / 100);
+            List<String> cleanRecords = new ArrayList<>(estimatedRecordCount);
 
-            // PERFORMANCE OPTIMIZATION:
+            // PERFORMANCE OPTIMIZATION: I/O Batching
             // Wrapping the raw MinIO InputStream in a BufferedInputStream (32KB buffer)
             // mitigates extreme network latency caused by single-byte sequential reads.
             try (InputStream rawStream = minioClient.getObject(
@@ -160,8 +161,6 @@ public class S3ClientService {
                 }
 
                 // EXTRACTION PHASE: Read target length + finish current line
-                // OPTIMIZATION: Pre-sizing buffer to 256 bytes minimizes internal array
-                // reallocation overhead during continuous string building.
                 ByteArrayOutputStream lineBuffer = new ByteArrayOutputStream(256);
                 int b;
 
@@ -201,14 +200,15 @@ public class S3ClientService {
     }
 
     /**
-     * Persists computational output to the shared storage layer.
+     * Persists final computational output to the shared storage layer.
      * <p>
-     * This is used for both intermediate Map partitions and final Reduce results.
-     * Data is encoded in UTF-8 to maintain character set consistency across the cluster.
+     * In the modern P2P architecture, intermediate shuffle data is stored on local disk
+     * (ESS) rather than S3. Therefore, this method is now exclusively utilized by Reducers
+     * to persist the final, aggregated outputs of the job. Data is encoded in UTF-8.
      * </p>
      *
      * @param bucketName  Target S3 bucket.
-     * @param objectName  Deterministic path (e.g., job_id/intermediate/part_n.txt).
+     * @param objectName  Deterministic path (e.g., job_id/output/part_n.txt).
      * @param data        Raw text results to be uploaded.
      * @throws Throwable if the upload is rejected by the storage cluster.
      */
@@ -223,7 +223,7 @@ public class S3ClientService {
                                 .bucket(bucketName)
                                 .object(objectName)
                                 .stream(inputStream, dataBytes.length, -1)
-                                .contentType("application/json")
+                                .contentType("text/plain")
                                 .build());
 
                 logger.debug("Successfully wrote object to s3://{}/{}", bucketName, objectName);
@@ -232,66 +232,31 @@ public class S3ClientService {
     }
 
     /**
-     * Discovers all intermediate fragments associated with a specific Reduce partition.
+     * Streams a local file directly to S3, bypassing the JVM Heap.
      * <p>
-     * This is the entry point for the <b>Shuffle phase</b>. It performs a recursive
-     * search for all files matching the partition-specific suffix created by
-     * the various Map tasks.
+     * <b>PERFORMANCE OPTIMIZATION:</b> Enforces O(1) memory footprint during massive
+     * final Reduce uploads by streaming directly from the local disk buffer to the network.
+     * Utilizing MinIO's optimized uploader allows for under-the-hood multipart parallel uploads.
      * </p>
      *
-     * @param bucketName     Bucket containing intermediate results.
-     * @param jobId          UUID of the active job.
-     * @param partitionIndex The specific partition (Modulo ID) the worker is reducing.
-     * @return A {@link List} of object keys ready for ingestion.
-     * @throws Throwable if listing permissions are denied or network fails.
+     * @param bucketName Target S3 bucket.
+     * @param objectName Target S3 key path.
+     * @param filePath   The local physical file to be uploaded.
+     * @throws Throwable if the upload fails or the disk is unreadable.
      */
-    @SuppressWarnings("unused")
-    public List<String> listIntermediateFiles(String bucketName, String jobId, int partitionIndex) throws Throwable {
-        return Retry.decorateCheckedSupplier(retryContext, () -> {
-            String prefix = jobId + "/intermediate/";
-            String suffix = "_part_" + partitionIndex + ".txt";
-            List<String> matchingObjects = new ArrayList<>();
+    public void uploadFileFromDisk(String bucketName, String objectName, Path filePath) throws Throwable {
+        Retry.decorateCheckedRunnable(retryContext, () -> {
+            logger.debug("Streaming file {} to s3://{}/{}", filePath, bucketName, objectName);
 
-            Iterable<Result<Item>> results = minioClient.listObjects(
-                    ListObjectsArgs.builder()
+            minioClient.uploadObject(
+                    UploadObjectArgs.builder()
                             .bucket(bucketName)
-                            .prefix(prefix)
-                            .recursive(true)
+                            .object(objectName)
+                            .filename(filePath.toAbsolutePath().toString())
+                            .contentType("text/plain")
                             .build());
 
-            for (Result<Item> result : results) {
-                String name = result.get().objectName();
-                if (name.endsWith(suffix)) {
-                    matchingObjects.add(name);
-                }
-            }
-
-            logger.info("Found {} intermediate fragments for partition {} in job {}.",
-                    matchingObjects.size(), partitionIndex, jobId);
-            return matchingObjects;
-        }).get();
-    }
-
-    /**
-     * Retrieves an entire S3 object as a UTF-8 String.
-     * <p>
-     * <b>Warning:</b> This method loads the entire object into memory. It is suitable
-     * for intermediate partitions but should not be used for raw input files.
-     * </p>
-     *
-     * @param bucketName Source bucket.
-     * @param objectName Specific object key.
-     * @return The full text content of the file.
-     * @throws Throwable if the object is too large for memory or retrieval fails.
-     */
-    @SuppressWarnings("unused")
-    public String readObject(String bucketName, String objectName) throws Throwable {
-        return Retry.decorateCheckedSupplier(retryContext, () -> {
-            try (InputStream stream = minioClient.getObject(
-                    GetObjectArgs.builder().bucket(bucketName).object(objectName).build())) {
-
-                return new String(stream.readAllBytes(), StandardCharsets.UTF_8);
-            }
-        }).get();
+            logger.debug("Successfully streamed file to S3.");
+        }).run();
     }
 }

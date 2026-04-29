@@ -11,9 +11,8 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
+
 
 /**
  * Handles the Shuffle and Partitioning phase of a Map-Reduce job.
@@ -88,21 +87,35 @@ public class ShufflePartitioner {
      * or the data append process.
      */
     public void appendThreadSafe(List<KeyValuePair> buffer) throws IOException {
-        // Step 1: Group the incoming buffer by target partition (Thread-Local operation)
-        Map<Integer, StringBuilder> localPartitions = new HashMap<>();
+        // PERFORMANCE OPTIMIZATION: Replaced HashMap with a pre-sized array.
+        // This completely eliminates Integer autoboxing, hashing overhead, and Lambda allocations.
+        StringBuilder[] localPartitions = new StringBuilder[numReducers];
 
         for (KeyValuePair pair : buffer) {
             // Correctly ensures a positive integer by stripping the sign bit
             int partitionIndex = (pair.key().hashCode() & Integer.MAX_VALUE) % numReducers;
 
-            localPartitions.computeIfAbsent(partitionIndex, k -> new StringBuilder())
-                    .append(pair.key()).append("\t").append(pair.value()).append("\n");
+            if (localPartitions[partitionIndex] == null) {
+                // Pre-size StringBuilder to avoid resizing during the tight loop
+                localPartitions[partitionIndex] = new StringBuilder(1024);
+            }
+
+            // PERFORMANCE OPTIMIZATION: Use char instead of String for single characters
+            localPartitions[partitionIndex]
+                    .append(pair.key())
+                    .append('\t')
+                    .append(pair.value())
+                    .append('\n');
         }
 
         // Step 2: Flush to disk using granular locks
-        for (Map.Entry<Integer, StringBuilder> entry : localPartitions.entrySet()) {
-            int partitionIndex = entry.getKey();
-            String payload = entry.getValue().toString();
+        for (int partitionIndex = 0; partitionIndex < numReducers; partitionIndex++) {
+            StringBuilder sb = localPartitions[partitionIndex];
+
+            // Skip empty partitions to save I/O cycles
+            if (sb == null) continue;
+
+            String payload = sb.toString();
 
             Path partitionDir = Paths.get(baseShuffleDir, jobId, String.valueOf(partitionIndex));
             Path filePath = partitionDir.resolve(mapTaskId + ".txt");
