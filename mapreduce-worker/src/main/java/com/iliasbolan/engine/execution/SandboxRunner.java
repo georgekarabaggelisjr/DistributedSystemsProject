@@ -30,9 +30,14 @@ import java.util.concurrent.ForkJoinPool;
  * <li><b>Memory Management (ClassLoader Leaks):</b> All Metaspace and loaded classes are completely
  * obliterated by the OS when this process exits, guaranteeing zero memory leaks across thousands of tasks.</li>
  * </ul>
+ * * <p><b>Architecture Update: Multi-Tenant Cloud Storage</b><br>
+ * This runner dynamically respects the Sandboxed S3 object routes injected by the Orchestrator,
+ * ensuring that data reads and writes are strictly confined to the user's explicit tenant folder
+ * (e.g., <code>s3://results/&lt;user_id&gt;/&lt;job_id&gt;/</code>).
+ * </p>
  *
  * @author Ilias Bolanakis
- * @version 2.1
+ * @version 3.0
  * @since 2026-04-24
  */
 public class SandboxRunner {
@@ -108,7 +113,7 @@ public class SandboxRunner {
      * {@link ForkJoinPool} for highly parallelized, work-stealing execution.
      * </p>
      *
-     * @param payload        The deserialized task instructions and metadata.
+     * @param payload        The deserialized task instructions and metadata containing multi-tenant S3 targets.
      * @param localCodeDir   The local directory containing the dynamically loaded user bytecode.
      * @param baseShuffleDir The root local directory for persisting intermediate partitioned data.
      * @param s3             The configured service client for interacting with S3-compatible storage.
@@ -117,6 +122,8 @@ public class SandboxRunner {
     private static void executeMap(TaskPayload payload, String localCodeDir, String baseShuffleDir, S3ClientService s3) throws Throwable {
         Mapper mapper = DynamicClassLoader.loadMapper(localCodeDir, payload.className());
 
+        // The multi-tenant logic is fully respected here!
+        // payload.bucketName() is "data", and payload.objectName() is "<user_id>/<input_filename>"
         List<String> records = s3.readDataChunk(
                 payload.bucketName(), payload.objectName(), payload.byteOffset(), payload.byteLength());
 
@@ -132,10 +139,10 @@ public class SandboxRunner {
      * <p>
      * Dynamically loads the user's {@link Reducer} implementation, initiates the
      * O(1) memory External Merge Sort on the raw gRPC data streams, and securely
-     * streams the final aggregated results directly to S3, bypassing the JVM heap.
+     * streams the final aggregated results directly to the user's sandboxed S3 bucket.
      * </p>
      *
-     * @param payload        The deserialized task instructions and metadata.
+     * @param payload        The deserialized task instructions and metadata containing multi-tenant S3 targets.
      * @param localCodeDir   The local directory containing the dynamically loaded user bytecode.
      * @param baseShuffleDir The root local directory used to resolve the job's ephemeral boundary.
      * @param s3             The configured service client for persisting final output to shared storage.
@@ -150,7 +157,11 @@ public class SandboxRunner {
 
         Path finalReducedFile = ExternalMergeSorter.sortReduceAndSpill(rawDataDir, reducer, ForkJoinPool.commonPool());
 
-        String finalPath = String.format("%s/output/result_part_%d.txt", payload.jobId(), partitionIndex);
+        // --- MULTI-TENANT FIX ---
+        // Dynamically constructs the S3 Key using the Orchestrator's injected payload.objectName().
+        // Example: payload.objectName() -> "22222222-2222-2222-2222-222222222222/11111111-1111-1111-1111-111111111111/"
+        // Resulting finalPath -> "22222222.../11111111.../result_part_0.txt"
+        String finalPath = String.format("%sresult_part_%d.txt", payload.objectName(), partitionIndex);
 
         // O(1) memory upload. Streams directly from disk, preventing "Finish-Line" OOM crashes.
         s3.uploadFileFromDisk(payload.bucketName(), finalPath, finalReducedFile);

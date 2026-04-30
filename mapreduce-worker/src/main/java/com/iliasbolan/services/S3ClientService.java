@@ -29,6 +29,8 @@ import java.util.List;
  * </p>
  * <h3>Key Architectural Features:</h3>
  * <ul>
+ * <li><b>Multi-Tenant Compatibility:</b> Fully decoupled from hardcoded paths, natively supporting
+ * isolated user sandbox environments (e.g., <code>s3://data/&lt;user_id&gt;/...</code>).</li>
  * <li><b>Resilience:</b> Implements {@code Resilience4j} retries with exponential backoff
  * and random jitter to survive transient network partitions.</li>
  * <li><b>Boundary Correction:</b> Implements a specialized synchronization algorithm
@@ -38,7 +40,7 @@ import java.util.List;
  * </ul>
  *
  * @author Ilias Bolanakis
- * @version 2.2
+ * @version 3.0
  * @see <a href="https://resilience4j.readme.io/">Resilience4j Documentation</a>
  * @since 2026-03-30
  */
@@ -83,8 +85,8 @@ public class S3ClientService {
      * user-provided {@code .class} or {@code .jar} files via the {@code TaskExecutor}.
      * </p>
      *
-     * @param bucketName      S3 bucket containing the code artifacts.
-     * @param objectName      S3 key for the specific bytecode file.
+     * @param bucketName      S3 bucket containing the code artifacts (e.g., "code").
+     * @param objectName      Sandboxed S3 key for the bytecode (e.g., "&lt;user_id&gt;/Mapper.class").
      * @param destinationPath Local file system path for temporary storage.
      * @throws Throwable if the artifact cannot be retrieved or the local disk is write-protected.
      */
@@ -121,10 +123,10 @@ public class S3ClientService {
      * </ol>
      * </p>
      *
-     * @param bucketName S3 bucket containing the input data.
-     * @param objectName S3 key of the source file.
+     * @param bucketName Target S3 bucket (e.g., "data").
+     * @param objectName Sandboxed S3 key of the source file (e.g., "&lt;user_id&gt;/input.txt").
      * @param offset     The logical starting byte (from the Manager).
-     * @param length     The target chunk size (typically 128MB).
+     * @param length     The target chunk size (typically 64MB - 128MB).
      * @return A {@link List} of UTF-8 encoded, sanitized text records.
      * @throws Throwable if the stream is interrupted or the data cannot be decoded.
      */
@@ -207,8 +209,8 @@ public class S3ClientService {
      * to persist the final, aggregated outputs of the job. Data is encoded in UTF-8.
      * </p>
      *
-     * @param bucketName  Target S3 bucket.
-     * @param objectName  Deterministic path (e.g., job_id/output/part_n.txt).
+     * @param bucketName  Target S3 bucket (e.g., "results").
+     * @param objectName  Sandboxed path (e.g., "&lt;user_id&gt;/&lt;job_id&gt;/part_n.txt").
      * @param data        Raw text results to be uploaded.
      * @throws Throwable if the upload is rejected by the storage cluster.
      */
@@ -239,8 +241,8 @@ public class S3ClientService {
      * Utilizing MinIO's optimized uploader allows for under-the-hood multipart parallel uploads.
      * </p>
      *
-     * @param bucketName Target S3 bucket.
-     * @param objectName Target S3 key path.
+     * @param bucketName Target S3 bucket (e.g., "results").
+     * @param objectName Sandboxed path (e.g., "&lt;user_id&gt;/&lt;job_id&gt;/part_n.txt").
      * @param filePath   The local physical file to be uploaded.
      * @throws Throwable if the upload fails or the disk is unreadable.
      */
