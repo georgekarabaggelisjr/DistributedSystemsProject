@@ -31,22 +31,23 @@ import java.util.stream.Stream;
  * </p>
  * <ol>
  * <li><b>Chunking &amp; Sorting:</b> Raw gRPC streams are read into memory-bounded buffers.
- * Once a buffer reaches {@value #CHUNK_RECORD_LIMIT}, it is sorted in memory and flushed
- * to disk as an intermediate "Sorted Run".</li>
+ * Once a buffer breaches either the strict record limit or the physical byte-size boundary,
+ * it is sorted in memory and flushed to disk as an intermediate "Sorted Run".</li>
  * <li><b>Lazy K-Way Merge:</b> All sorted runs are accessed concurrently via file streams.
  * A {@link PriorityQueue} maintains the absolute minimum key across all active runs.
  * Identical keys are wrapped in a custom {@link Iterator} and streamed directly to the
  * user's {@link Reducer}, ensuring data is only loaded into the heap at the exact moment of computation.</li>
  * </ol>
  * <p>
- * <b>Architectural Update (Zero-Allocation Merge):</b><br>
- * The K-Way merge algorithm has been upgraded to a mutable object-reuse pattern.
- * This entirely eliminates ephemeral object creation (StringBuilders, wrapper nodes)
- * during the disk-read loops, starving the Garbage Collector and maximizing raw I/O throughput.
+ * <b>Architectural Update (Zero-Allocation Merge &amp; Byte-Aware Guards):</b><br>
+ * The K-Way merge algorithm has been upgraded to a mutable object-reuse pattern, entirely
+ * eliminating ephemeral object creation during disk-read loops. Furthermore, the chunking
+ * phase now incorporates a Byte-Aware physical memory guard to prevent Out-Of-Memory (OOM)
+ * crashes when processing datasets with exceptionally large payload values.
  * </p>
  *
  * @author Ilias Bolanakis
- * @version 3.1
+ * @version 3.2
  * @since 2026-04-24
  */
 public class ExternalMergeSorter {
@@ -54,8 +55,9 @@ public class ExternalMergeSorter {
     private static final Logger logger = LoggerFactory.getLogger(ExternalMergeSorter.class);
 
     /**
-     * The maximum number of records permitted in the JVM heap before triggering a disk spill.
-     * Tuned specifically to accommodate Kubernetes container memory limits (e.g., 2Gi limits).
+     * The maximum number of logical records permitted in the JVM heap before triggering a disk spill.
+     * Tuned specifically to accommodate Kubernetes container memory limits (e.g., 2Gi limits) for
+     * standard text processing.
      */
     private static final int CHUNK_RECORD_LIMIT = 500_000;
 
@@ -94,8 +96,8 @@ public class ExternalMergeSorter {
      * Reads raw input files and spills sorted chunks to the local file system.
      * <p>
      * Scans all incoming streams, parses them into {@link KeyValuePair} objects, and
-     * flushes them to disk once the {@value #CHUNK_RECORD_LIMIT} is reached. Each run
-     * is guaranteed to be totally ordered by key.
+     * flushes them to disk once either the {@value #CHUNK_RECORD_LIMIT} or the physical
+     * byte-size threshold is reached. Each run is guaranteed to be totally ordered by key.
      * </p>
      *
      * @param rawDataDir The directory containing raw gRPC stream files.
@@ -107,6 +109,10 @@ public class ExternalMergeSorter {
     private static List<Path> createSortedRuns(Path rawDataDir, Path runsDir) throws IOException {
         List<Path> sortedRunFiles = new ArrayList<>();
         List<KeyValuePair> currentChunk = new ArrayList<>(CHUNK_RECORD_LIMIT);
+
+        // OOM SECURITY GUARD: Track physical byte footprint to prevent payload-based heap exhaustion
+        long currentChunkSizeBytes = 0;
+        final long MAX_CHUNK_SIZE_BYTES = 32 * 1024 * 1024; // 32MB physical memory limit per run
         int runCounter = 0;
 
         try (Stream<Path> rawFiles = Files.list(rawDataDir)) {
@@ -125,11 +131,16 @@ public class ExternalMergeSorter {
                             String key = line.substring(0, tabIndex);
                             String value = line.substring(tabIndex + 1);
                             currentChunk.add(new KeyValuePair(key, value));
+
+                            // Estimate heap consumption (Key + Value + Tab + Newline)
+                            currentChunkSizeBytes += key.length() + value.length() + 2;
                         }
 
-                        if (currentChunk.size() >= CHUNK_RECORD_LIMIT) {
+                        // Flush if EITHER the record count OR the physical byte limit is breached
+                        if (currentChunk.size() >= CHUNK_RECORD_LIMIT || currentChunkSizeBytes >= MAX_CHUNK_SIZE_BYTES) {
                             sortedRunFiles.add(sortAndSpillChunk(currentChunk, runsDir, runCounter++));
                             currentChunk.clear();
+                            currentChunkSizeBytes = 0; // Reset byte tracker after successful spill
                         }
                     }
                 }
@@ -266,10 +277,10 @@ public class ExternalMergeSorter {
     }
 
     /**
-         * A lazy-evaluating Iterator that pulls data continuously from the K-Way merge PriorityQueue
-         * as long as the incoming keys match the targeted grouping key.
-         */
-        private record StreamGroupingIterator(PriorityQueue<StreamNode> pq, String currentKey) implements Iterator<String> {
+     * A lazy-evaluating Iterator that pulls data continuously from the K-Way merge PriorityQueue
+     * as long as the incoming keys match the targeted grouping key.
+     */
+    private record StreamGroupingIterator(PriorityQueue<StreamNode> pq, String currentKey) implements Iterator<String> {
         /**
          * Constructs the grouping iterator.
          *
@@ -279,34 +290,34 @@ public class ExternalMergeSorter {
         private StreamGroupingIterator {
         }
 
-            @Override
-            public boolean hasNext() {
-                return !pq.isEmpty() && pq.peek().currentKey.equals(currentKey);
-            }
-
-            @Override
-            public String next() {
-                if (!hasNext()) throw new NoSuchElementException("No more values for key: " + currentKey);
-
-                // 1. Extract the minimum node
-                StreamNode minNode = pq.poll();
-                assert minNode != null;
-                String valueToReturn = minNode.currentValue;
-
-                // 2. PERFORMANCE OPTIMIZATION: Zero-Allocation Advance
-                // Rather than instantiating a new node, we mutate the exact same object
-                // and re-insert it into the queue.
-                try {
-                    if (minNode.advance()) {
-                        pq.add(minNode); // 3. Reinsert into the Priority Queue
-                    }
-                } catch (IOException e) {
-                    throw new RuntimeException("Fatal disk read error during lazy stream evaluation", e);
-                }
-
-                return valueToReturn;
-            }
+        @Override
+        public boolean hasNext() {
+            return !pq.isEmpty() && pq.peek().currentKey.equals(currentKey);
         }
+
+        @Override
+        public String next() {
+            if (!hasNext()) throw new NoSuchElementException("No more values for key: " + currentKey);
+
+            // 1. Extract the minimum node
+            StreamNode minNode = pq.poll();
+            assert minNode != null;
+            String valueToReturn = minNode.currentValue;
+
+            // 2. PERFORMANCE OPTIMIZATION: Zero-Allocation Advance
+            // Rather than instantiating a new node, we mutate the exact same object
+            // and re-insert it into the queue.
+            try {
+                if (minNode.advance()) {
+                    pq.add(minNode); // 3. Reinsert into the Priority Queue
+                }
+            } catch (IOException e) {
+                throw new RuntimeException("Fatal disk read error during lazy stream evaluation", e);
+            }
+
+            return valueToReturn;
+        }
+    }
 
     /**
      * Internal data container representing an active file stream during a K-Way merge operation.

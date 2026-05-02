@@ -30,14 +30,19 @@ import java.util.concurrent.ForkJoinPool;
  * <li><b>Memory Management (ClassLoader Leaks):</b> All Metaspace and loaded classes are completely
  * obliterated by the OS when this process exits, guaranteeing zero memory leaks across thousands of tasks.</li>
  * </ul>
- * * <p><b>Architecture Update: Multi-Tenant Cloud Storage</b><br>
+ * <p><b>Architecture Update: Multi-Tenant Cloud Storage</b><br>
  * This runner dynamically respects the Sandboxed S3 object routes injected by the Orchestrator,
  * ensuring that data reads and writes are strictly confined to the user's explicit tenant folder
  * (e.g., <code>s3://results/&lt;user_id&gt;/&lt;job_id&gt;/</code>).
  * </p>
+ * <p><b>Memory Protection: I/O Optimized Sub-Chunking</b><br>
+ * Implements bounded micro-batching during the Map phase. By capping individual MinIO fetches
+ * to 128MB, the system optimizes network throughput while ensuring the heap memory footprint
+ * stays perfectly flat, allowing the worker to safely process multi-gigabyte task intents.
+ * </p>
  *
  * @author Ilias Bolanakis
- * @version 3.0
+ * @version 3.2
  * @since 2026-04-24
  */
 public class SandboxRunner {
@@ -108,9 +113,11 @@ public class SandboxRunner {
     /**
      * Orchestrates the execution of a Map task within the isolated sandbox boundary.
      * <p>
-     * Dynamically loads the user's {@link Mapper} implementation, streams a bounded
-     * chunk of records from S3 into memory, and submits the workload to the
-     * {@link ForkJoinPool} for highly parallelized, work-stealing execution.
+     * Dynamically loads the user's {@link Mapper} implementation and streams the target payload
+     * from S3 into memory. To balance network efficiency with heap protection, it utilizes
+     * an <b>I/O Optimized Sub-Chunking Pattern</b> to slice massive datasets into safe 128MB batches.
+     * Each batch is submitted to the {@link ForkJoinPool} for work-stealing execution and
+     * instantly flushed to disk via the thread-safe Partitioner.
      * </p>
      *
      * @param payload        The deserialized task instructions and metadata containing multi-tenant S3 targets.
@@ -122,16 +129,39 @@ public class SandboxRunner {
     private static void executeMap(TaskPayload payload, String localCodeDir, String baseShuffleDir, S3ClientService s3) throws Throwable {
         Mapper mapper = DynamicClassLoader.loadMapper(localCodeDir, payload.className());
 
-        // The multi-tenant logic is fully respected here!
-        // payload.bucketName() is "data", and payload.objectName() is "<user_id>/<input_filename>"
-        List<String> records = s3.readDataChunk(
-                payload.bucketName(), payload.objectName(), payload.byteOffset(), payload.byteLength());
-
+        // Initialize the partitioner once to manage parallel disk spills across all sub-chunks
         ShufflePartitioner partitioner = new ShufflePartitioner(
                 baseShuffleDir, payload.jobId(), payload.taskId(), payload.numReducers());
 
-        MapTaskProcessor rootMapTask = new MapTaskProcessor(records, 0, records.size(), mapper, partitioner);
-        ForkJoinPool.commonPool().invoke(rootMapTask);
+        // OOM SECURITY GUARD: I/O Optimized Sub-Chunking
+        // Balances MinIO network calls with heap protection. Caps physical RAM ingestion at 128MB
+        // to comfortably fit within the 1.5GB Sandbox limit, even when Orchestrator payloads exceed 1GB.
+        long remainingBytes = payload.byteLength();
+        long currentLogicalOffset = payload.byteOffset();
+        final long SUB_CHUNK_MAX_SIZE = 128 * 1024 * 1024; // 128MB physical memory limit per slice
+
+        logger.info("Initiating bounded Map execution. Total bytes to process: {}", remainingBytes);
+
+        while (remainingBytes > 0) {
+            long fetchSize = Math.min(remainingBytes, SUB_CHUNK_MAX_SIZE);
+            logger.info("Fetching sub-chunk at offset {}, size {} bytes", currentLogicalOffset, fetchSize);
+
+            // The multi-tenant logic is fully respected here
+            List<String> records = s3.readDataChunk(
+                    payload.bucketName(), payload.objectName(), currentLogicalOffset, fetchSize);
+
+            if (!records.isEmpty()) {
+                // Submit the safe 128MB memory footprint to the ForkJoinPool
+                MapTaskProcessor rootMapTask = new MapTaskProcessor(records, 0, records.size(), mapper, partitioner);
+                ForkJoinPool.commonPool().invoke(rootMapTask);
+            }
+
+            // Advance logical pointers for the next safe slice
+            currentLogicalOffset += fetchSize;
+            remainingBytes -= fetchSize;
+        }
+
+        logger.info("Sub-chunk processing complete for task {}.", payload.taskId());
     }
 
     /**

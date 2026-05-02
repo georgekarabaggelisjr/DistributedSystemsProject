@@ -11,6 +11,7 @@ import org.slf4j.LoggerFactory;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -35,12 +36,13 @@ import java.util.List;
  * and random jitter to survive transient network partitions.</li>
  * <li><b>Boundary Correction:</b> Implements a specialized synchronization algorithm
  * to ensure UTF-8 records are never bifurcated across Map chunks.</li>
- * <li><b>O(1) Memory Streaming:</b> Utilizes array pre-allocation and buffered streams
- * to guarantee stable heap usage and prevent K8s OOMKilled container terminations.</li>
+ * <li><b>Memory Safeguards:</b> Utilizes array pre-allocation, buffered streams, and strict
+ * byte-size limits on logical records to guarantee stable heap usage and prevent K8s
+ * OOMKilled container terminations, even when processing malformed datasets.</li>
  * </ul>
  *
  * @author Ilias Bolanakis
- * @version 3.0
+ * @version 3.1
  * @see <a href="https://resilience4j.readme.io/">Resilience4j Documentation</a>
  * @since 2026-03-30
  */
@@ -122,13 +124,17 @@ public class S3ClientService {
      * current line is finalized.</li>
      * </ol>
      * </p>
+     * <p>
+     * <b>Security Note:</b> Incorporates an absolute 10MB line-limit guard to prevent
+     * Out-Of-Memory (OOM) errors in the event of a malformed or improperly delimited dataset.
+     * </p>
      *
      * @param bucketName Target S3 bucket (e.g., "data").
      * @param objectName Sandboxed S3 key of the source file (e.g., "&lt;user_id&gt;/input.txt").
      * @param offset     The logical starting byte (from the Manager).
      * @param length     The target chunk size (typically 64MB - 128MB).
      * @return A {@link List} of UTF-8 encoded, sanitized text records.
-     * @throws Throwable if the stream is interrupted or the data cannot be decoded.
+     * @throws Throwable if the stream is interrupted, decoding fails, or the OOM guard is triggered.
      */
     public List<String> readDataChunk(String bucketName, String objectName, long offset, long length) throws Throwable {
         return Retry.decorateCheckedSupplier(retryContext, () -> {
@@ -164,11 +170,22 @@ public class S3ClientService {
 
                 // EXTRACTION PHASE: Read target length + finish current line
                 ByteArrayOutputStream lineBuffer = new ByteArrayOutputStream(256);
+
+                // OOM SECURITY GUARD: Prevent infinite heap buffering on malformed data
+                final int MAX_LINE_SIZE_BYTES = 10 * 1024 * 1024; // 10MB limit
                 int b;
 
                 while ((b = stream.read()) != -1) {
                     bytesProcessedInChunk++;
                     lineBuffer.write(b);
+
+                    // Enforce the strict upper bound to protect the JVM heap
+                    if (lineBuffer.size() > MAX_LINE_SIZE_BYTES) {
+                        throw new IOException(
+                                String.format("Security/OOM Guard Triggered: Encountered a line exceeding %d bytes. " +
+                                        "The dataset may be malformed or missing newline delimiters.", MAX_LINE_SIZE_BYTES)
+                        );
+                    }
 
                     // UTF-8 records are separated by standard LF (0x0A)
                     if (b == 0x0A) {
