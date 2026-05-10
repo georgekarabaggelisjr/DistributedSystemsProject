@@ -134,11 +134,11 @@ public class SandboxRunner {
                 baseShuffleDir, payload.jobId(), payload.taskId(), payload.numReducers());
 
         // OOM SECURITY GUARD: I/O Optimized Sub-Chunking
-        // Balances MinIO network calls with heap protection. Caps physical RAM ingestion at 128MB
+        // Balances MinIO network calls with heap protection. Caps physical RAM ingestion at 32MB
         // to comfortably fit within the 1.5GB Sandbox limit, even when Orchestrator payloads exceed 1GB.
         long remainingBytes = payload.byteLength();
         long currentLogicalOffset = payload.byteOffset();
-        final long SUB_CHUNK_MAX_SIZE = 128 * 1024 * 1024; // 128MB physical memory limit per slice
+        final long SUB_CHUNK_MAX_SIZE = 32 * 1024 * 1024; // 32MB physical memory limit per slice
 
         logger.info("Initiating bounded Map execution. Total bytes to process: {}", remainingBytes);
 
