@@ -53,10 +53,11 @@ public class ShuffleServiceImpl extends ShuffleServiceImplBase {
     private final String baseShuffleDir;
 
     /**
-     * Optimized buffer size (64KB) selected to align with standard TCP frame
-     * sizes and minimize context switching during NIO operations.
+     * Optimized buffer size (65KB) selected to align with standard TCP frame
+     * sizes and guarantee that gRPC Protobuf envelopes safely fit inside
+     * the strict 65,535-byte default HTTP/2 flow-control window.
      */
-    private static final int CHUNK_SIZE_BYTES = 65536;
+    private static final int CHUNK_SIZE_BYTES = 65000;
 
     // PERFORMANCE OPTIMIZATION: Pre-compiled Regex
     // Eliminates the massive CPU penalty of compiling the validation regex on every request.
@@ -128,9 +129,6 @@ public class ShuffleServiceImpl extends ShuffleServiceImplBase {
         ServerCallStreamObserver<PartitionChunk> flowController =
                 (ServerCallStreamObserver<PartitionChunk>) responseObserver;
 
-        // PERFORMANCE OPTIMIZATION: Reactive Flow Control Monitor
-        // Defines a synchronized monitor that allows the gRPC network stack to
-        // instantly wake up the disk-reader thread when buffer capacity is available.
         final Object flowLock = new Object();
         flowController.setOnReadyHandler(() -> {
             synchronized (flowLock) {
@@ -138,19 +136,31 @@ public class ShuffleServiceImpl extends ShuffleServiceImplBase {
             }
         });
 
-        try (Stream<Path> filePaths = Files.list(partitionDir)) {
-            filePaths.filter(Files::isRegularFile)
-                    .forEach(file -> streamFileContent(file, flowController, flowLock));
-
-            if (!flowController.isCancelled()) {
-                responseObserver.onCompleted();
-                logger.info("Secure stream concluded for Partition {} (Job: {})", partitionId, safeJobId);
+        flowController.setOnCancelHandler(() -> {
+            synchronized (flowLock) {
+                flowLock.notifyAll();
             }
+        });
 
-        } catch (Exception e) {
-            logger.error("Internal streaming failure for directory: {}", partitionDir, e);
-            responseObserver.onError(io.grpc.Status.INTERNAL.withCause(e).asRuntimeException());
-        }
+        // gRPC Serializing Executor Deadlock Fix
+        // getPartition() runs on the gRPC thread. If we block this thread with flowLock.wait(),
+        // the setOnReadyHandler callback will NEVER execute because it is queued on the exact same thread.
+        // We must offload the blocking I/O to a dedicated thread so gRPC can process the wake-up signals!
+        new Thread(() -> {
+            try (Stream<Path> filePaths = Files.list(partitionDir)) {
+                filePaths.filter(Files::isRegularFile)
+                        .forEach(file -> streamFileContent(file, flowController, flowLock));
+
+                if (!flowController.isCancelled()) {
+                    responseObserver.onCompleted();
+                    logger.info("Secure stream concluded for Partition {} (Job: {})", partitionId, safeJobId);
+                }
+
+            } catch (Exception e) {
+                logger.error("Internal streaming failure for directory: {}", partitionDir, e);
+                responseObserver.onError(io.grpc.Status.INTERNAL.withCause(e).asRuntimeException());
+            }
+        }, "ESS-Stream-Worker-" + partitionId).start();
     }
 
     /**
