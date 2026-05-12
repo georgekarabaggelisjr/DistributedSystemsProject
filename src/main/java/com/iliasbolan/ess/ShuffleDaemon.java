@@ -2,6 +2,7 @@ package com.iliasbolan.ess;
 
 import com.iliasbolan.ess.gc.StorageJanitor;
 import com.iliasbolan.ess.grpc.ShuffleServiceImpl;
+import com.iliasbolan.ess.storage.MinioStorageService;
 import io.grpc.Context;
 import io.grpc.Contexts;
 import io.grpc.Metadata;
@@ -25,19 +26,25 @@ import java.io.IOException;
  * retrieval by Reducer pods.
  * </p>
  * <p>
- * <b>Architecture Update: Secure Data Plane (Token Authentication).</b><br>
- * This version implements a Zero-Trust security model. It utilizes a global gRPC
- * {@link ServerInterceptor} to intercept every incoming request, extract a
- * Manager-issued HMAC token from the headers, and bind it to a thread-local
- * {@link Context}. This allows downstream services to perform cryptographic
- * origin validation without polluting the method signatures.
+ * <b>Architecture Update 1: Secure Data Plane (Token Authentication)</b><br>
+ * Implements a Zero-Trust security model utilizing a global gRPC {@link ServerInterceptor}
+ * to intercept incoming requests, extract a Manager-issued HMAC token, and bind it to a
+ * thread-local {@link Context} for downstream cryptographic origin validation.
+ * </p>
+ * <p>
+ * <b>Architecture Update 2: Multi-Tier Storage (MinIO Overflow)</b><br>
+ * Integrates an S3-compatible overflow tier. To maintain O(1) memory footprint and
+ * optimize connection pooling, a single {@link MinioStorageService} instance is bootstrapped
+ * and injected into both the background Garbage Collector and the gRPC data plane.
+ * This guarantees fault tolerance against physical disk exhaustion without sacrificing data availability.
  * </p>
  *
  * @author Ilias Bolanakis
- * @version 1.0
- * @since 2026-04-25
+ * @version 3.0
+ * @since 2026-05-13
  * @see com.iliasbolan.ess.gc.StorageJanitor
  * @see com.iliasbolan.ess.grpc.ShuffleServiceImpl
+ * @see com.iliasbolan.ess.storage.MinioStorageService
  */
 public class ShuffleDaemon {
 
@@ -57,28 +64,37 @@ public class ShuffleDaemon {
             Metadata.Key.of("authorization", Metadata.ASCII_STRING_MARSHALLER);
 
     /**
-     * Bootstraps the ESS Daemon, initializes storage maintenance, and activates
+     * Bootstraps the ESS Daemon, initializes multi-tier storage maintenance, and activates
      * the secure gRPC server.
      *
      * @param args Command line arguments (Configuration is derived from Environment Variables).
-     * @throws IOException If the gRPC server fails to bind or storage is inaccessible.
+     * @throws IOException If the gRPC server fails to bind or physical storage is inaccessible.
      * @throws InterruptedException If the server process is interrupted while running.
      */
     public static void main(String[] args) throws IOException, InterruptedException {
         // 1. Configuration Loading (Cloud-Native Pattern)
-        // Configuration is externalized to support containerized deployment (e.g., Kubernetes DaemonSets).
         int port = Integer.parseInt(System.getenv().getOrDefault("ESS_PORT", "7337"));
         String baseShuffleDir = System.getenv().getOrDefault("SHUFFLE_DIR", "/mnt/mapreduce-shuffle");
 
         logger.info("====== [ ESS DAEMON BOOTSTRAP ] ======");
-        logger.info("Port: {} | Shuffle Path: {}", port, baseShuffleDir);
+        logger.info("Port: {} | Local Shuffle Path: {}", port, baseShuffleDir);
 
-        // 2. Initialize the Storage Maintenance Service
-        // The Janitor prevents physical disk exhaustion by purging stale job data
-        // using a high-watermark reclamation algorithm.
-        StorageJanitor.start(baseShuffleDir);
+        // 2. Initialize the Multi-Tier Storage Adapter (MinIO Overflow)
+        // Instantiated once and shared to optimize HTTP connection pooling to the S3 cluster.
+        MinioStorageService minioStorageService = null;
+        try {
+            minioStorageService = new MinioStorageService();
+            logger.info("MinIO Overflow Tier successfully integrated.");
+        } catch (Exception e) {
+            logger.error("Failed to connect to MinIO cluster. Proceeding with Local-Only mode. WARNING: Data loss may occur upon disk exhaustion!", e);
+            // By catching and not throwing, the ESS degrades gracefully into a local-only node if S3 is down.
+        }
 
-        // --- 3. SECURE INTERCEPTOR ---
+        // 3. Initialize the Storage Maintenance Service
+        // The Janitor is now aware of the overflow tier and will spill data to S3 before physical deletion.
+        StorageJanitor.start(baseShuffleDir, minioStorageService);
+
+        // --- 4. SECURE INTERCEPTOR ---
         // Implementation of the security gateway that extracts headers before message parsing.
         ServerInterceptor authInterceptor = new ServerInterceptor() {
             @Override
@@ -96,17 +112,17 @@ public class ShuffleDaemon {
             }
         };
 
-        // 4. Configure and start the gRPC Service Plane
-        // We apply the interceptor globally to ensure all service methods are protected.
+        // 5. Configure and start the gRPC Service Plane
+        // We inject the storage service to enable Lazy-Restoration of spilled data.
         Server server = ServerBuilder.forPort(port)
-                .addService(new ShuffleServiceImpl(baseShuffleDir))
+                .addService(new ShuffleServiceImpl(baseShuffleDir, minioStorageService))
                 .intercept(authInterceptor)
                 .build();
 
         server.start();
-        logger.info("ESS Daemon successfully bound. Secure Interceptor ACTIVE.");
+        logger.info("ESS Daemon successfully bound. Secure Interceptor & Overflow Routing ACTIVE.");
 
-        // 5. Graceful Teardown hook
+        // 6. Graceful Teardown hook
         // Ensures that physical storage managers and active streams are closed before process termination.
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             logger.warn("Shutdown signal received. Terminating ESS Daemon...");

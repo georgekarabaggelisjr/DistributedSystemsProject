@@ -2,6 +2,7 @@ package com.iliasbolan.ess.grpc;
 
 import com.google.protobuf.ByteString;
 import com.iliasbolan.ess.ShuffleDaemon;
+import com.iliasbolan.ess.storage.MinioStorageService;
 import com.iliasbolan.grpc.shuffle.PartitionChunk;
 import com.iliasbolan.grpc.shuffle.PartitionRequest;
 import com.iliasbolan.grpc.shuffle.ShuffleServiceGrpc.ShuffleServiceImplBase;
@@ -27,7 +28,7 @@ import java.util.regex.Pattern;
 import java.util.stream.Stream;
 
 /**
- * Concrete implementation of the gRPC Shuffle Streaming Service.
+ * Concrete implementation of the gRPC Shuffle Streaming Service with Multi-Tier Storage Support.
  * <p>
  * This service acts as the core high-performance data plane for the <b>External Shuffle Service (ESS)</b>.
  * It facilitates the reliable, asynchronous transfer of intermediate MapReduce data splits across
@@ -35,10 +36,15 @@ import java.util.stream.Stream;
  * </p>
  * <p>
  * <b>LZ4 Pass-Through Optimization:</b><br>
- * Upgraded to support an LZ4-only data plane. This service acts as a transparent binary pipeline,
- * streaming {@code .lz4} blocks from the local disk directly to the gRPC wire. By bypassing
- * decompression at the ESS layer, we preserve host CPU resources and ensure format integrity
- * for the Reducer nodes.
+ * This service acts as a transparent binary pipeline, streaming {@code .lz4} blocks from local disk
+ * directly to the gRPC wire. By bypassing decompression, we preserve host CPU resources and ensure format integrity.
+ * </p>
+ * <p>
+ * <b>Resilient Data Plane (MinIO Overflow):</b><br>
+ * Integrated with an S3-compatible overflow tier. If an inbound request targets a partition that
+ * has been evicted from the local physical disk by the Janitor, this service will automatically perform
+ * a Lazy-Restore, downloading the missing data from MinIO before fulfilling the stream. This prevents
+ * job failures for lagging straggler Reducers.
  * </p>
  * <p>
  * <b>Security Protocol: Zero-Trust Data Plane</b><br>
@@ -47,8 +53,8 @@ import java.util.stream.Stream;
  * </p>
  *
  * @author Ilias Bolanakis
- * @version 2.0
- * @since 2026-05-12
+ * @version 3.0
+ * @since 2026-05-13
  */
 public class ShuffleServiceImpl extends ShuffleServiceImplBase {
 
@@ -56,6 +62,9 @@ public class ShuffleServiceImpl extends ShuffleServiceImplBase {
 
     /** Root directory on the host filesystem where intermediate shuffle partitions are persisted. */
     private final String baseShuffleDir;
+
+    /** Cloud-native overflow storage client for retrieving evicted partition data. */
+    private final MinioStorageService minioStorageService;
 
     /**
      * Optimized buffer size (65KB) selected to align with standard TCP frame
@@ -65,7 +74,7 @@ public class ShuffleServiceImpl extends ShuffleServiceImplBase {
     private static final int CHUNK_SIZE_BYTES = 65000;
 
     /**
-     * Bounded thread pool for handling physical disk-to-network streaming operations.
+     * Bounded thread pool for handling physical disk-to-network streaming and S3 restoration.
      */
     private final ExecutorService streamingPool = Executors.newFixedThreadPool(100);
 
@@ -76,12 +85,14 @@ public class ShuffleServiceImpl extends ShuffleServiceImplBase {
     private final SecretKeySpec secretKeySpec;
 
     /**
-     * Constructs a new Shuffle Service implementation.
+     * Constructs a new Shuffle Service implementation with overflow tier integration.
      *
-     * @param baseShuffleDir Absolute or relative path to the local directory containing partitioned Map data.
+     * @param baseShuffleDir      Absolute or relative path to the local directory containing partitioned Map data.
+     * @param minioStorageService S3 adapter for restoring data evicted by the high-watermark Janitor.
      */
-    public ShuffleServiceImpl(String baseShuffleDir) {
+    public ShuffleServiceImpl(String baseShuffleDir, MinioStorageService minioStorageService) {
         this.baseShuffleDir = baseShuffleDir;
+        this.minioStorageService = minioStorageService;
 
         // Extract internal secret securely from the environment
         String secretKey = System.getenv().getOrDefault("ESS_SECRET_KEY", "dev-insecure-shared-secret");
@@ -92,7 +103,7 @@ public class ShuffleServiceImpl extends ShuffleServiceImplBase {
      * Streams a specific shuffle partition to a requesting Reducer pod.
      * <p>
      * Performs authorization and path sanitization, then offloads the heavy binary
-     * streaming of {@code .lz4} files to a dedicated worker pool.
+     * streaming and potential MinIO object restoration to a dedicated worker pool.
      * </p>
      *
      * @param request          The Protobuf message containing the requested JobId and PartitionId.
@@ -129,16 +140,9 @@ public class ShuffleServiceImpl extends ShuffleServiceImplBase {
             return;
         }
 
-        // 3. DATA LOCALIZATION
         Path partitionDir = Paths.get(baseShuffleDir, safeJobId, String.valueOf(partitionId));
 
-        if (!Files.exists(partitionDir)) {
-            logger.warn("Target partition directory missing: {}", partitionDir);
-            responseObserver.onCompleted();
-            return;
-        }
-
-        // 4. HIGH-PERFORMANCE STREAMING (Bounded Execution)
+        // 3. HIGH-PERFORMANCE STREAMING & ASYNC RESTORATION (Bounded Execution)
         ServerCallStreamObserver<PartitionChunk> flowController =
                 (ServerCallStreamObserver<PartitionChunk>) responseObserver;
 
@@ -155,23 +159,33 @@ public class ShuffleServiceImpl extends ShuffleServiceImplBase {
             }
         });
 
-        // I/O operations are offloaded to a bounded streaming pool to prevent OOM errors
+        // Disk I/O and S3 Networking operations are offloaded to a bounded streaming pool.
+        // This prevents massive blockages on the core gRPC Netty event loops.
         streamingPool.submit(() -> {
-            try (Stream<Path> filePaths = Files.list(partitionDir)) {
-                // Only stream compressed .lz4 files.
-                // This ensures binary integrity and avoids mixing formats during rolling updates.
-                filePaths.filter(p -> p.toString().endsWith(".lz4"))
-                        .forEach(file -> streamFileContent(file, flowController, flowLock));
+            try {
+                // TIERING LOGIC: If missing locally, block this worker thread to pull from S3
+                if (!Files.exists(partitionDir)) {
+                    logger.warn("Local cache miss for partition {}. Initiating MinIO overflow restore...", partitionDir);
+                    if (minioStorageService != null) {
+                        minioStorageService.restorePartition(safeJobId, partitionId, partitionDir);
+                    } else {
+                        throw new IOException("Data missing locally and MinIO overflow tier is not initialized.");
+                    }
+                }
 
-                // Ensure explicit stream closure after all files in the partition are sent.
-                // This resolves the "hanging stream" issue seen during large 11GB transfers.
-                if (!flowController.isCancelled()) {
-                    responseObserver.onCompleted();
-                    logger.info("Secure LZ4 stream concluded for Partition {} (Job: {})", partitionId, safeJobId);
+                // STREAMING LOGIC: Stream LZ4 files from local physical disk
+                try (Stream<Path> filePaths = Files.list(partitionDir)) {
+                    filePaths.filter(p -> p.toString().endsWith(".lz4"))
+                            .forEach(file -> streamFileContent(file, flowController, flowLock));
+
+                    if (!flowController.isCancelled()) {
+                        responseObserver.onCompleted();
+                        logger.info("Secure LZ4 stream concluded for Partition {} (Job: {})", partitionId, safeJobId);
+                    }
                 }
 
             } catch (Exception e) {
-                logger.error("Internal streaming failure for directory: {}", partitionDir, e);
+                logger.error("Internal streaming or restore failure for directory: {}", partitionDir, e);
                 responseObserver.onError(io.grpc.Status.INTERNAL.withCause(e).asRuntimeException());
             }
         });
@@ -228,7 +242,7 @@ public class ShuffleServiceImpl extends ShuffleServiceImplBase {
     private void streamFileContent(Path file, ServerCallStreamObserver<PartitionChunk> flowController, Object flowLock) {
         if (flowController.isCancelled()) return;
 
-        // Use direct buffer to minimize heap impact during 11GB+ transfers
+        // Use direct buffer to minimize heap impact during massive transfers
         ByteBuffer buffer = ByteBuffer.allocateDirect(CHUNK_SIZE_BYTES);
 
         try (FileChannel fileChannel = FileChannel.open(file, StandardOpenOption.READ)) {

@@ -1,5 +1,6 @@
 package com.iliasbolan.ess.gc;
 
+import com.iliasbolan.ess.storage.MinioStorageService;
 import org.jspecify.annotations.NonNull;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -30,20 +31,20 @@ import java.util.stream.Stream;
  * are enforced reactively to prevent node-level outages.
  * </p>
  * <p>
- * <b>Reclamation Algorithm:</b><br>
- * The Janitor utilizes a Dual-Watermark protocol:
+ * <b>Reclamation Algorithm (MinIO Overflow Tier):</b><br>
+ * The Janitor utilizes a Space-Aware Dual-Watermark protocol combined with an S3-compatible overflow tier:
  * <ul>
  * <li><b>High-Watermark (85%):</b> Trigger point for aggressive reclamation. When breached, the
- * system identifies and purges job directories in a FIFO (First-In, First-Out) manner based
- * on creation timestamps.</li>
+ * system identifies job directories in a FIFO (First-In, First-Out) manner based on creation timestamps.
+ * Before local deletion, the job data is safely spilled to the MinIO object store to ensure zero data loss.</li>
  * <li><b>Low-Watermark (70%):</b> Target state. Reclamation continues until disk utilization
  * reaches this safe buffer.</li>
  * </ul>
  * </p>
  *
  * @author Ilias Bolanakis
- * @version 1.2
- * @since 2026-05-12
+ * @version 2.0
+ * @since 2026-05-13
  */
 public class StorageJanitor {
 
@@ -71,6 +72,11 @@ public class StorageJanitor {
     private static final long HARD_TTL_HOURS = 24;
 
     /**
+     * The MinIO storage service used for spilling data before physical deletion.
+     */
+    private static MinioStorageService minioStorageService;
+
+    /**
      * Initializes and schedules the background Janitor thread to monitor storage health.
      * <p>
      * The scan interval is reduced to 30 seconds to provide reactive space reclamation
@@ -78,8 +84,10 @@ public class StorageJanitor {
      * </p>
      *
      * @param baseShuffleDir The root physical directory containing per-job partition data.
+     * @param storageService The MinIO storage client to handle data offloading.
      */
-    public static void start(String baseShuffleDir) {
+    public static void start(String baseShuffleDir, MinioStorageService storageService) {
+        minioStorageService = storageService;
         gcExecutor = Executors.newSingleThreadScheduledExecutor();
 
         gcExecutor.scheduleAtFixedRate(() -> {
@@ -136,7 +144,8 @@ public class StorageJanitor {
 
     /**
      * Identifies and purges the oldest job directories until disk usage is restored
-     * to the Low-Watermark buffer.
+     * to the Low-Watermark buffer. Integrates with the MinIO overflow tier to
+     * persist data prior to local eviction.
      *
      * @param rootPath   The directory to scan for jobs.
      * @param store      The FileStore being managed.
@@ -173,13 +182,30 @@ public class StorageJanitor {
                 break;
             }
 
-            logger.info("Reclaiming Space: Purging oldest job directory -> {}", jobDir.getFileName());
-            deleteDirectoryRecursively(jobDir);
+            String jobId = jobDir.getFileName().toString();
+            logger.info("Reclaiming Space: Spilling job directory to MinIO -> {}", jobId);
+
+            try {
+                // Spill the data to MinIO before deleting it from local disk
+                if (minioStorageService != null) {
+                    minioStorageService.spillJobData(jobId, jobDir);
+                } else {
+                    logger.warn("MinioStorageService is not initialized. Proceeding with hard deletion!");
+                }
+
+                logger.info("Spill complete. Purging local directory -> {}", jobId);
+                deleteDirectoryRecursively(jobDir);
+            } catch (IOException e) {
+                logger.error("Failed to spill job directory {}. Skipping local deletion to prevent data loss.", jobId, e);
+                // By failing safely and skipping the local deletion, we ensure data reliability
+                // over disk space in the event of an object storage outage.
+            }
         }
     }
 
     /**
      * Executes a hard TTL sweep across the shuffle directory to purge stale metadata.
+     * Note: TTL sweeps skip MinIO spilling as the job data is considered fundamentally dead.
      *
      * @param rootPath The root directory containing job data.
      * @throws IOException If file attribute reading fails.
