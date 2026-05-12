@@ -21,26 +21,33 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
 import java.security.MessageDigest;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
 
 /**
  * Concrete implementation of the gRPC Shuffle Streaming Service.
  * <p>
- * This service is the core of the <b>External Shuffle Service (ESS)</b>, providing
- * a high-performance data plane for Peer-to-Peer shuffle fetches. By utilizing
- * NIO Direct Buffers and Zero-Copy I/O concepts, it facilitates the transfer
- * of intermediate MapReduce data splits across the physical cluster network.
+ * This service acts as the core high-performance data plane for the <b>External Shuffle Service (ESS)</b>.
+ * It facilitates the reliable, asynchronous transfer of intermediate MapReduce data splits across
+ * physical cluster networks utilizing NIO Direct Buffers and Zero-Copy I/O concepts.
  * </p>
+ * * <h3>Security Protocol: Zero-Trust Data Plane</h3>
  * <p>
- * <b>Security Protocol: Zero-Trust Data Plane.</b><br>
- * Every request is subjected to cryptographic authorization. The service verifies
- * that the requester possesses a Manager-issued HMAC-SHA256 token, ensuring that
- * data is only served to authorized compute pods belonging to the same Job context.
+ * Every partition request is subjected to rigorous cryptographic authorization. The service verifies
+ * that the requester possesses a Manager-issued HMAC-SHA256 token matching the requested Job context.
+ * This guarantees data is only served to authorized compute pods.
+ * </p>
+ * * <h3>Concurrency & Durability</h3>
+ * <p>
+ * To prevent Native Memory Exhaustion (OOM) during massive concurrent reducer fetch requests,
+ * the streaming layer utilizes a bounded {@link java.util.concurrent.ExecutorService}. This ensures
+ * strict backpressure at the network edge, preventing the daemon from crashing under high load.
  * </p>
  *
  * @author Ilias Bolanakis
- * @version 1.2
+ * @version 1.3
  * @since 2026-04-25
  */
 public class ShuffleServiceImpl extends ShuffleServiceImplBase {
@@ -59,6 +66,13 @@ public class ShuffleServiceImpl extends ShuffleServiceImplBase {
      */
     private static final int CHUNK_SIZE_BYTES = 65000;
 
+    /**
+     * Bounded thread pool for handling physical disk-to-network streaming operations.
+     * Capping the concurrent streams stabilizes heap and native stack memory allocations,
+     * ensuring cluster survivability during massive parallel shuffle-fetch phases.
+     */
+    private final ExecutorService streamingPool = Executors.newFixedThreadPool(100);
+
     // PERFORMANCE OPTIMIZATION: Pre-compiled Regex
     // Eliminates the massive CPU penalty of compiling the validation regex on every request.
     private static final Pattern ID_PATTERN = Pattern.compile("^[a-zA-Z0-9\\-]+$");
@@ -70,20 +84,25 @@ public class ShuffleServiceImpl extends ShuffleServiceImplBase {
     /**
      * Constructs a new Shuffle Service implementation.
      *
-     * @param baseShuffleDir Path to the local directory containing partitioned Map data.
+     * @param baseShuffleDir Absolute or relative path to the local directory containing partitioned Map data.
      */
     public ShuffleServiceImpl(String baseShuffleDir) {
         this.baseShuffleDir = baseShuffleDir;
 
+        // Extract internal secret securely from the environment
         String secretKey = System.getenv().getOrDefault("ESS_SECRET_KEY", "dev-insecure-shared-secret");
         this.secretKeySpec = new SecretKeySpec(secretKey.getBytes(StandardCharsets.UTF_8), "HmacSHA256");
     }
 
     /**
      * Streams a specific shuffle partition to a requesting Reducer pod.
+     * <p>
+     * This method acts as a gateway. It performs authorization and path sanitization,
+     * then offloads the heavy blocking I/O stream processing to a dedicated worker pool.
+     * </p>
      *
-     * @param request          Contains the JobId and PartitionId to be fetched.
-     * @param responseObserver Stream observer for transmitting asynchronous {@link PartitionChunk} sequences.
+     * @param request          The Protobuf message containing the requested JobId and PartitionId.
+     * @param responseObserver The gRPC Stream observer for transmitting asynchronous {@link PartitionChunk} sequences.
      */
     @Override
     public void getPartition(PartitionRequest request, StreamObserver<PartitionChunk> responseObserver) {
@@ -125,7 +144,7 @@ public class ShuffleServiceImpl extends ShuffleServiceImplBase {
             return;
         }
 
-        // 4. HIGH-PERFORMANCE STREAMING
+        // 4. HIGH-PERFORMANCE STREAMING (Bounded Execution)
         ServerCallStreamObserver<PartitionChunk> flowController =
                 (ServerCallStreamObserver<PartitionChunk>) responseObserver;
 
@@ -143,10 +162,9 @@ public class ShuffleServiceImpl extends ShuffleServiceImplBase {
         });
 
         // gRPC Serializing Executor Deadlock Fix
-        // getPartition() runs on the gRPC thread. If we block this thread with flowLock.wait(),
-        // the setOnReadyHandler callback will NEVER execute because it is queued on the exact same thread.
-        // We must offload the blocking I/O to a dedicated thread so gRPC can process the wake-up signals!
-        new Thread(() -> {
+        // I/O operations are offloaded to a bounded streaming pool to prevent OOM errors
+        // while allowing gRPC network threads to continue processing wake-up signals.
+        streamingPool.submit(() -> {
             try (Stream<Path> filePaths = Files.list(partitionDir)) {
                 filePaths.filter(Files::isRegularFile)
                         .forEach(file -> streamFileContent(file, flowController, flowLock));
@@ -160,14 +178,15 @@ public class ShuffleServiceImpl extends ShuffleServiceImplBase {
                 logger.error("Internal streaming failure for directory: {}", partitionDir, e);
                 responseObserver.onError(io.grpc.Status.INTERNAL.withCause(e).asRuntimeException());
             }
-        }, "ESS-Stream-Worker-" + partitionId).start();
+        });
     }
 
     /**
      * Validates structural identifiers to prevent Arbitrary Path Traversal attacks.
      *
      * @param input The untrusted JobId provided by the gRPC client.
-     * @return The validated and sanitized ID.
+     * @return The validated and sanitized alphanumeric ID.
+     * @throws SecurityException If the input contains illegal characters (e.g., "../").
      */
     private String sanitizeId(String input) {
         if (input == null || !ID_PATTERN.matcher(input).matches()) {
@@ -179,8 +198,9 @@ public class ShuffleServiceImpl extends ShuffleServiceImplBase {
     /**
      * Computes an HMAC-SHA256 signature to validate the request origin.
      *
-     * @param data The Job ID to sign.
-     * @return A hexadecimal string representation of the HMAC signature.
+     * @param data The Job ID to cryptographically sign.
+     * @return A hexadecimal string representation of the securely computed HMAC signature.
+     * @throws RuntimeException If the underlying JVM does not support HMAC-SHA256.
      */
     private String computeHmacSha256(String data) {
         try {
@@ -201,11 +221,16 @@ public class ShuffleServiceImpl extends ShuffleServiceImplBase {
     }
 
     /**
-     * Streams the content of a physical file using NIO Direct Buffers.
+     * Streams the physical content of a single file segment using NIO Direct Buffers.
+     * <p>
+     * Utilizes an active wait-loop tied to the gRPC stream state, guaranteeing that disk reads
+     * are instantly paused if the network buffer is full (backpressure application).
+     * </p>
      *
-     * @param file           The physical file segment to stream.
-     * @param flowController The gRPC observer controlling the network flow.
-     * @param flowLock       The synchronized monitor for instant thread resumption.
+     * @param file           The physical file segment path to stream to the client.
+     * @param flowController The gRPC observer managing the underlying HTTP/2 network flow.
+     * @param flowLock       The synchronized monitor object utilized for instant thread resumption.
+     * @throws RuntimeException If an IO exception occurs while reading the physical disk channel.
      */
     private void streamFileContent(Path file, ServerCallStreamObserver<PartitionChunk> flowController, Object flowLock) {
         if (flowController.isCancelled()) return;
@@ -220,7 +245,7 @@ public class ShuffleServiceImpl extends ShuffleServiceImplBase {
                 synchronized (flowLock) {
                     while (!flowController.isReady() && !flowController.isCancelled()) {
                         try {
-                            flowLock.wait(); // Eliminates the 5ms penalty. Sleeps until strictly necessary.
+                            flowLock.wait(); // Eliminates the CPU penalty. Sleeps until strictly necessary.
                         } catch (InterruptedException e) {
                             Thread.currentThread().interrupt();
                             return;
@@ -242,10 +267,10 @@ public class ShuffleServiceImpl extends ShuffleServiceImplBase {
     }
 
     /**
-     * Packages a ByteBuffer into a gRPC message and transmits it to the peer.
+     * Packages an initialized ByteBuffer into a gRPC Protobuf envelope and transmits it to the peer.
      *
-     * @param buffer   The direct buffer containing file segment data.
-     * @param observer The destination stream observer.
+     * @param buffer   The populated direct buffer containing file segment data.
+     * @param observer The destination stream observer handling outbound messages.
      */
     private void transmitChunk(ByteBuffer buffer, StreamObserver<PartitionChunk> observer) {
         observer.onNext(PartitionChunk.newBuilder()
