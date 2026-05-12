@@ -191,8 +191,13 @@ public class TaskExecutor {
         Files.createDirectories(rawDataDir);
 
         try {
-            List<String> endpoints = payload.workerEndpoints();
-            logger.info("Initiating SECURE gRPC P2P transfer from {} ESS nodes...", endpoints.size());
+            // Deduplicate P2P Endpoints
+            // Prevents exponential redundant data fetching on single-node or dense clusters.
+            List<String> rawEndpoints = payload.workerEndpoints();
+            java.util.Set<String> uniqueEndpoints = new java.util.HashSet<>(rawEndpoints);
+            List<String> endpoints = new java.util.ArrayList<>(uniqueEndpoints);
+
+            logger.info("Initiating SECURE gRPC P2P transfer from {} unique ESS nodes...", endpoints.size());
 
             for (int i = 0; i < endpoints.size(); i++) {
                 String endpoint = endpoints.get(i);
@@ -276,6 +281,10 @@ public class TaskExecutor {
 
         ProcessBuilder pb = new ProcessBuilder(
                 javaBin,
+                "-XX:+UseContainerSupport",
+                "-XX:MaxRAMPercentage=50.0" , // REDUCED from 75.0 to 50.0 to guarantee survival alongside the Parent JVM
+                "-XX:MaxMetaspaceSize=64m", // Hardcap Metaspace to prevent native memory leaks
+                "-Djava.util.concurrent.ForkJoinPool.common.parallelism=4",
                 "-cp", classpath,
                 "com.iliasbolan.engine.execution.SandboxRunner",
                 payloadFile.toAbsolutePath().toString(),

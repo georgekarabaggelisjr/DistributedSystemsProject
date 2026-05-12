@@ -172,7 +172,7 @@ public class S3ClientService {
                 ByteArrayOutputStream lineBuffer = new ByteArrayOutputStream(256);
 
                 // OOM SECURITY GUARD: Prevent infinite heap buffering on malformed data
-                final int MAX_LINE_SIZE_BYTES = 10 * 1024 * 1024; // 10MB limit
+                final int MAX_LINE_SIZE_BYTES = 100 * 1024 * 1024; // 100MB limit
                 int b;
 
                 while ((b = stream.read()) != -1) {
