@@ -24,6 +24,12 @@ import java.util.stream.Stream;
  * disk utilization of the underlying {@link FileStore}.
  * </p>
  * <p>
+ * <b>High-Resolution Monitoring (LZ4 Optimization):</b><br>
+ * Updated to a 30-second polling interval. In environments processing large (11GB+) payloads,
+ * disk usage can escalate rapidly. This higher resolution ensures that the reclamation watermarks
+ * are enforced reactively to prevent node-level outages.
+ * </p>
+ * <p>
  * <b>Reclamation Algorithm:</b><br>
  * The Janitor utilizes a Dual-Watermark protocol:
  * <ul>
@@ -34,15 +40,10 @@ import java.util.stream.Stream;
  * reaches this safe buffer.</li>
  * </ul>
  * </p>
- * <p>
- * <b>Fault Tolerance:</b><br>
- * As a safety fallback, the service also performs a daily "Hard TTL" sweep to ensure that
- * stale job data from crashed or abandoned orchestration sequences does not persist indefinitely.
- * </p>
  *
  * @author Ilias Bolanakis
- * @version 1.1
- * @since 2026-04-25
+ * @version 1.2
+ * @since 2026-05-12
  */
 public class StorageJanitor {
 
@@ -72,8 +73,8 @@ public class StorageJanitor {
     /**
      * Initializes and schedules the background Janitor thread to monitor storage health.
      * <p>
-     * The service performs a state check every 15 minutes, which provides a balance
-     * between storage responsiveness and CPU overhead on the physical node.
+     * The scan interval is reduced to 30 seconds to provide reactive space reclamation
+     * for large-scale data spikes associated with 11GB+ shuffle payloads.
      * </p>
      *
      * @param baseShuffleDir The root physical directory containing per-job partition data.
@@ -98,7 +99,7 @@ public class StorageJanitor {
 
                 // Trigger aggressive reclamation if High-Watermark is reached
                 if (usedPercentage >= HIGH_WATERMARK_PERCENT) {
-                    logger.warn("HIGH WATERMARK BREACHED ({}%). Initiating aggressive space reclamation...", Math.round(usedPercentage * 100));
+                    logger.warn("HIGH WATERMARK BREACHED ({}%). Running reactive space reclamation...", Math.round(usedPercentage * 100));
                     reclaimSpace(rootPath, store, totalSpace);
                 }
 
@@ -106,9 +107,9 @@ public class StorageJanitor {
                 purgeHardTtl(rootPath);
 
             } catch (IOException e) {
-                logger.error("Janitor Service failed to access FileStore metrics: {}", e.getMessage());
+                logger.error("Janitor Service failure: {}", e.getMessage());
             }
-        }, 1, 15, TimeUnit.MINUTES);
+        }, 10, 30, TimeUnit.SECONDS); // Polling resolution increased to 30 seconds
     }
 
     /**
@@ -121,8 +122,7 @@ public class StorageJanitor {
     }
 
     /**
-     * Temporary data structure to hold file paths and their pre-fetched creation times,
-     * allowing for O(N) disk reads instead of O(N log N) during sorting.
+     * Temporary data structure for O(N) timestamp-based sorting.
      */
     private static class JobDirectory {
         final Path path;
@@ -137,11 +137,6 @@ public class StorageJanitor {
     /**
      * Identifies and purges the oldest job directories until disk usage is restored
      * to the Low-Watermark buffer.
-     * <p>
-     * <b>Performance Optimization:</b> Utilizes the Decorate-Sort-Undecorate pattern.
-     * Creation times are pre-fetched into a wrapper object before sorting to guarantee
-     * exactly O(N) disk I/O reads, preventing severe disk thrashing during cluster cleanup.
-     * </p>
      *
      * @param rootPath   The directory to scan for jobs.
      * @param store      The FileStore being managed.
@@ -159,11 +154,11 @@ public class StorageJanitor {
                             long time = Files.readAttributes(p, BasicFileAttributes.class).creationTime().toMillis();
                             return new JobDirectory(p, time);
                         } catch (IOException e) {
-                            return new JobDirectory(p, Long.MAX_VALUE); // Place errors at the end
+                            return new JobDirectory(p, Long.MAX_VALUE);
                         }
                     })
-                    .sorted(Comparator.comparingLong(jd -> jd.creationTime)) // Sort purely in RAM
-                    .map(jd -> jd.path) // Extract the path back out
+                    .sorted(Comparator.comparingLong(jd -> jd.creationTime))
+                    .map(jd -> jd.path)
                     .collect(Collectors.toList());
         }
 
@@ -184,8 +179,7 @@ public class StorageJanitor {
     }
 
     /**
-     * Executes a hard TTL sweep across the shuffle directory to purge stale metadata
-     * exceeding the {@code HARD_TTL_HOURS} limit.
+     * Executes a hard TTL sweep across the shuffle directory to purge stale metadata.
      *
      * @param rootPath The root directory containing job data.
      * @throws IOException If file attribute reading fails.
@@ -197,7 +191,6 @@ public class StorageJanitor {
             for (Path jobDir : stream) {
                 if (Files.isDirectory(jobDir)) {
                     BasicFileAttributes attrs = Files.readAttributes(jobDir, BasicFileAttributes.class);
-                    // Targeted purge of jobs older than the absolute threshold
                     if (attrs.creationTime().toMillis() < cutoff) {
                         logger.info("Hard TTL Expired for Job: {}. Purging data...", jobDir.getFileName());
                         deleteDirectoryRecursively(jobDir);
@@ -209,10 +202,6 @@ public class StorageJanitor {
 
     /**
      * Performs a high-performance recursive deletion of a directory and all nested contents.
-     * <p>
-     * Utilizes {@link Files#walkFileTree} to ensure that file deletions are handled correctly
-     * before their parent directories are processed.
-     * </p>
      *
      * @param root The directory path to delete.
      * @throws IOException If any file deletion or directory traversal operation fails.
