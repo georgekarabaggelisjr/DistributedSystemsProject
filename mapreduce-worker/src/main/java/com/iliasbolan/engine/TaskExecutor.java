@@ -25,6 +25,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
 import java.util.Iterator;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
@@ -37,6 +38,13 @@ import java.util.concurrent.TimeUnit;
  * gRPC-based data transfers, and delegation to isolated ephemeral sandbox environments.
  * </p>
  * <p>
+ * <b>Architecture Update: Atomic Stream Fetching (LZ4 Integrity)</b><br>
+ * To prevent binary corruption during massive 11GB+ parallel shuffles, gRPC streams
+ * are initially persisted to temporary ({@code .tmp}) files. The system performs an
+ * atomic OS-level rename to {@code .lz4} strictly upon successful stream completion,
+ * guaranteeing that the Sorter only processes fully finalized frames.
+ * </p>
+ * <p>
  * <b>Architecture Update: Global Ephemeral Bounding</b><br>
  * All ephemeral files (Bytecode, Payloads, Raw gRPC Streams) are strictly confined
  * to the {@code baseShuffleDir/{jobId}/} directory. This guarantees that the
@@ -44,8 +52,8 @@ import java.util.concurrent.TimeUnit;
  * </p>
  *
  * @author Ilias Bolanakis
- * @version 2.2
- * @since 2026-04-25
+ * @version 2.3
+ * @since 2026-05-12
  */
 public class TaskExecutor {
 
@@ -210,7 +218,13 @@ public class TaskExecutor {
                         .keepAliveTime(30, TimeUnit.SECONDS)
                         .build();
 
-                try (BufferedOutputStream bos = new BufferedOutputStream(new FileOutputStream(rawDataDir.resolve("grpc_stream_" + i + ".txt").toFile()))) {
+                // Atomic File Writes
+                // Write to a temporary file first to prevent LZ4 frame corruption
+                // resulting from incomplete or interleaved gRPC streams.
+                Path tmpPath = rawDataDir.resolve("grpc_stream_" + i + ".tmp");
+                Path finalPath = rawDataDir.resolve("grpc_stream_" + i + ".lz4");
+
+                try (BufferedOutputStream bos = new BufferedOutputStream(new FileOutputStream(tmpPath.toFile()))) {
                     Metadata header = new Metadata();
                     header.put(AUTH_KEY, payload.jobToken());
 
@@ -228,6 +242,7 @@ public class TaskExecutor {
                         chunkStream.next().getContent().writeTo(bos);
                     }
                 } catch (StatusRuntimeException grpcEx) {
+                    Files.deleteIfExists(tmpPath); // Eagerly purge the corrupted partial stream
                     String lostTaskId = "map-chunk-" + i;
                     logger.warn("P2P Data Loss Detected! Triggering Lineage Recovery for {}.", lostTaskId);
 
@@ -235,10 +250,17 @@ public class TaskExecutor {
                     eventProducer.sendErrorSignal(safeJobId, safeTaskId, payload.jobToken(), "FAILED", errorPayload);
                     return;
                 } catch (Exception e) {
+                    Files.deleteIfExists(tmpPath); // Eagerly purge the corrupted partial stream
                     logger.error("Critical gRPC shuffle failure at node {}", endpoint, e);
                     throw new RuntimeException(e);
                 } finally {
                     channel.shutdown().awaitTermination(5, TimeUnit.SECONDS);
+                }
+
+                // If the try-block completed without throwing, the stream is fully intact.
+                // Atomically assign the .lz4 extension, signaling readiness to the Sorter.
+                if (Files.exists(tmpPath)) {
+                    Files.move(tmpPath, finalPath, StandardCopyOption.ATOMIC_MOVE);
                 }
             }
 
@@ -246,7 +268,7 @@ public class TaskExecutor {
             Files.createDirectories(payloadFile.getParent());
             Files.writeString(payloadFile, rawJson);
 
-            logger.info("Streams persisted. Delegating aggregation to Sandbox...");
+            logger.info("Streams persisted and validated atomically. Delegating aggregation to Sandbox...");
             runSandbox(payloadFile, payload);
 
             eventProducer.sendCompletionSignal(safeJobId, safeTaskId, payload.jobToken(), "COMPLETED", null);

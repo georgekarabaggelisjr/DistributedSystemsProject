@@ -113,55 +113,61 @@ public class SandboxRunner {
     /**
      * Orchestrates the execution of a Map task within the isolated sandbox boundary.
      * <p>
-     * Dynamically loads the user's {@link Mapper} implementation and streams the target payload
-     * from S3 into memory. To balance network efficiency with heap protection, it utilizes
-     * an <b>I/O Optimized Sub-Chunking Pattern</b> to slice massive datasets into safe 128MB batches.
-     * Each batch is submitted to the {@link ForkJoinPool} for work-stealing execution and
-     * instantly flushed to disk via the thread-safe Partitioner.
+     * This method handles the lifecycle of the Map phase by dynamically loading user code,
+     * managing memory-safe S3 data ingestion, and ensuring high-performance disk spills.
+     * </p>
+     * <p>
+     * <b>Performance Optimization: Stream Persistence</b><br>
+     * Utilizes a try-with-resources block to manage the {@link ShufflePartitioner}. This
+     * allows the partitioner to maintain persistent LZ4 streams across all sub-chunks,
+     * eliminating the "Stream Thrashing" overhead caused by repeated frame initialization.
+     * Final LZ4 footers and file handles are released automatically upon method conclusion.
      * </p>
      *
-     * @param payload        The deserialized task instructions and metadata containing multi-tenant S3 targets.
+     * @param payload        The deserialized task instructions containing S3 targets and job metadata.
      * @param localCodeDir   The local directory containing the dynamically loaded user bytecode.
      * @param baseShuffleDir The root local directory for persisting intermediate partitioned data.
      * @param s3             The configured service client for interacting with S3-compatible storage.
      * @throws Throwable If class loading, data retrieval, or parallel execution encounters a fatal error.
      */
     private static void executeMap(TaskPayload payload, String localCodeDir, String baseShuffleDir, S3ClientService s3) throws Throwable {
+        // Dynamically load the Mapper implementation from the localized sandbox directory
         Mapper mapper = DynamicClassLoader.loadMapper(localCodeDir, payload.className());
 
-        // Initialize the partitioner once to manage parallel disk spills across all sub-chunks
-        ShufflePartitioner partitioner = new ShufflePartitioner(
-                baseShuffleDir, payload.jobId(), payload.taskId(), payload.numReducers());
+        // Initialize the partitioner within try-with-resources to ensure reliable stream finalization
+        try (ShufflePartitioner partitioner = new ShufflePartitioner(
+                baseShuffleDir, payload.jobId(), payload.taskId(), payload.numReducers())) {
 
-        // OOM SECURITY GUARD: I/O Optimized Sub-Chunking
-        // Balances MinIO network calls with heap protection. Caps physical RAM ingestion at 32MB
-        // to comfortably fit within the 1.5GB Sandbox limit, even when Orchestrator payloads exceed 1GB.
-        long remainingBytes = payload.byteLength();
-        long currentLogicalOffset = payload.byteOffset();
-        final long SUB_CHUNK_MAX_SIZE = 32 * 1024 * 1024; // 32MB physical memory limit per slice
+            // OOM SECURITY GUARD: I/O Optimized Sub-Chunking
+            // Slices massive datasets into safe 32MB physical RAM slices to stay within the Sandbox heap limits.
+            long remainingBytes = payload.byteLength();
+            long currentLogicalOffset = payload.byteOffset();
+            final long SUB_CHUNK_MAX_SIZE = 32 * 1024 * 1024;
 
-        logger.info("Initiating bounded Map execution. Total bytes to process: {}", remainingBytes);
+            logger.info("Initiating high-performance Map execution. Total bytes to process: {}", remainingBytes);
 
-        while (remainingBytes > 0) {
-            long fetchSize = Math.min(remainingBytes, SUB_CHUNK_MAX_SIZE);
-            logger.info("Fetching sub-chunk at offset {}, size {} bytes", currentLogicalOffset, fetchSize);
+            while (remainingBytes > 0) {
+                long fetchSize = Math.min(remainingBytes, SUB_CHUNK_MAX_SIZE);
+                logger.info("Fetching sub-chunk at offset {}, size {} bytes", currentLogicalOffset, fetchSize);
 
-            // The multi-tenant logic is fully respected here
-            List<String> records = s3.readDataChunk(
-                    payload.bucketName(), payload.objectName(), currentLogicalOffset, fetchSize);
+                // Stream the record batch directly from S3-compatible storage
+                List<String> records = s3.readDataChunk(
+                        payload.bucketName(), payload.objectName(), currentLogicalOffset, fetchSize);
 
-            if (!records.isEmpty()) {
-                // Submit the safe 128MB memory footprint to the ForkJoinPool
-                MapTaskProcessor rootMapTask = new MapTaskProcessor(records, 0, records.size(), mapper, partitioner);
-                ForkJoinPool.commonPool().invoke(rootMapTask);
+                if (!records.isEmpty()) {
+                    // Submit the record batch to the Fork/Join Pool for parallel execution.
+                    // The partitioner instance is shared across all batches to maximize LZ4 frame efficiency.
+                    MapTaskProcessor rootMapTask = new MapTaskProcessor(records, 0, records.size(), mapper, partitioner);
+                    ForkJoinPool.commonPool().invoke(rootMapTask);
+                }
+
+                // Advance logical pointers for the next safe slice
+                currentLogicalOffset += fetchSize;
+                remainingBytes -= fetchSize;
             }
+        } // partitioner.close() is automatically invoked here, flushing all LZ4 buffers to disk
 
-            // Advance logical pointers for the next safe slice
-            currentLogicalOffset += fetchSize;
-            remainingBytes -= fetchSize;
-        }
-
-        logger.info("Sub-chunk processing complete for task {}.", payload.taskId());
+        logger.info("All sub-chunks processed and compressed for task {}.", payload.taskId());
     }
 
     /**
