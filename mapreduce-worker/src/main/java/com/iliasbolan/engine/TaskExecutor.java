@@ -301,12 +301,18 @@ public class TaskExecutor {
         String javaBin = Paths.get(javaHome, "bin", "java").toString();
         String classpath = System.getProperty("java.class.path");
 
+        // Dynamically calculate the target thread count (matching the Processors' math)
+        int vCpus = Runtime.getRuntime().availableProcessors();
+        double factor = Double.parseDouble(System.getenv().getOrDefault("PARALLELISM_FACTOR", "2.0"));
+        int targetThreads = (int) Math.ceil(vCpus * factor);
+
+        // Inject the dynamic targetThreads into the ProcessBuilder
         ProcessBuilder pb = new ProcessBuilder(
                 javaBin,
                 "-XX:+UseContainerSupport",
-                "-XX:MaxRAMPercentage=50.0" , // REDUCED from 75.0 to 50.0 to guarantee survival alongside the Parent JVM
-                "-XX:MaxMetaspaceSize=64m", // Hardcap Metaspace to prevent native memory leaks
-                "-Djava.util.concurrent.ForkJoinPool.common.parallelism=4",
+                "-XX:MaxRAMPercentage=50.0" ,
+                "-XX:MaxMetaspaceSize=64m",
+                "-Djava.util.concurrent.ForkJoinPool.common.parallelism=" + targetThreads, // <--- THE FIX
                 "-cp", classpath,
                 "com.iliasbolan.engine.execution.SandboxRunner",
                 payloadFile.toAbsolutePath().toString(),
