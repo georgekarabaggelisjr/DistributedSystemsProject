@@ -224,7 +224,7 @@ public class TaskExecutor {
                 Path tmpPath = rawDataDir.resolve("grpc_stream_" + i + ".tmp");
                 Path finalPath = rawDataDir.resolve("grpc_stream_" + i + ".lz4");
 
-                try (BufferedOutputStream bos = new BufferedOutputStream(new FileOutputStream(tmpPath.toFile()))) {
+                try (BufferedOutputStream bos = new BufferedOutputStream(new FileOutputStream(tmpPath.toFile()), 1024 * 1024)) {
                     Metadata header = new Metadata();
                     header.put(AUTH_KEY, payload.jobToken());
 

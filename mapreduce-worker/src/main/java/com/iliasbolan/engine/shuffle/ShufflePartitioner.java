@@ -2,6 +2,7 @@ package com.iliasbolan.engine.shuffle;
 
 import com.iliasbolan.core.KeyValuePair;
 import net.jpountz.lz4.LZ4FrameOutputStream;
+import net.jpountz.lz4.LZ4FrameOutputStream.BLOCKSIZE;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -89,7 +90,7 @@ public class ShufflePartitioner implements AutoCloseable {
         OutputStream os = Files.newOutputStream(filePath,
                 StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
 
-        LZ4FrameOutputStream lz4os = new LZ4FrameOutputStream(os);
+        LZ4FrameOutputStream lz4os = new LZ4FrameOutputStream(os, BLOCKSIZE.SIZE_4MB);
         BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(lz4os, StandardCharsets.UTF_8));
 
         writerCache.put(partitionIndex, writer);
@@ -97,7 +98,7 @@ public class ShufflePartitioner implements AutoCloseable {
     }
 
     @Override
-    public void close() throws IOException {
+    public void close() {
         logger.info("Finalizing LZ4 partitions for task: {}", mapTaskId);
         for (BufferedWriter writer : writerCache.values()) {
             try {
