@@ -113,9 +113,11 @@ public class RabbitMqConsumer {
         try (Connection connection = connectionManager.createConnection();
              Channel channel = connection.createChannel()) {
 
-            // Define DLX arguments to prevent message loss on repeated failures
+            // Define DLX arguments and align Idempotent parameters with Orchestrator optimizations
             java.util.Map<String, Object> queueArgs = new java.util.HashMap<>();
             queueArgs.put("x-dead-letter-exchange", "dead_letter_exchange");
+            queueArgs.put("x-queue-mode", "lazy");     // Crucial: Must match Python publisher to avoid PRECONDITION_FAILED
+            queueArgs.put("x-expires", 86400000);      // 24-hour autonomous garbage collection
 
             channel.queueDeclare(queueName, true, false, false, queueArgs);
 
