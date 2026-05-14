@@ -12,6 +12,8 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.SimpleFileVisitor;
 import java.nio.file.attribute.BasicFileAttributes;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * Enterprise-grade MinIO Storage adapter for the External Shuffle Service (ESS) overflow tier.
@@ -22,9 +24,15 @@ import java.nio.file.attribute.BasicFileAttributes;
  * allowing KEDA-driven ephemeral job pods to scale down or terminate in multitenant environments
  * without causing data loss for lagging Reducers.
  * </p>
+ * <p>
+ * <b>Performance Architecture:</b><br>
+ * Utilizes direct physical-to-network streaming for O(1) memory OOM protection during massive
+ * spills, and employs parallel concurrent streams during restoration to maximize bandwidth
+ * saturation and minimize Reducer wait times.
+ * </p>
  *
  * @author Ilias Bolanakis
- * @version 1.0
+ * @version 2.0
  * @since 2026-05-13
  */
 public class MinioStorageService {
@@ -111,11 +119,10 @@ public class MinioStorageService {
     /**
      * Restores all partition segments from the MinIO overflow bucket back to the physical disk.
      * <p>
-     * <b>Production-Ready Logic:</b> Unlike basic implementations that assume a single file,
-     * this method performs a prefix-based scan of the bucket. It identifies all object segments
-     * belonging to the specific Job/Partition hierarchy and streams them down to the local
-     * filesystem. This ensures compatibility with MapReduce engines that produce multiple
-     * spill files per partition.
+     * <b>Concurrent Restoration Logic:</b> Performs a prefix-based scan of the bucket to identify
+     * all object segments belonging to the specific Job/Partition hierarchy. It then leverages
+     * a parallel stream to download all segments concurrently, saturating the network interface
+     * to drastically reduce cache-miss latency for the waiting Reducer.
      * </p>
      *
      * @param jobId       The unique identifier for the MapReduce job.
@@ -127,7 +134,7 @@ public class MinioStorageService {
         // Construct the prefix: e.g., "job-123/0/"
         String objectPrefix = jobId + "/" + partitionId + "/";
 
-        logger.info("Initiating multi-segment restoration from MinIO for Job: {}, Partition: {}", jobId, partitionId);
+        logger.info("Initiating multi-segment concurrent restoration from MinIO for Job: {}, Partition: {}", jobId, partitionId);
 
         try {
             // Ensure the local directory structure exists
@@ -142,36 +149,44 @@ public class MinioStorageService {
                             .build()
             );
 
-            int segmentCount = 0;
+            // Buffer items to enable parallel stream processing
+            List<Item> itemsToDownload = new ArrayList<>();
             for (Result<Item> result : results) {
-                Item item = result.get();
-                String objectName = item.objectName();
-
-                // 2. Extract the filename from the object path to preserve naming
-                // Path.of(objectName).getFileName() handles the conversion from S3 keys to local paths
-                Path fileName = Path.of(objectName).getFileName();
-                Path targetFile = targetDir.resolve(fileName);
-
-                logger.debug("Downloading segment: {} -> {}", objectName, targetFile);
-
-                // 3. Perform optimized download
-                // downloadObject utilizes internal stream-chunking to maintain O(1) memory overhead
-                minioClient.downloadObject(
-                        DownloadObjectArgs.builder()
-                                .bucket(bucketName)
-                                .object(objectName)
-                                .filename(targetFile.toAbsolutePath().toString())
-                                .build()
-                );
-                segmentCount++;
+                itemsToDownload.add(result.get());
             }
+
+            int segmentCount = itemsToDownload.size();
 
             if (segmentCount == 0) {
                 logger.warn("Restore requested for Job {} Partition {}, but no objects were found in MinIO prefix: {}",
                         jobId, partitionId, objectPrefix);
-            } else {
-                logger.info("Successfully restored {} segments for Partition {} from overflow tier.", segmentCount, partitionId);
+                return;
             }
+
+            // 2. Perform highly concurrent downloads via parallel execution
+            itemsToDownload.parallelStream().forEach(item -> {
+                try {
+                    String objectName = item.objectName();
+
+                    // Extract the filename from the object path to preserve naming
+                    Path targetFile = targetDir.resolve(Path.of(objectName).getFileName());
+
+                    logger.debug("Downloading segment concurrently: {} -> {}", objectName, targetFile);
+
+                    // downloadObject utilizes internal stream-chunking to maintain O(1) memory overhead
+                    minioClient.downloadObject(
+                            DownloadObjectArgs.builder()
+                                    .bucket(bucketName)
+                                    .object(objectName)
+                                    .filename(targetFile.toAbsolutePath().toString())
+                                    .build()
+                    );
+                } catch (Exception e) {
+                    throw new RuntimeException("Failed to download segment concurrently: " + item.objectName(), e);
+                }
+            });
+
+            logger.info("Successfully restored {} segments concurrently for Partition {} from overflow tier.", segmentCount, partitionId);
 
         } catch (Exception e) {
             logger.error("Critical failure during MinIO partition restoration: Job {} Partition {}", jobId, partitionId, e);

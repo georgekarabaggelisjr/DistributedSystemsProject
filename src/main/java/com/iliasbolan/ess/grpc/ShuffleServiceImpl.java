@@ -24,6 +24,7 @@ import java.nio.file.StandardOpenOption;
 import java.security.MessageDigest;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Semaphore;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
 
@@ -35,6 +36,14 @@ import java.util.stream.Stream;
  * physical cluster networks utilizing NIO Direct Buffers and Zero-Copy I/O concepts.
  * </p>
  * <p>
+ * <b>Unbounded Concurrency & Bounded I/O Architecture:</b><br>
+ * Utilizes Java Virtual Threads to handle an effectively unlimited number of concurrent gRPC requests
+ * without JVM heap exhaustion or Netty thread-pool starvation. To protect the underlying OS (File Descriptors)
+ * and upstream MinIO clusters (HTTP Connection Pools) from resource exhaustion, physical I/O execution
+ * is strictly gated by a fair-queued {@link Semaphore}. Virtual threads yield their carrier threads
+ * at zero cost while waiting in the queue.
+ * </p>
+ * <p>
  * <b>LZ4 Pass-Through Optimization:</b><br>
  * This service acts as a transparent binary pipeline, streaming {@code .lz4} blocks from local disk
  * directly to the gRPC wire. By bypassing decompression, we preserve host CPU resources and ensure format integrity.
@@ -43,17 +52,11 @@ import java.util.stream.Stream;
  * <b>Resilient Data Plane (MinIO Overflow):</b><br>
  * Integrated with an S3-compatible overflow tier. If an inbound request targets a partition that
  * has been evicted from the local physical disk by the Janitor, this service will automatically perform
- * a Lazy-Restore, downloading the missing data from MinIO before fulfilling the stream. This prevents
- * job failures for lagging straggler Reducers.
- * </p>
- * <p>
- * <b>Security Protocol: Zero-Trust Data Plane</b><br>
- * Every partition request is subjected to rigorous cryptographic authorization. The service verifies
- * that the requester possesses a Manager-issued HMAC-SHA256 token matching the requested Job context.
+ * a Lazy-Restore, downloading the missing data from MinIO before fulfilling the stream.
  * </p>
  *
  * @author Ilias Bolanakis
- * @version 3.0
+ * @version 4.0
  * @since 2026-05-13
  */
 public class ShuffleServiceImpl extends ShuffleServiceImplBase {
@@ -74,9 +77,17 @@ public class ShuffleServiceImpl extends ShuffleServiceImplBase {
     private static final int CHUNK_SIZE_BYTES = 65000;
 
     /**
-     * Bounded thread pool for handling physical disk-to-network streaming and S3 restoration.
+     * Unbounded Virtual Thread pool. Prevents gRPC request queuing and eliminates timeout failures
+     * associated with fixed thread pools under high concurrency.
      */
-    private final ExecutorService streamingPool = Executors.newFixedThreadPool(100);
+    private final ExecutorService streamingPool = Executors.newVirtualThreadPerTaskExecutor();
+
+    /**
+     * Strict resource boundary semaphore.
+     * Protects the OS from File Descriptor exhaustion and the MinIO cluster from HTTP connection starvation
+     * by strictly limiting the maximum number of concurrent physical disk reads or network restores.
+     */
+    private final Semaphore ioPermits;
 
     /** Pre-compiled regex for validating Job and Partition identifiers. */
     private static final Pattern ID_PATTERN = Pattern.compile("^[a-zA-Z0-9\\-]+$");
@@ -85,7 +96,7 @@ public class ShuffleServiceImpl extends ShuffleServiceImplBase {
     private final SecretKeySpec secretKeySpec;
 
     /**
-     * Constructs a new Shuffle Service implementation with overflow tier integration.
+     * Constructs a new Shuffle Service implementation with overflow tier integration and flow control.
      *
      * @param baseShuffleDir      Absolute or relative path to the local directory containing partitioned Map data.
      * @param minioStorageService S3 adapter for restoring data evicted by the high-watermark Janitor.
@@ -97,13 +108,18 @@ public class ShuffleServiceImpl extends ShuffleServiceImplBase {
         // Extract internal secret securely from the environment
         String secretKey = System.getenv().getOrDefault("ESS_SECRET_KEY", "dev-insecure-shared-secret");
         this.secretKeySpec = new SecretKeySpec(secretKey.getBytes(StandardCharsets.UTF_8), "HmacSHA256");
+
+        // Dynamically configure the physical I/O boundary (Defaults to 150 concurrent active reads)
+        int maxConcurrentIo = Integer.parseInt(System.getenv().getOrDefault("ESS_MAX_CONCURRENT_IO", "150"));
+        this.ioPermits = new Semaphore(maxConcurrentIo, true); // Fair queuing enabled
+        logger.info("ShuffleService initialized. I/O Resource Semaphore bounded to {} concurrent permits.", maxConcurrentIo);
     }
 
     /**
      * Streams a specific shuffle partition to a requesting Reducer pod.
      * <p>
      * Performs authorization and path sanitization, then offloads the heavy binary
-     * streaming and potential MinIO object restoration to a dedicated worker pool.
+     * streaming and potential MinIO object restoration to a Virtual Thread governed by the I/O Semaphore.
      * </p>
      *
      * @param request          The Protobuf message containing the requested JobId and PartitionId.
@@ -159,31 +175,43 @@ public class ShuffleServiceImpl extends ShuffleServiceImplBase {
             }
         });
 
-        // Disk I/O and S3 Networking operations are offloaded to a bounded streaming pool.
-        // This prevents massive blockages on the core gRPC Netty event loops.
+        // 4. DELEGATE TO VIRTUAL THREAD POOL
         streamingPool.submit(() -> {
             try {
-                // TIERING LOGIC: If missing locally, block this worker thread to pull from S3
-                if (!Files.exists(partitionDir)) {
-                    logger.warn("Local cache miss for partition {}. Initiating MinIO overflow restore...", partitionDir);
-                    if (minioStorageService != null) {
-                        minioStorageService.restorePartition(safeJobId, partitionId, partitionDir);
-                    } else {
-                        throw new IOException("Data missing locally and MinIO overflow tier is not initialized.");
+                // 5. RESOURCE GATING (Zero-Cost Virtual Thread Blocking)
+                // The thread parks here until an I/O permit frees up, protecting system stability.
+                ioPermits.acquire();
+
+                try {
+                    // TIERING LOGIC: If missing locally, pull from S3 before streaming
+                    if (!Files.exists(partitionDir)) {
+                        logger.warn("Local cache miss for partition {}. Initiating MinIO overflow restore...", partitionDir);
+                        if (minioStorageService != null) {
+                            minioStorageService.restorePartition(safeJobId, partitionId, partitionDir);
+                        } else {
+                            throw new IOException("Data missing locally and MinIO overflow tier is not initialized.");
+                        }
                     }
+
+                    // STREAMING LOGIC: Stream LZ4 files from local physical disk
+                    try (Stream<Path> filePaths = Files.list(partitionDir)) {
+                        filePaths.filter(p -> p.toString().endsWith(".lz4"))
+                                .forEach(file -> streamFileContent(file, flowController, flowLock));
+
+                        if (!flowController.isCancelled()) {
+                            responseObserver.onCompleted();
+                            logger.info("Secure LZ4 stream concluded for Partition {} (Job: {})", partitionId, safeJobId);
+                        }
+                    }
+                } finally {
+                    // Guaranteed release of the physical I/O permit for the next waiting thread
+                    ioPermits.release();
                 }
 
-                // STREAMING LOGIC: Stream LZ4 files from local physical disk
-                try (Stream<Path> filePaths = Files.list(partitionDir)) {
-                    filePaths.filter(p -> p.toString().endsWith(".lz4"))
-                            .forEach(file -> streamFileContent(file, flowController, flowLock));
-
-                    if (!flowController.isCancelled()) {
-                        responseObserver.onCompleted();
-                        logger.info("Secure LZ4 stream concluded for Partition {} (Job: {})", partitionId, safeJobId);
-                    }
-                }
-
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                logger.warn("Virtual streaming thread interrupted while awaiting I/O permit for Job {} Partition {}", safeJobId, partitionId);
+                responseObserver.onError(io.grpc.Status.CANCELLED.withDescription("Request interrupted before I/O execution").asRuntimeException());
             } catch (Exception e) {
                 logger.error("Internal streaming or restore failure for directory: {}", partitionDir, e);
                 responseObserver.onError(io.grpc.Status.INTERNAL.withCause(e).asRuntimeException());
