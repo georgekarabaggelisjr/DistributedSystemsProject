@@ -27,7 +27,7 @@ import static org.junit.jupiter.api.Assertions.*;
  * {@code Resilience4j} retry wrappers implemented in the service layer.</p>
  *
  * @author Ilias Bolanakis
- * @version 2.0
+ * @version 2.1
  * @since 2026-04-24
  * @see com.iliasbolan.services.S3ClientService
  */
@@ -73,42 +73,44 @@ class S3ClientServiceIntegrationTest {
     }
 
     /**
-     * Validates a complete Write/Read round-trip and record boundary synchronization.
+     * Validates a complete Write/Read round-trip and the Hadoop Lookback boundary synchronization.
      *
-     * <p>This test specifically targets the <b>Boundary Correction Algorithm</b>.
-     * By providing an intentional byte offset that starts in the middle of a record,
+     * <p>This test specifically targets the <b>Zero-Loss Boundary Correction Algorithm</b>.
+     * By providing an intentional byte offset that aligns perfectly with the start of a record,
      * the test verifies that the service:
      * <ul>
-     * <li>Successfully skips the leading partial record (Sync Phase).</li>
-     * <li>Identifies the correct start of the next complete record via newline
-     * detection (0x0A).</li>
+     * <li>Checks the preceding byte (offset - 1).</li>
+     * <li>Correctly identifies the start of a record via newline detection (0x0A) at the lookback byte.</li>
+     * <li>Does NOT erroneously drop the first record (preventing silent data loss).</li>
      * <li>Parses subsequent data correctly into clean UTF-8 strings.</li>
      * </ul>
      * </p>
      *
-     * @throws Throwable To accommodate service-layer retry mechanisms and
-     * I/O exceptions.
+     * @throws Throwable To accommodate service-layer retry mechanisms and I/O exceptions.
      */
     @Test
     void testWriteAndReadDataChunk_SuccessfulRoundTrip() throws Throwable {
         // Arrange: Use newlines so the Record Reader has boundaries to work with.
-        // In UTF-8, these characters are 1 byte each (Indices 0-11 for A-F).
+        // In UTF-8, these characters are 1 byte each (Indices 0-11 for A-L).
         String objectName = "test-job/chunk-test.txt";
         String testData = "A\nB\nC\nD\nE\nF\nG\nH\nI\nJ\nK\nL";
 
-        // Act 1: Write the data to MinIO (Now resilient via Resilience4j)
+        // Act 1: Write the data to MinIO
         s3ClientService.writeData(TEST_BUCKET, objectName, testData);
 
         // Act 2: Read the chunk.
         // SYNC LOGIC: We set offset to 8 (pointing at 'E').
-        // The service will read 'E' (8), then '\n' (9), and then start 'F' at index 10.
+        // The Hadoop Lookback pattern will inspect offset 7 (which is '\n').
+        // Because it sees a newline immediately prior, it knows 'E' is perfectly aligned
+        // and will NOT skip it.
         List<String> records = s3ClientService.readDataChunk(TEST_BUCKET, objectName, 8, 20);
 
         // Assert
         assertNotNull(records);
         assertFalse(records.isEmpty(), "No records were parsed from the chunk!");
 
-        // Check if the first clean record after our offset/skip logic is "F"
-        assertEquals("F", records.get(0), "The first record did not match expected alignment!");
+        // The old buggy logic expected "F" here because it dropped data.
+        // The corrected logic should successfully capture "E".
+        assertEquals("E", records.get(0), "The Lookback Pattern failed! The perfectly aligned record was dropped.");
     }
 }

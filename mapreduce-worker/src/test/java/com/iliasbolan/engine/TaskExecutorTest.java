@@ -39,7 +39,7 @@ import static org.mockito.Mockito.*;
  * </p>
  *
  * @author Ilias Bolanakis
- * @version 2.0
+ * @version 2.1
  * @since 2026-04-25
  * @see TaskExecutor
  */
@@ -124,12 +124,12 @@ class TaskExecutorTest {
     }
 
     /**
-     * Validates the <b>Reactive Lineage Recomputation</b> sentinel logic.
+     * Validates the <b>Accurate Lineage Recovery Signaling</b> protocol.
      * <p>
      * This test simulates a network failure during a gRPC shuffle fetch. It
      * verifies that the executor intercepts the <code>StatusRuntimeException</code>
-     * and transmits a targeted error signal to the Manager to trigger recovery
-     * of the missing Map partition.
+     * and transmits a targeted error signal containing the exact ESS endpoint that
+     * failed, preventing infinite recovery loops in the Orchestrator.
      * </p>
      *
      * @throws Throwable If the orchestration logic fails to handle the exception.
@@ -169,13 +169,14 @@ class TaskExecutorTest {
 
             taskExecutor.executeTask(jsonPayload);
 
-            // Assert: The Sentinel must report the failure signal to trigger orchestrator recovery
+            // Assert: The Sentinel must report the accurate endpoint failure signal
+            // This tests the architectural fix for the "Masking Bug"
             verify(eventProducer).sendErrorSignal(
                     eq("job-999"),
                     eq("0"),
                     eq("error-auth-token"),
                     eq("FAILED"),
-                    eq("SHUFFLE_FETCH_FAILED:map-chunk-0")
+                    eq("SHUFFLE_FETCH_FAILED_FROM_NODE:10.244.2.15:7337")
             );
         }
     }

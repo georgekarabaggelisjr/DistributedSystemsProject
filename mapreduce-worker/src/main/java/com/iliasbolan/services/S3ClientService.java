@@ -34,15 +34,16 @@ import java.util.List;
  * isolated user sandbox environments (e.g., <code>s3://data/&lt;user_id&gt;/...</code>).</li>
  * <li><b>Resilience:</b> Implements {@code Resilience4j} retries with exponential backoff
  * and random jitter to survive transient network partitions.</li>
- * <li><b>Boundary Correction:</b> Implements a specialized synchronization algorithm
- * to ensure UTF-8 records are never bifurcated across Map chunks.</li>
- * <li><b>Memory Safeguards:</b> Utilizes array pre-allocation, buffered streams, and strict
- * byte-size limits on logical records to guarantee stable heap usage and prevent K8s
- * OOMKilled container terminations, even when processing malformed datasets.</li>
+ * <li><b>Zero-Loss Boundary Correction (Lookback Pattern):</b> Implements an advanced
+ * <code>offset - 1</code> lookback sync to guarantee that perfectly aligned chunks do not
+ * erroneously drop their first record, eliminating silent data loss across parallel maps.</li>
+ * <li><b>Dynamic Memory Eviction:</b> Utilizes array pre-allocation, buffered streams, and
+ * dynamic byte-buffer re-instantiation to prevent permanent heap hoarding on malformed lines,
+ * guaranteeing stable heap usage and preventing K8s OOMKilled container terminations.</li>
  * </ul>
  *
  * @author Ilias Bolanakis
- * @version 3.1
+ * @version 3.2
  * @see <a href="https://resilience4j.readme.io/">Resilience4j Documentation</a>
  * @since 2026-03-30
  */
@@ -114,19 +115,19 @@ public class S3ClientService {
     /**
      * Reads a boundary-corrected chunk of data from a large file.
      * <p>
-     * <b>Algorithm Detail:</b>
-     * To support parallel processing of a single large file, this method implements
-     * "Record Synchronization":
+     * <b>Algorithm Detail (Hadoop Lookback Pattern):</b>
+     * To support parallel processing without dropping data, this method evaluates the exact
+     * byte prior to the designated chunk start:
      * <ol>
-     * <li>If the chunk starts mid-file (offset > 0), it discards the leading fragment
-     * until the first newline (0x0A) is reached.</li>
-     * <li>It reads the requested {@code length}, but continues reading until the
-     * current line is finalized.</li>
+     * <li>If the byte at <code>offset - 1</code> is NOT a newline (0x0A), the chunk starts
+     * mid-record. It discards the leading fragment until the first newline is reached.</li>
+     * <li>If the byte at <code>offset - 1</code> IS a newline, the chunk is perfectly aligned
+     * and processing begins immediately, preventing the silent deletion of the first valid record.</li>
      * </ol>
      * </p>
      * <p>
-     * <b>Security Note:</b> Incorporates an absolute 10MB line-limit guard to prevent
-     * Out-Of-Memory (OOM) errors in the event of a malformed or improperly delimited dataset.
+     * <b>Security Note:</b> Incorporates an absolute 100MB line-limit guard, alongside dynamic
+     * 1MB buffer eviction to protect the JVM Heap from permanently hoarding RAM on malformed datasets.
      * </p>
      *
      * @param bucketName Target S3 bucket (e.g., "data").
@@ -142,9 +143,14 @@ public class S3ClientService {
 
             // PERFORMANCE OPTIMIZATION: Memory Pre-allocation
             // Assumes an average line length of 100 bytes to pre-size the array.
-            // Eliminates O(N) array copying and extreme GC pressure during 128MB chunk ingestion.
+            // Eliminates O(N) array copying and extreme GC pressure during massive chunk ingestion.
             int estimatedRecordCount = (int) (length / 100);
             List<String> cleanRecords = new ArrayList<>(estimatedRecordCount);
+
+            // ARCHITECTURAL FIX 1: The Hadoop Lookback Pattern.
+            // Fetch offset - 1 to check boundary alignment without dropping perfectly aligned records.
+            long fetchOffset = offset > 0 ? offset - 1 : 0;
+            long fetchLength = offset > 0 ? length + 1 : length;
 
             // PERFORMANCE OPTIMIZATION: I/O Batching
             // Wrapping the raw MinIO InputStream in a BufferedInputStream (32KB buffer)
@@ -153,14 +159,25 @@ public class S3ClientService {
                     GetObjectArgs.builder()
                             .bucket(bucketName)
                             .object(objectName)
-                            .offset(offset)
+                            .offset(fetchOffset)
+                            .length(fetchLength)
                             .build());
                  java.io.BufferedInputStream stream = new java.io.BufferedInputStream(rawStream, 32768)) {
 
                 long bytesProcessedInChunk = 0;
+                boolean skipFirstRecord = false;
 
-                // SYNC PHASE: Seek to the first valid record start (newline)
                 if (offset > 0) {
+                    int lookbackByte = stream.read();
+                    bytesProcessedInChunk++;
+                    // If the byte directly preceding our chunk is NOT a newline, we started mid-record
+                    if (lookbackByte != 0x0A) {
+                        skipFirstRecord = true;
+                    }
+                }
+
+                // SYNC PHASE: Discard the broken fragment if we landed mid-record
+                if (skipFirstRecord) {
                     int b;
                     while ((b = stream.read()) != -1) {
                         bytesProcessedInChunk++;
@@ -194,10 +211,18 @@ public class S3ClientService {
                         if (!line.isEmpty()) {
                             cleanRecords.add(line);
                         }
-                        lineBuffer.reset();
+
+                        // ARCHITECTURAL FIX 2: Dynamic Buffer Eviction
+                        // Prevents permanent memory hoarding. If a malformed line causes the buffer
+                        // to swell massively, we drop it to the GC rather than keeping the bloated array.
+                        if (lineBuffer.size() > 1024 * 1024) { // 1MB eviction threshold
+                            lineBuffer = new ByteArrayOutputStream(256);
+                        } else {
+                            lineBuffer.reset();
+                        }
 
                         // Termination condition: Quota reached AND record completed
-                        if (bytesProcessedInChunk >= length) {
+                        if (bytesProcessedInChunk >= fetchLength) {
                             logger.info("Fulfilled quota ({} bytes). Closing stream.", bytesProcessedInChunk);
                             break;
                         }
