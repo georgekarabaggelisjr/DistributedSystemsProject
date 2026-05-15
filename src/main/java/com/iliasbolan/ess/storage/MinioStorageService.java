@@ -14,6 +14,8 @@ import java.nio.file.SimpleFileVisitor;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executors;
 
 /**
  * Enterprise-grade MinIO Storage adapter for the External Shuffle Service (ESS) overflow tier.
@@ -30,9 +32,17 @@ import java.util.List;
  * spills, and employs parallel concurrent streams during restoration to maximize bandwidth
  * saturation and minimize Reducer wait times.
  * </p>
+ * <p>
+ * <b>Architecture Update (ForkJoinPool Starvation Fix):</b><br>
+ * Migrated concurrent S3 restorations from <code>parallelStream()</code> to explicit
+ * Virtual Thread orchestration. Because MinIO downloads are strictly blocking I/O operations,
+ * using the global ForkJoinPool previously risked starving the entire JVM of compute threads
+ * during massive cache misses. Virtual threads safely unmount during I/O wait times, maintaining
+ * flawless node stability.
+ * </p>
  *
  * @author Ilias Bolanakis
- * @version 2.0
+ * @version 2.1
  * @since 2026-05-13
  */
 public class MinioStorageService {
@@ -120,9 +130,9 @@ public class MinioStorageService {
      * Restores all partition segments from the MinIO overflow bucket back to the physical disk.
      * <p>
      * <b>Concurrent Restoration Logic:</b> Performs a prefix-based scan of the bucket to identify
-     * all object segments belonging to the specific Job/Partition hierarchy. It then leverages
-     * a parallel stream to download all segments concurrently, saturating the network interface
-     * to drastically reduce cache-miss latency for the waiting Reducer.
+     * all object segments belonging to the specific Job/Partition hierarchy. It leverages an
+     * explicit Virtual Thread executor to download all segments concurrently, saturating the
+     * network interface while protecting the JVM's ForkJoinPool from I/O starvation.
      * </p>
      *
      * @param jobId       The unique identifier for the MapReduce job.
@@ -163,28 +173,36 @@ public class MinioStorageService {
                 return;
             }
 
-            // 2. Perform highly concurrent downloads via parallel execution
-            itemsToDownload.parallelStream().forEach(item -> {
-                try {
-                    String objectName = item.objectName();
+            // 2. Perform highly concurrent downloads via Virtual Threads
+            // Replaced parallelStream() to prevent starvation of the global ForkJoinPool during blocking I/O.
+            try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
+                List<CompletableFuture<Void>> downloadTasks = itemsToDownload.stream().map(item ->
+                        CompletableFuture.runAsync(() -> {
+                            try {
+                                String objectName = item.objectName();
 
-                    // Extract the filename from the object path to preserve naming
-                    Path targetFile = targetDir.resolve(Path.of(objectName).getFileName());
+                                // Extract the filename from the object path to preserve naming
+                                Path targetFile = targetDir.resolve(Path.of(objectName).getFileName());
 
-                    logger.debug("Downloading segment concurrently: {} -> {}", objectName, targetFile);
+                                logger.debug("Downloading segment concurrently: {} -> {}", objectName, targetFile);
 
-                    // downloadObject utilizes internal stream-chunking to maintain O(1) memory overhead
-                    minioClient.downloadObject(
-                            DownloadObjectArgs.builder()
-                                    .bucket(bucketName)
-                                    .object(objectName)
-                                    .filename(targetFile.toAbsolutePath().toString())
-                                    .build()
-                    );
-                } catch (Exception e) {
-                    throw new RuntimeException("Failed to download segment concurrently: " + item.objectName(), e);
-                }
-            });
+                                // downloadObject utilizes internal stream-chunking to maintain O(1) memory overhead
+                                minioClient.downloadObject(
+                                        DownloadObjectArgs.builder()
+                                                .bucket(bucketName)
+                                                .object(objectName)
+                                                .filename(targetFile.toAbsolutePath().toString())
+                                                .build()
+                                );
+                            } catch (Exception e) {
+                                throw new RuntimeException("Failed to download segment concurrently: " + item.objectName(), e);
+                            }
+                        }, executor)
+                ).toList();
+
+                // Wait for all segments to download successfully
+                CompletableFuture.allOf(downloadTasks.toArray(new CompletableFuture[0])).join();
+            }
 
             logger.info("Successfully restored {} segments concurrently for Partition {} from overflow tier.", segmentCount, partitionId);
 

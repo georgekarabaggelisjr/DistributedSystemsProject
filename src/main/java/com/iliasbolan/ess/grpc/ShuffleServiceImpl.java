@@ -27,32 +27,57 @@ import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
 
 /**
  * High-performance, multi-tier data plane implementation for the External Shuffle Service (ESS).
  * <p>
- * Refactored for improved readability, utilizing guard clauses and method extraction
- * to flatten the "Arrow Anti-Pattern" of nested concurrency blocks.
+ * This service is responsible for securely streaming intermediate MapReduce partition data
+ * to downstream Reducers via Peer-to-Peer (P2P) gRPC connections. It utilizes NIO Direct Buffers
+ * to maintain a strict O(1) memory footprint during massive multi-gigabyte data transfers.
+ * </p>
+ * <p>
+ * <b>Architecture Update (Virtual Thread Carrier Pinning Prevention):</b><br>
+ * Refactored HTTP/2 flow-control backpressure handling to utilize {@link ReentrantLock} and
+ * {@link Condition} instead of intrinsic monitor locks (<code>synchronized</code> / <code>wait()</code>).
+ * This ensures that when a stream yields due to network saturation, the underlying Virtual Thread
+ * cleanly unmounts from its OS carrier thread. This prevents global JVM deadlocks when scaling
+ * to thousands of concurrent shuffle fetches.
  * </p>
  *
  * @author Ilias Bolanakis
- * @version 4.5 (Refactored)
+ * @version 4.6
  * @since 2026-05-15
  */
 public class ShuffleServiceImpl extends ShuffleServiceImplBase {
 
     private static final Logger logger = LoggerFactory.getLogger(ShuffleServiceImpl.class);
     private static final int CHUNK_SIZE_BYTES = 65000;
+
+    /** Security boundary: Ensures job identifiers cannot contain path traversal payloads (e.g., "../"). */
     private static final Pattern ID_PATTERN = Pattern.compile("^[a-zA-Z0-9\\-]+$");
 
     private final String baseShuffleDir;
     private final MinioStorageService minioStorageService;
+
+    /** Ephemeral concurrency pool utilizing lightweight Virtual Threads for massive I/O scaling. */
     private final ExecutorService streamingPool = Executors.newVirtualThreadPerTaskExecutor();
+
+    /** Concurrency gate to prevent exhausting MinIO connection pools during massive cache misses. */
     private final Semaphore ioPermits;
+
+    /** Cryptographic key specification for stateless token validation. */
     private final SecretKeySpec secretKeySpec;
 
+    /**
+     * Initializes the gRPC Shuffle Data Plane.
+     *
+     * @param baseShuffleDir      The root physical directory containing localized partition data.
+     * @param minioStorageService The configured S3 adapter for restoring spilled partitions.
+     */
     public ShuffleServiceImpl(String baseShuffleDir, MinioStorageService minioStorageService) {
         this.baseShuffleDir = baseShuffleDir;
         this.minioStorageService = minioStorageService;
@@ -72,13 +97,13 @@ public class ShuffleServiceImpl extends ShuffleServiceImplBase {
 
         logger.info("Inbound Stream Request: [Job: {}, Partition: {}]", rawJobId, partitionId);
 
-        // 1. Guard Clause: Authorization
+        // 1. Guard Clause: Zero-Trust Cryptographic Authorization
         if (!isAuthorized(rawJobId)) {
             sendError(responseObserver, Status.UNAUTHENTICATED, "Invalid Cryptographic Signature.");
             return;
         }
 
-        // 2. Guard Clause: Path Sanitization
+        // 2. Guard Clause: Strict Path Sanitization
         String safeJobId;
         try {
             safeJobId = sanitizeId(rawJobId);
@@ -87,22 +112,43 @@ public class ShuffleServiceImpl extends ShuffleServiceImplBase {
             return;
         }
 
-        // 3. Setup Flow Control & Delegate to Virtual Thread
         Path partitionDir = Paths.get(baseShuffleDir, safeJobId, String.valueOf(partitionId));
         ServerCallStreamObserver<PartitionChunk> flowController = (ServerCallStreamObserver<PartitionChunk>) responseObserver;
 
-        final Object flowLock = new Object();
-        flowController.setOnReadyHandler(() -> { synchronized (flowLock) { flowLock.notifyAll(); } });
-        flowController.setOnCancelHandler(() -> { synchronized (flowLock) { flowLock.notifyAll(); } });
+        // 3. Setup Virtual-Thread-Safe Flow Control
+        final ReentrantLock flowLock = new ReentrantLock();
+        final Condition flowCondition = flowLock.newCondition();
 
-        streamingPool.submit(() -> executeStreamingTask(safeJobId, partitionId, partitionDir, flowController, flowLock));
+        // Signal waiting virtual threads when the network buffer clears
+        flowController.setOnReadyHandler(() -> {
+            flowLock.lock();
+            try {
+                flowCondition.signalAll();
+            } finally {
+                flowLock.unlock();
+            }
+        });
+
+        // Signal waiting virtual threads to abort cleanly if the client disconnects
+        flowController.setOnCancelHandler(() -> {
+            flowLock.lock();
+            try {
+                flowCondition.signalAll();
+            } finally {
+                flowLock.unlock();
+            }
+        });
+
+        // 4. Delegate heavy I/O to the Virtual Thread pool
+        streamingPool.submit(() -> executeStreamingTask(safeJobId, partitionId, partitionDir, flowController, flowLock, flowCondition));
     }
 
     /**
      * Core asynchronous execution block. Separates tiered storage resolution from physical streaming.
      */
     private void executeStreamingTask(String jobId, int partitionId, Path partitionDir,
-                                      ServerCallStreamObserver<PartitionChunk> observer, Object flowLock) {
+                                      ServerCallStreamObserver<PartitionChunk> observer,
+                                      ReentrantLock flowLock, Condition flowCondition) {
         try {
             // Attempt to resolve data (either locally or via S3 restore).
             // Returns false if it handled a data-skew empty partition internally.
@@ -111,7 +157,7 @@ public class ShuffleServiceImpl extends ShuffleServiceImplBase {
             }
 
             // If we reach here, data exists locally. Stream it.
-            streamDirectory(jobId, partitionId, partitionDir, observer, flowLock);
+            streamDirectory(jobId, partitionId, partitionDir, observer, flowLock, flowCondition);
 
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -124,7 +170,9 @@ public class ShuffleServiceImpl extends ShuffleServiceImplBase {
 
     /**
      * Resolves cache misses by pulling from MinIO. Handles semaphore gating cleanly.
+     *
      * @return true if data is available locally to stream, false if an empty stream was triggered.
+     * @throws InterruptedException if the thread is interrupted while waiting for an I/O permit.
      */
     private boolean resolveStorageTier(String jobId, int partitionId, Path partitionDir, StreamObserver<PartitionChunk> observer) throws InterruptedException {
         // Fast path: Data is already local
@@ -162,7 +210,8 @@ public class ShuffleServiceImpl extends ShuffleServiceImplBase {
      * Locates LZ4 files in the directory and streams them.
      */
     private void streamDirectory(String jobId, int partitionId, Path partitionDir,
-                                 ServerCallStreamObserver<PartitionChunk> observer, Object flowLock) throws IOException {
+                                 ServerCallStreamObserver<PartitionChunk> observer,
+                                 ReentrantLock flowLock, Condition flowCondition) throws IOException {
 
         try (Stream<Path> filePaths = Files.list(partitionDir)) {
             List<Path> validFiles = filePaths.filter(p -> p.toString().endsWith(".lz4")).toList();
@@ -175,7 +224,7 @@ public class ShuffleServiceImpl extends ShuffleServiceImplBase {
 
             // Stream all valid files
             for (Path file : validFiles) {
-                streamFileContent(file, observer, flowLock);
+                streamFileContent(file, observer, flowLock, flowCondition);
                 if (observer.isCancelled()) break;
             }
 
@@ -188,26 +237,31 @@ public class ShuffleServiceImpl extends ShuffleServiceImplBase {
 
     /**
      * Streams the physical content of a single file segment using NIO Direct Buffers.
+     * Incorporates Virtual-Thread-safe locking to gracefully handle gRPC network backpressure.
      */
-    private void streamFileContent(Path file, ServerCallStreamObserver<PartitionChunk> flowController, Object flowLock) throws IOException {
+    private void streamFileContent(Path file, ServerCallStreamObserver<PartitionChunk> flowController,
+                                   ReentrantLock flowLock, Condition flowCondition) throws IOException {
+
         if (flowController.isCancelled()) return;
 
+        // O(1) Memory Allocation: Data moves straight from OS Page Cache to Network Socket
         ByteBuffer buffer = ByteBuffer.allocateDirect(CHUNK_SIZE_BYTES);
 
         try (FileChannel fileChannel = FileChannel.open(file, StandardOpenOption.READ)) {
             while (fileChannel.read(buffer) > 0) {
                 buffer.flip();
 
-                // Apply Network Backpressure
-                synchronized (flowLock) {
+                // Apply Network Backpressure safely without pinning the Carrier Thread
+                flowLock.lock();
+                try {
                     while (!flowController.isReady() && !flowController.isCancelled()) {
-                        try {
-                            flowLock.wait();
-                        } catch (InterruptedException e) {
-                            Thread.currentThread().interrupt();
-                            return;
-                        }
+                        flowCondition.await();
                     }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                } finally {
+                    flowLock.unlock();
                 }
 
                 if (flowController.isCancelled()) break;
@@ -222,6 +276,9 @@ public class ShuffleServiceImpl extends ShuffleServiceImplBase {
     // Utility & Security Methods Below
     // ==========================================
 
+    /**
+     * Validates the cryptographically signed HMAC token injected by the gRPC Interceptor.
+     */
     private boolean isAuthorized(String rawJobId) {
         String providedToken = ShuffleDaemon.AUTH_TOKEN_KEY.get();
         String expectedToken = computeHmacSha256(rawJobId);
@@ -233,6 +290,9 @@ public class ShuffleServiceImpl extends ShuffleServiceImplBase {
         return true;
     }
 
+    /**
+     * Safely resolves data skew scenarios by transmitting a zero-byte payload to the Reducer.
+     */
     private void handleEmptyPartition(StreamObserver<PartitionChunk> observer, Path dir) {
         logger.info("Data Skew Resolution: Injecting empty chunk for partition {}", dir);
         observer.onNext(PartitionChunk.newBuilder().setContent(ByteString.EMPTY).build());
@@ -245,7 +305,7 @@ public class ShuffleServiceImpl extends ShuffleServiceImplBase {
 
     private String sanitizeId(String input) {
         if (input == null || !ID_PATTERN.matcher(input).matches()) {
-            throw new SecurityException("Illegal character set in identifier.");
+            throw new SecurityException("Illegal character set in identifier. Potential path traversal detected.");
         }
         return input;
     }

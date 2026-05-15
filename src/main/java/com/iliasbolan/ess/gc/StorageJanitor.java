@@ -13,7 +13,6 @@ import java.util.List;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
-import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 /**
@@ -31,6 +30,13 @@ import java.util.stream.Stream;
  * are enforced reactively to prevent node-level outages.
  * </p>
  * <p>
+ * <b>Architecture Update (Active Task Protection):</b><br>
+ * Prevents the aggressive garbage collector from corrupting active Map tasks. Before initiating
+ * a MinIO spill and subsequent local deletion, the Janitor now inspects the job directory for
+ * active <code>.tmp</code> streams, ensuring that currently executing pods are never preemptively
+ * wiped from disk during peak I/O saturation.
+ * </p>
+ * <p>
  * <b>Reclamation Algorithm (MinIO Overflow Tier):</b><br>
  * The Janitor utilizes a Space-Aware Dual-Watermark protocol combined with an S3-compatible overflow tier:
  * <ul>
@@ -43,7 +49,7 @@ import java.util.stream.Stream;
  * </p>
  *
  * @author Ilias Bolanakis
- * @version 2.0
+ * @version 2.1
  * @since 2026-05-13
  */
 public class StorageJanitor {
@@ -130,16 +136,9 @@ public class StorageJanitor {
     }
 
     /**
-     * Temporary data structure for O(N) timestamp-based sorting.
-     */
-    private static class JobDirectory {
-        final Path path;
-        final long creationTime;
-
-        JobDirectory(Path path, long creationTime) {
-            this.path = path;
-            this.creationTime = creationTime;
-        }
+         * Temporary data structure for O(N) timestamp-based sorting.
+         */
+        private record JobDirectory(Path path, long creationTime) {
     }
 
     /**
@@ -168,7 +167,7 @@ public class StorageJanitor {
                     })
                     .sorted(Comparator.comparingLong(jd -> jd.creationTime))
                     .map(jd -> jd.path)
-                    .collect(Collectors.toList());
+                    .toList();
         }
 
         for (Path jobDir : sortedJobs) {
@@ -180,6 +179,20 @@ public class StorageJanitor {
             if (currentUsedPercent <= LOW_WATERMARK_PERCENT) {
                 logger.info("Low-Watermark reached ({}%). Halting aggressive reclamation.", Math.round(currentUsedPercent * 100));
                 break;
+            }
+
+            // ARCHITECTURAL FIX: Active Task Protection
+            // Deeply inspects the job directory to prevent the Janitor from wiping out
+            // a job that is actively streaming data from the compute pods.
+            try (Stream<Path> jobFiles = Files.walk(jobDir)) {
+                boolean hasActiveWriters = jobFiles.anyMatch(p -> p.toString().endsWith(".tmp"));
+                if (hasActiveWriters) {
+                    logger.debug("Skipping job directory {} due to active .tmp writers (Job currently running).", jobDir.getFileName());
+                    continue;
+                }
+            } catch (IOException e) {
+                logger.warn("Failed to check for active writers in {}. Skipping to prevent data loss.", jobDir.getFileName());
+                continue;
             }
 
             String jobId = jobDir.getFileName().toString();
