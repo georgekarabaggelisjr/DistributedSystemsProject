@@ -6,6 +6,7 @@ import com.iliasbolan.ess.storage.MinioStorageService;
 import com.iliasbolan.grpc.shuffle.PartitionChunk;
 import com.iliasbolan.grpc.shuffle.PartitionRequest;
 import com.iliasbolan.grpc.shuffle.ShuffleServiceGrpc.ShuffleServiceImplBase;
+import io.grpc.Status;
 import io.grpc.stub.ServerCallStreamObserver;
 import io.grpc.stub.StreamObserver;
 import org.slf4j.Logger;
@@ -22,6 +23,7 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
 import java.security.MessageDigest;
+import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Semaphore;
@@ -29,258 +31,178 @@ import java.util.regex.Pattern;
 import java.util.stream.Stream;
 
 /**
- * Concrete implementation of the gRPC Shuffle Streaming Service with Multi-Tier Storage Support.
+ * High-performance, multi-tier data plane implementation for the External Shuffle Service (ESS).
  * <p>
- * This service acts as the core high-performance data plane for the <b>External Shuffle Service (ESS)</b>.
- * It facilitates the reliable, asynchronous transfer of intermediate MapReduce data splits across
- * physical cluster networks utilizing NIO Direct Buffers and Zero-Copy I/O concepts.
- * </p>
- * <p>
- * <b>Unbounded Concurrency & Bounded I/O Architecture:</b><br>
- * Utilizes Java Virtual Threads to handle an effectively unlimited number of concurrent gRPC requests
- * without JVM heap exhaustion or Netty thread-pool starvation. To protect the underlying OS (File Descriptors)
- * and upstream MinIO clusters (HTTP Connection Pools) from resource exhaustion, physical I/O execution
- * is strictly gated by a fair-queued {@link Semaphore}. Virtual threads yield their carrier threads
- * at zero cost while waiting in the queue.
- * </p>
- * <p>
- * <b>LZ4 Pass-Through Optimization:</b><br>
- * This service acts as a transparent binary pipeline, streaming {@code .lz4} blocks from local disk
- * directly to the gRPC wire. By bypassing decompression, we preserve host CPU resources and ensure format integrity.
- * </p>
- * <p>
- * <b>Resilient Data Plane (MinIO Overflow):</b><br>
- * Integrated with an S3-compatible overflow tier. If an inbound request targets a partition that
- * has been evicted from the local physical disk by the Janitor, this service will automatically perform
- * a Lazy-Restore, downloading the missing data from MinIO before fulfilling the stream.
+ * Refactored for improved readability, utilizing guard clauses and method extraction
+ * to flatten the "Arrow Anti-Pattern" of nested concurrency blocks.
  * </p>
  *
  * @author Ilias Bolanakis
- * @version 4.0
- * @since 2026-05-13
+ * @version 4.5 (Refactored)
+ * @since 2026-05-15
  */
 public class ShuffleServiceImpl extends ShuffleServiceImplBase {
 
     private static final Logger logger = LoggerFactory.getLogger(ShuffleServiceImpl.class);
-
-    /** Root directory on the host filesystem where intermediate shuffle partitions are persisted. */
-    private final String baseShuffleDir;
-
-    /** Cloud-native overflow storage client for retrieving evicted partition data. */
-    private final MinioStorageService minioStorageService;
-
-    /**
-     * Optimized buffer size (65KB) selected to align with standard TCP frame
-     * sizes and guarantee that gRPC Protobuf envelopes safely fit inside
-     * the strict 65,535-byte default HTTP/2 flow-control window.
-     */
     private static final int CHUNK_SIZE_BYTES = 65000;
-
-    /**
-     * Unbounded Virtual Thread pool. Prevents gRPC request queuing and eliminates timeout failures
-     * associated with fixed thread pools under high concurrency.
-     */
-    private final ExecutorService streamingPool = Executors.newVirtualThreadPerTaskExecutor();
-
-    /**
-     * Strict resource boundary semaphore.
-     * Protects the OS from File Descriptor exhaustion and the MinIO cluster from HTTP connection starvation
-     * by strictly limiting the maximum number of concurrent physical disk reads or network restores.
-     */
-    private final Semaphore ioPermits;
-
-    /** Pre-compiled regex for validating Job and Partition identifiers. */
     private static final Pattern ID_PATTERN = Pattern.compile("^[a-zA-Z0-9\\-]+$");
 
-    /** Cached cryptographic key specification for HMAC validation. */
+    private final String baseShuffleDir;
+    private final MinioStorageService minioStorageService;
+    private final ExecutorService streamingPool = Executors.newVirtualThreadPerTaskExecutor();
+    private final Semaphore ioPermits;
     private final SecretKeySpec secretKeySpec;
 
-    /**
-     * Constructs a new Shuffle Service implementation with overflow tier integration and flow control.
-     *
-     * @param baseShuffleDir      Absolute or relative path to the local directory containing partitioned Map data.
-     * @param minioStorageService S3 adapter for restoring data evicted by the high-watermark Janitor.
-     */
     public ShuffleServiceImpl(String baseShuffleDir, MinioStorageService minioStorageService) {
         this.baseShuffleDir = baseShuffleDir;
         this.minioStorageService = minioStorageService;
 
-        // Extract internal secret securely from the environment
         String secretKey = System.getenv().getOrDefault("ESS_SECRET_KEY", "dev-insecure-shared-secret");
         this.secretKeySpec = new SecretKeySpec(secretKey.getBytes(StandardCharsets.UTF_8), "HmacSHA256");
 
-        // Dynamically configure the physical I/O boundary (Defaults to 150 concurrent active reads)
         int maxConcurrentIo = Integer.parseInt(System.getenv().getOrDefault("ESS_MAX_CONCURRENT_IO", "150"));
-        this.ioPermits = new Semaphore(maxConcurrentIo, true); // Fair queuing enabled
-        logger.info("ShuffleService initialized. I/O Resource Semaphore bounded to {} concurrent permits.", maxConcurrentIo);
+        this.ioPermits = new Semaphore(maxConcurrentIo, true);
+        logger.info("ShuffleService Data Plane initialized. S3 Restore Ceiling: {}.", maxConcurrentIo);
     }
 
-    /**
-     * Streams a specific shuffle partition to a requesting Reducer pod.
-     * <p>
-     * Performs authorization and path sanitization, then offloads the heavy binary
-     * streaming and potential MinIO object restoration to a Virtual Thread governed by the I/O Semaphore.
-     * </p>
-     *
-     * @param request          The Protobuf message containing the requested JobId and PartitionId.
-     * @param responseObserver The gRPC Stream observer for transmitting asynchronous {@link PartitionChunk} sequences.
-     */
     @Override
     public void getPartition(PartitionRequest request, StreamObserver<PartitionChunk> responseObserver) {
         String rawJobId = request.getJobId();
         int partitionId = request.getPartitionId();
 
-        logger.info("ESS Stream Request: [Job: {}, Partition: {}]", rawJobId, partitionId);
+        logger.info("Inbound Stream Request: [Job: {}, Partition: {}]", rawJobId, partitionId);
 
-        // 1. ZERO-TRUST AUTHORIZATION GATEWAY
-        String providedToken = ShuffleDaemon.AUTH_TOKEN_KEY.get();
-        String expectedToken = computeHmacSha256(rawJobId);
-
-        if (providedToken == null || !MessageDigest.isEqual(providedToken.getBytes(StandardCharsets.UTF_8), expectedToken.getBytes(StandardCharsets.UTF_8))) {
-            logger.warn("SECURITY BREACH ATTEMPT: Unauthorized access to Job {}. Token Rejected.", rawJobId);
-            responseObserver.onError(io.grpc.Status.UNAUTHENTICATED
-                    .withDescription("Missing or Invalid Cryptographic Authorization Token.")
-                    .asRuntimeException());
+        // 1. Guard Clause: Authorization
+        if (!isAuthorized(rawJobId)) {
+            sendError(responseObserver, Status.UNAUTHENTICATED, "Invalid Cryptographic Signature.");
             return;
         }
 
-        // 2. INPUT SANITIZATION
+        // 2. Guard Clause: Path Sanitization
         String safeJobId;
         try {
             safeJobId = sanitizeId(rawJobId);
         } catch (SecurityException se) {
-            logger.error("SECURITY BREACH ATTEMPT: Path traversal payload detected in JobId: {}", rawJobId);
-            responseObserver.onError(io.grpc.Status.INVALID_ARGUMENT
-                    .withDescription("Malformed JobId structure.")
-                    .asRuntimeException());
+            sendError(responseObserver, Status.INVALID_ARGUMENT, "Malformed job identifier.");
             return;
         }
 
+        // 3. Setup Flow Control & Delegate to Virtual Thread
         Path partitionDir = Paths.get(baseShuffleDir, safeJobId, String.valueOf(partitionId));
-
-        // 3. HIGH-PERFORMANCE STREAMING & ASYNC RESTORATION (Bounded Execution)
-        ServerCallStreamObserver<PartitionChunk> flowController =
-                (ServerCallStreamObserver<PartitionChunk>) responseObserver;
+        ServerCallStreamObserver<PartitionChunk> flowController = (ServerCallStreamObserver<PartitionChunk>) responseObserver;
 
         final Object flowLock = new Object();
-        flowController.setOnReadyHandler(() -> {
-            synchronized (flowLock) {
-                flowLock.notifyAll();
-            }
-        });
+        flowController.setOnReadyHandler(() -> { synchronized (flowLock) { flowLock.notifyAll(); } });
+        flowController.setOnCancelHandler(() -> { synchronized (flowLock) { flowLock.notifyAll(); } });
 
-        flowController.setOnCancelHandler(() -> {
-            synchronized (flowLock) {
-                flowLock.notifyAll();
-            }
-        });
-
-        // 4. DELEGATE TO VIRTUAL THREAD POOL
-        streamingPool.submit(() -> {
-            try {
-                // 5. RESOURCE GATING (Zero-Cost Virtual Thread Blocking)
-                // The thread parks here until an I/O permit frees up, protecting system stability.
-                ioPermits.acquire();
-
-                try {
-                    // TIERING LOGIC: If missing locally, pull from S3 before streaming
-                    if (!Files.exists(partitionDir)) {
-                        logger.warn("Local cache miss for partition {}. Initiating MinIO overflow restore...", partitionDir);
-                        if (minioStorageService != null) {
-                            minioStorageService.restorePartition(safeJobId, partitionId, partitionDir);
-                        } else {
-                            throw new IOException("Data missing locally and MinIO overflow tier is not initialized.");
-                        }
-                    }
-
-                    // STREAMING LOGIC: Stream LZ4 files from local physical disk
-                    try (Stream<Path> filePaths = Files.list(partitionDir)) {
-                        filePaths.filter(p -> p.toString().endsWith(".lz4"))
-                                .forEach(file -> streamFileContent(file, flowController, flowLock));
-
-                        if (!flowController.isCancelled()) {
-                            responseObserver.onCompleted();
-                            logger.info("Secure LZ4 stream concluded for Partition {} (Job: {})", partitionId, safeJobId);
-                        }
-                    }
-                } finally {
-                    // Guaranteed release of the physical I/O permit for the next waiting thread
-                    ioPermits.release();
-                }
-
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                logger.warn("Virtual streaming thread interrupted while awaiting I/O permit for Job {} Partition {}", safeJobId, partitionId);
-                responseObserver.onError(io.grpc.Status.CANCELLED.withDescription("Request interrupted before I/O execution").asRuntimeException());
-            } catch (Exception e) {
-                logger.error("Internal streaming or restore failure for directory: {}", partitionDir, e);
-                responseObserver.onError(io.grpc.Status.INTERNAL.withCause(e).asRuntimeException());
-            }
-        });
+        streamingPool.submit(() -> executeStreamingTask(safeJobId, partitionId, partitionDir, flowController, flowLock));
     }
 
     /**
-     * Validates structural identifiers to prevent Arbitrary Path Traversal attacks.
-     *
-     * @param input The untrusted JobId provided by the gRPC client.
-     * @return The validated and sanitized alphanumeric ID.
+     * Core asynchronous execution block. Separates tiered storage resolution from physical streaming.
      */
-    private String sanitizeId(String input) {
-        if (input == null || !ID_PATTERN.matcher(input).matches()) {
-            throw new SecurityException("Invalid ID format. Potential path traversal detected.");
-        }
-        return input;
-    }
-
-    /**
-     * Computes an HMAC-SHA256 signature to validate the request origin.
-     *
-     * @param data The Job ID to cryptographically sign.
-     * @return A hexadecimal string representation of the HMAC signature.
-     */
-    private String computeHmacSha256(String data) {
+    private void executeStreamingTask(String jobId, int partitionId, Path partitionDir,
+                                      ServerCallStreamObserver<PartitionChunk> observer, Object flowLock) {
         try {
-            Mac mac = Mac.getInstance("HmacSHA256");
-            mac.init(secretKeySpec);
-            byte[] hashBytes = mac.doFinal(data.getBytes(StandardCharsets.UTF_8));
-
-            StringBuilder hexString = new StringBuilder();
-            for (byte b : hashBytes) {
-                String hex = Integer.toHexString(0xff & b);
-                if (hex.length() == 1) hexString.append('0');
-                hexString.append(hex);
+            // Attempt to resolve data (either locally or via S3 restore).
+            // Returns false if it handled a data-skew empty partition internally.
+            if (!resolveStorageTier(jobId, partitionId, partitionDir, observer)) {
+                return;
             }
-            return hexString.toString();
+
+            // If we reach here, data exists locally. Stream it.
+            streamDirectory(jobId, partitionId, partitionDir, observer, flowLock);
+
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            sendError(observer, Status.CANCELLED, "I/O Interrupted before execution.");
         } catch (Exception e) {
-            throw new RuntimeException("Failed to initialize cryptographic HMAC validation", e);
+            logger.error("Data Plane Error for directory: {}", partitionDir, e);
+            sendError(observer, Status.INTERNAL, e.getMessage());
+        }
+    }
+
+    /**
+     * Resolves cache misses by pulling from MinIO. Handles semaphore gating cleanly.
+     * @return true if data is available locally to stream, false if an empty stream was triggered.
+     */
+    private boolean resolveStorageTier(String jobId, int partitionId, Path partitionDir, StreamObserver<PartitionChunk> observer) throws InterruptedException {
+        // Fast path: Data is already local
+        if (Files.exists(partitionDir)) {
+            return true;
+        }
+
+        // Slow path: Cache miss. Acquire permit and attempt MinIO restore.
+        ioPermits.acquire();
+        try {
+            // Double-check locking: Ensure another thread didn't just restore it
+            if (Files.exists(partitionDir)) {
+                return true;
+            }
+
+            if (minioStorageService == null) {
+                handleEmptyPartition(observer, partitionDir);
+                return false;
+            }
+
+            logger.warn("Cache Miss for Partition {}. Restoring from S3...", partitionDir);
+            minioStorageService.restorePartition(jobId, partitionId, partitionDir);
+            return true;
+
+        } catch (Exception e) {
+            // Skew Resolution: Restore failed, likely because the partition legitimately has no data
+            handleEmptyPartition(observer, partitionDir);
+            return false;
+        } finally {
+            ioPermits.release();
+        }
+    }
+
+    /**
+     * Locates LZ4 files in the directory and streams them.
+     */
+    private void streamDirectory(String jobId, int partitionId, Path partitionDir,
+                                 ServerCallStreamObserver<PartitionChunk> observer, Object flowLock) throws IOException {
+
+        try (Stream<Path> filePaths = Files.list(partitionDir)) {
+            List<Path> validFiles = filePaths.filter(p -> p.toString().endsWith(".lz4")).toList();
+
+            // Skew Resolution: Directory exists but contains no finalized .lz4 frames
+            if (validFiles.isEmpty()) {
+                handleEmptyPartition(observer, partitionDir);
+                return;
+            }
+
+            // Stream all valid files
+            for (Path file : validFiles) {
+                streamFileContent(file, observer, flowLock);
+                if (observer.isCancelled()) break;
+            }
+
+            if (!observer.isCancelled()) {
+                observer.onCompleted();
+                logger.info("Stream Concluded: Partition {} (Job: {})", partitionId, jobId);
+            }
         }
     }
 
     /**
      * Streams the physical content of a single file segment using NIO Direct Buffers.
-     * <p>
-     * Utilizes an active wait-loop tied to the gRPC stream state to apply backpressure.
-     * In this LZ4-only architecture, it performs a pure binary copy from disk to network.
-     * </p>
-     *
-     * @param file           The physical .lz4 file segment path.
-     * @param flowController The gRPC observer managing network flow.
-     * @param flowLock       The monitor object used for thread resumption.
      */
-    private void streamFileContent(Path file, ServerCallStreamObserver<PartitionChunk> flowController, Object flowLock) {
+    private void streamFileContent(Path file, ServerCallStreamObserver<PartitionChunk> flowController, Object flowLock) throws IOException {
         if (flowController.isCancelled()) return;
 
-        // Use direct buffer to minimize heap impact during massive transfers
         ByteBuffer buffer = ByteBuffer.allocateDirect(CHUNK_SIZE_BYTES);
 
         try (FileChannel fileChannel = FileChannel.open(file, StandardOpenOption.READ)) {
             while (fileChannel.read(buffer) > 0) {
                 buffer.flip();
 
+                // Apply Network Backpressure
                 synchronized (flowLock) {
                     while (!flowController.isReady() && !flowController.isCancelled()) {
                         try {
-                            flowLock.wait(); // Pause reading until network buffer drains
+                            flowLock.wait();
                         } catch (InterruptedException e) {
                             Thread.currentThread().interrupt();
                             return;
@@ -293,18 +215,59 @@ public class ShuffleServiceImpl extends ShuffleServiceImplBase {
                 transmitChunk(buffer, flowController);
                 buffer.clear();
             }
-        } catch (IOException e) {
-            logger.error("NIO Channel failure while reading segment: {}", file, e);
-            throw new RuntimeException(e);
         }
     }
 
-    /**
-     * Packages a direct buffer into a gRPC Protobuf envelope and transmits it to the peer.
-     */
+    // ==========================================
+    // Utility & Security Methods Below
+    // ==========================================
+
+    private boolean isAuthorized(String rawJobId) {
+        String providedToken = ShuffleDaemon.AUTH_TOKEN_KEY.get();
+        String expectedToken = computeHmacSha256(rawJobId);
+
+        if (providedToken == null || !MessageDigest.isEqual(providedToken.getBytes(StandardCharsets.UTF_8), expectedToken.getBytes(StandardCharsets.UTF_8))) {
+            logger.warn("SECURITY ALERT: HMAC Mismatch for Job {}. Token Rejected.", rawJobId);
+            return false;
+        }
+        return true;
+    }
+
+    private void handleEmptyPartition(StreamObserver<PartitionChunk> observer, Path dir) {
+        logger.info("Data Skew Resolution: Injecting empty chunk for partition {}", dir);
+        observer.onNext(PartitionChunk.newBuilder().setContent(ByteString.EMPTY).build());
+        observer.onCompleted();
+    }
+
+    private void sendError(StreamObserver<PartitionChunk> observer, Status status, String description) {
+        observer.onError(status.withDescription(description).asRuntimeException());
+    }
+
+    private String sanitizeId(String input) {
+        if (input == null || !ID_PATTERN.matcher(input).matches()) {
+            throw new SecurityException("Illegal character set in identifier.");
+        }
+        return input;
+    }
+
+    private String computeHmacSha256(String data) {
+        try {
+            Mac mac = Mac.getInstance("HmacSHA256");
+            mac.init(secretKeySpec);
+            byte[] hashBytes = mac.doFinal(data.getBytes(StandardCharsets.UTF_8));
+            StringBuilder hexString = new StringBuilder();
+            for (byte b : hashBytes) {
+                String hex = Integer.toHexString(0xff & b);
+                if (hex.length() == 1) hexString.append('0');
+                hexString.append(hex);
+            }
+            return hexString.toString();
+        } catch (Exception e) {
+            throw new RuntimeException("Cryptographic provider initialization failed.", e);
+        }
+    }
+
     private void transmitChunk(ByteBuffer buffer, StreamObserver<PartitionChunk> observer) {
-        observer.onNext(PartitionChunk.newBuilder()
-                .setContent(ByteString.copyFrom(buffer))
-                .build());
+        observer.onNext(PartitionChunk.newBuilder().setContent(ByteString.copyFrom(buffer)).build());
     }
 }
