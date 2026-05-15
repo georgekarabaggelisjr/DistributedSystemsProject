@@ -38,22 +38,29 @@ import java.util.concurrent.TimeUnit;
  * gRPC-based data transfers, and delegation to isolated ephemeral sandbox environments.
  * </p>
  * <p>
- * <b>Architecture Update: Atomic Stream Fetching (LZ4 Integrity)</b><br>
+ * <b>Architectural Update 1: Atomic Stream Fetching (LZ4 Integrity)</b><br>
  * To prevent binary corruption during massive 11GB+ parallel shuffles, gRPC streams
  * are initially persisted to temporary ({@code .tmp}) files. The system performs an
  * atomic OS-level rename to {@code .lz4} strictly upon successful stream completion,
  * guaranteeing that the Sorter only processes fully finalized frames.
  * </p>
  * <p>
- * <b>Architecture Update: Global Ephemeral Bounding</b><br>
+ * <b>Architectural Update 2: Global Ephemeral Bounding</b><br>
  * All ephemeral files (Bytecode, Payloads, Raw gRPC Streams) are strictly confined
  * to the {@code baseShuffleDir/{jobId}/} directory. This guarantees that the
  * ESS {@code StorageJanitor} cleans up all disk traces seamlessly without leaving orphans.
  * </p>
+ * <p>
+ * <b>Architectural Update 3: Accurate Lineage Recovery Signaling</b><br>
+ * Resolved the "Masking Bug" where stream failures erroneously reported arbitrary map-chunks
+ * (e.g., {@code map-chunk-0}) as corrupted. The executor now accurately identifies the
+ * specific ESS node endpoint causing the disruption, preventing infinite recovery loops
+ * in the Orchestrator.
+ * </p>
  *
  * @author Ilias Bolanakis
- * @version 2.3
- * @since 2026-05-12
+ * @version 2.4
+ * @since 2026-05-15
  */
 public class TaskExecutor {
 
@@ -243,10 +250,12 @@ public class TaskExecutor {
                     }
                 } catch (StatusRuntimeException grpcEx) {
                     Files.deleteIfExists(tmpPath); // Eagerly purge the corrupted partial stream
-                    String lostTaskId = "map-chunk-" + i;
-                    logger.warn("P2P Data Loss Detected! Triggering Lineage Recovery for {}.", lostTaskId);
 
-                    String errorPayload = "SHUFFLE_FETCH_FAILED:" + lostTaskId;
+                    // FIX: Report the actual node endpoint that failed, rather than fabricating a map-chunk ID
+                    // based on the loop index. This prevents infinite lineage recovery loops on the wrong node.
+                    logger.warn("P2P Data Loss Detected! Fetch failed from endpoint {}.", endpoint);
+                    String errorPayload = "SHUFFLE_FETCH_FAILED_FROM_NODE:" + endpoint;
+
                     eventProducer.sendErrorSignal(safeJobId, safeTaskId, payload.jobToken(), "FAILED", errorPayload);
                     return;
                 } catch (Exception e) {

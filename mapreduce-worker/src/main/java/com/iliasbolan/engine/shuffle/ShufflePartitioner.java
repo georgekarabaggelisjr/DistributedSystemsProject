@@ -15,16 +15,22 @@ import java.util.concurrent.ConcurrentHashMap;
 /**
  * Enterprise-grade ShufflePartitioner with O(1) Memory Persistent Streams.
  * <p>
- * <b>Architectural Fix: Zero-Aggregation Write-Through</b><br>
- * This version eliminates the {@link StringBuilder} buffering that caused heap
- * spikes during large 11GB shuffles. Records are streamed directly to the
- * partition-specific {@link BufferedWriter} instances, ensuring the memory
- * footprint remains constant regardless of chunk density or record length.
+ * <b>Architectural Fix 1: Zero-Aggregation Write-Through</b><br>
+ * Eliminates {@link StringBuilder} buffering that caused heap spikes during massive shuffles.
+ * Records are streamed directly to partition-specific {@link BufferedWriter} instances,
+ * ensuring the memory footprint remains constant regardless of chunk density or record length.
+ * </p>
+ * <p>
+ * <b>Architectural Fix 2: Eager Directory Allocation (Skew Protection)</b><br>
+ * Pre-allocates all partition directories during instantiation. This prevents fatal cache-miss
+ * errors in the External Shuffle Service (ESS) overflow tier when highly skewed datasets result
+ * in completely empty partitions. By guaranteeing directory existence, the ESS correctly
+ * identifies empty partitions rather than triggering unnecessary and failing MinIO restores.
  * </p>
  *
  * @author Ilias Bolanakis
- * @version 3.2
- * @since 2026-05-12
+ * @version 3.3
+ * @since 2026-05-15
  */
 public class ShufflePartitioner implements AutoCloseable {
 
@@ -38,6 +44,15 @@ public class ShufflePartitioner implements AutoCloseable {
     /** Persistent cache of open writers to prevent LZ4 frame thrashing. */
     private final ConcurrentHashMap<Integer, BufferedWriter> writerCache = new ConcurrentHashMap<>();
 
+    /**
+     * Initializes the ShufflePartitioner and establishes the physical directory boundaries.
+     *
+     * @param baseShuffleDir The root physical directory for ephemeral shuffle data persistence.
+     * @param jobId          The universally unique identifier (UUID) of the overarching MapReduce job.
+     * @param mapTaskId      The unique identifier for the specific Map task utilizing this partitioner.
+     * @param numReducers    The total number of allocated Reducers (used to define partition boundaries).
+     * @throws RuntimeException If eager directory allocation fails due to disk access limits or I/O faults.
+     */
     public ShufflePartitioner(String baseShuffleDir, String jobId, String mapTaskId, int numReducers) {
         this.baseShuffleDir = baseShuffleDir;
         this.jobId = jobId;
@@ -48,27 +63,41 @@ public class ShufflePartitioner implements AutoCloseable {
         this.partitionLocks = new Object[numReducers];
         for (int i = 0; i < numReducers; i++) {
             this.partitionLocks[i] = new Object();
+
+            // EAGER DIRECTORY ALLOCATION: Data Skew / ESS Empty Partition Fix
+            // Forces the creation of all partition boundaries immediately to guarantee
+            // the ESS Daemon resolves empty streams correctly, bypassing erroneous S3 cache misses.
+            try {
+                Files.createDirectories(Paths.get(baseShuffleDir, jobId, String.valueOf(i)));
+            } catch (IOException e) {
+                logger.error("CRITICAL: Failed to eagerly allocate partition directory for index {}", i, e);
+                throw new RuntimeException("Storage initialization failure during partition allocation", e);
+            }
         }
     }
 
     /**
-     * Appends records directly to persistent LZ4 streams without intermediate heap buffering.
+     * Appends a buffer of mapped records directly to persistent LZ4 streams.
      * <p>
-     * <b>O(1) Memory Guarantee:</b> By writing records one-by-one to the underlying
-     * buffered streams, this method maintains a flat memory profile, preventing OOM
-     * crashes on dense data chunks.
+     * <b>O(1) Memory Guarantee:</b> By writing records sequentially to the underlying
+     * buffered streams, this method bypasses intermediate array aggregations, maintaining
+     * a strictly flat memory profile. Thread safety is guaranteed via partition-level
+     * lock stripping, allowing concurrent micro-batches to write seamlessly.
      * </p>
+     *
+     * @param buffer A transient, micro-batched collection of {@link KeyValuePair} records.
+     * @throws IOException If physical disk writes or stream access operations fail.
      */
     public void appendThreadSafe(List<KeyValuePair> buffer) throws IOException {
         for (KeyValuePair pair : buffer) {
-            // Determine partition via bitmasked hash
+            // Determine partition via bitmasked hash to prevent negative modulus outcomes
             int partitionIndex = (pair.key().hashCode() & Integer.MAX_VALUE) % numReducers;
 
-            // Use lock stripping to allow threads to write to different partitions in parallel
+            // Lock stripping isolates synchronization latency to a per-partition basis
             synchronized (partitionLocks[partitionIndex]) {
                 BufferedWriter writer = getOrCreateWriter(partitionIndex);
 
-                // PERFORMANCE: Write components individually to avoid String concatenation spikes
+                // PERFORMANCE: Component-level writes avoid ephemeral String allocation spikes
                 writer.write(pair.key());
                 writer.write('\t');
                 writer.write(pair.value());
@@ -77,15 +106,25 @@ public class ShufflePartitioner implements AutoCloseable {
         }
     }
 
+    /**
+     * Retrieves a cached writer or dynamically provisions a new LZ4 stream for the partition.
+     *
+     * @param partitionIndex The mathematical routing destination for the data payload.
+     * @return A ready-to-write, buffered, LZ4-compressed output stream.
+     * @throws IOException If the file cannot be created or opened for I/O operations.
+     */
     private BufferedWriter getOrCreateWriter(int partitionIndex) throws IOException {
         BufferedWriter cachedWriter = writerCache.get(partitionIndex);
         if (cachedWriter != null) return cachedWriter;
 
         Path partitionDir = Paths.get(baseShuffleDir, jobId, String.valueOf(partitionIndex));
+
+        // Note: Directory is guaranteed to exist due to eager allocation in the constructor,
+        // but retaining this call ensures idempotency if manual disk interventions occurred.
         Files.createDirectories(partitionDir);
 
-        // Use TRUNCATE_EXISTING instead of APPEND. If a task is retried,
-        // we must start the LZ4 frame fresh to prevent binary corruption.
+        // Use TRUNCATE_EXISTING instead of APPEND. If a Map task is retried (Lineage Recovery),
+        // the system must start a fresh LZ4 frame to prevent binary corruption on the Reducer.
         Path filePath = partitionDir.resolve(mapTaskId + ".lz4");
         OutputStream os = Files.newOutputStream(filePath,
                 StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
@@ -97,15 +136,22 @@ public class ShufflePartitioner implements AutoCloseable {
         return writer;
     }
 
+    /**
+     * Safely flushes and terminates all active LZ4 streams managed by this partitioner.
+     * <p>
+     * Essential for ensuring that all compressed frames are fully finalized on the local disk
+     * before the TaskExecutor signals a successful completion to the Orchestrator.
+     * </p>
+     */
     @Override
     public void close() {
-        logger.info("Finalizing LZ4 partitions for task: {}", mapTaskId);
+        logger.info("Finalizing LZ4 partition frames for task: {}", mapTaskId);
         for (BufferedWriter writer : writerCache.values()) {
             try {
                 writer.flush();
                 writer.close();
             } catch (IOException e) {
-                logger.error("Failed to finalize shuffle stream", e);
+                logger.error("Failed to finalize shuffle stream for task: {}", mapTaskId, e);
             }
         }
         writerCache.clear();
