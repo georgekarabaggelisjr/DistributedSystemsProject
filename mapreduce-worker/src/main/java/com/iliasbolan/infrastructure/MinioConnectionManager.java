@@ -17,7 +17,7 @@ import org.slf4j.LoggerFactory;
  *
  * <p><b>Thread Safety:</b><br>
  * The underlying {@link MinioClient} is designed to be thread-safe. This manager maintains
- * a single instance of the client, making it suitable for injection into multi-threaded
+ * a single instance of the client, making it suitable for injection into multithreaded
  * services such as the {@link S3ClientService}.</p>
  *
  * @author Ilias Bolanakis

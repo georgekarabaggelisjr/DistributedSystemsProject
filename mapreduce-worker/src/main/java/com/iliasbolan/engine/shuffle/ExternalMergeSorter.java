@@ -13,8 +13,6 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.*;
-import java.util.concurrent.ForkJoinPool;
-import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 /**
@@ -55,11 +53,10 @@ public class ExternalMergeSorter {
      *
      * @param rawDataDir The local directory containing the raw, LZ4-compressed gRPC stream files.
      * @param reducer    The user-defined Reducer implementation dynamically loaded into the JVM.
-     * @param pool       The shared thread pool (reserved for future parallel external sorting).
      * @return The {@link Path} to the final serialized file containing the reduced output.
      * @throws IOException If a fatal disk I/O failure occurs during merging or resource allocation.
      */
-    public static Path sortReduceAndSpill(Path rawDataDir, Reducer reducer, ForkJoinPool pool) throws IOException {
+    public static Path sortReduceAndSpill(Path rawDataDir, Reducer reducer) throws IOException {
         logger.info("Initializing LZ4-Aware ExternalMergeSorter on directory: {}", rawDataDir);
 
         Path runsDir = rawDataDir.resolve("sorted_runs");
@@ -96,7 +93,7 @@ public class ExternalMergeSorter {
             // Strictly require .lz4 extension to avoid reading active .tmp fetches
             List<Path> filesToProcess = rawFiles
                     .filter(p -> p.getFileName().toString().startsWith("grpc_stream_") && p.toString().endsWith(".lz4"))
-                    .collect(Collectors.toList());
+                    .toList();
 
             for (Path rawFile : filesToProcess) {
 
@@ -257,7 +254,6 @@ public class ExternalMergeSorter {
      * A lazy-evaluating Iterator that pulls data continuously from the K-Way merge PriorityQueue.
      */
     private record StreamGroupingIterator(PriorityQueue<StreamNode> pq, String currentKey) implements Iterator<String> {
-        private StreamGroupingIterator {}
 
         @Override
         public boolean hasNext() {
@@ -269,6 +265,7 @@ public class ExternalMergeSorter {
             if (!hasNext()) throw new NoSuchElementException("No more values for key: " + currentKey);
 
             StreamNode minNode = pq.poll();
+            assert minNode != null;
             String valueToReturn = minNode.currentValue;
 
             // Zero-Allocation Advance: Mutate and reinsert the node

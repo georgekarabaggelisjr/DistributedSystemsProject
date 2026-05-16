@@ -191,7 +191,7 @@ public class SandboxRunner {
         // Raw Data strictly isolated within the Job's directory boundary for Janitor collection
         Path rawDataDir = Paths.get(baseShuffleDir, payload.jobId(), "reduce_raw", String.valueOf(partitionIndex));
 
-        Path finalReducedFile = ExternalMergeSorter.sortReduceAndSpill(rawDataDir, reducer, ForkJoinPool.commonPool());
+        Path finalReducedFile = ExternalMergeSorter.sortReduceAndSpill(rawDataDir, reducer);
 
         // --- MULTI-TENANT FIX ---
         // Dynamically constructs the S3 Key using the Orchestrator's injected payload.objectName().
