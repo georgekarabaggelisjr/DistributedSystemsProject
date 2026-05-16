@@ -149,7 +149,14 @@ public class TaskExecutor {
 
         java.io.File fileObj = new java.io.File(localCodePath);
         fileObj.getParentFile().mkdirs();
-        s3ClientService.downloadUserCode(payload.userCodeBucket(), payload.userCodeObject(), localCodePath);
+
+        // --- Prevent Redundant S3 Fetches ---
+        if (!fileObj.exists()) {
+            s3ClientService.downloadUserCode(payload.userCodeBucket(), payload.userCodeObject(), localCodePath);
+        } else {
+            logger.debug("User code already localized. Skipping S3 fetch.");
+        }
+        // -----------------------------------------
 
         // Payload localized within the ESS Janitor boundary
         Path payloadFile = Paths.get(baseShuffleDir, safeJobId, "payloads", safeTaskId + ".json");
@@ -198,7 +205,14 @@ public class TaskExecutor {
 
         java.io.File fileObj = new java.io.File(localCodePath);
         fileObj.getParentFile().mkdirs();
-        s3ClientService.downloadUserCode(payload.userCodeBucket(), payload.userCodeObject(), localCodePath);
+
+        // --- Prevent Redundant S3 Fetches ---
+        if (!fileObj.exists()) {
+            s3ClientService.downloadUserCode(payload.userCodeBucket(), payload.userCodeObject(), localCodePath);
+        } else {
+            logger.debug("User code already localized. Skipping S3 fetch.");
+        }
+        // -----------------------------------------
 
         int partitionIndex = Integer.parseInt(safeTaskId);
         // Raw gRPC streams strictly bounded to the Job Directory

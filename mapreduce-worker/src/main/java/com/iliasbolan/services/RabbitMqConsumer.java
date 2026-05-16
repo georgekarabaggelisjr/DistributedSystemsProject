@@ -157,7 +157,7 @@ public class RabbitMqConsumer {
 
     /**
      * Processes an individual message delivery, handling metadata extraction,
-     * task execution, and AMQP signaling.
+     * task execution, and manual retry tracking for Classic Lazy Queues.
      *
      * @param channel  The active RabbitMQ channel for ACKing or NACKing.
      * @param delivery The encapsulated AMQP delivery containing the body and envelopes.
@@ -166,7 +166,9 @@ public class RabbitMqConsumer {
     private void handleMessage(Channel channel, com.rabbitmq.client.Delivery delivery) throws IOException {
         byte[] rawBody = delivery.getBody();
         long deliveryTag = delivery.getEnvelope().getDeliveryTag();
-        long deliveryCount = getDeliveryCount(delivery.getProperties());
+
+        // --- Extract custom retry count instead of native Quorum count ---
+        long deliveryCount = getCustomDeliveryCount(delivery.getProperties());
 
         String jobId = "UNKNOWN";
         String taskId = "UNKNOWN";
@@ -190,9 +192,11 @@ public class RabbitMqConsumer {
 
             // Poison Pill Check: Prevent infinite retry loops of faulty tasks
             if (deliveryCount > MAX_RETRIES) {
-                logger.error("Poison Pill Detected! Task exceeded MAX_RETRIES ({}).", MAX_RETRIES);
+                logger.error("Poison Pill Detected! Task exceeded MAX_RETRIES ({}). Routing to DLX.", MAX_RETRIES);
                 eventProducer.sendErrorSignal(jobId, taskId, jobToken, "FAILED", "MAX_RETRIES_EXCEEDED");
-                channel.basicNack(deliveryTag, false, false); // Drop and route to DLX
+
+                // NACK with requeue=false forces the lazy queue to push it to the Dead Letter Exchange
+                channel.basicNack(deliveryTag, false, false);
                 return;
             }
 
@@ -203,21 +207,41 @@ public class RabbitMqConsumer {
                 // Delegate computation to the TaskExecutor (Sandbox)
                 taskExecutor.executeTask(messageBody);
 
-                // Explicit positive acknowledgment
+                // Explicit positive acknowledgment on success
                 channel.basicAck(deliveryTag, false);
 
             } catch (Throwable t) {
-                logger.error("Transient task failure. Re-queuing and signaling FAILED state.", t);
+                logger.error("Transient task failure. Republishing with incremented retry count.", t);
 
                 try {
-                    // Isolate the network call so a secondary failure doesn't hijack the NACK
+                    // Isolate the network call so a secondary failure doesn't hijack the retry logic
                     eventProducer.sendErrorSignal(jobId, taskId, jobToken, "FAILED", t.getClass().getSimpleName());
                 } catch (Exception networkError) {
-                    logger.error("Failed to broadcast error signal to Manager. Proceeding with local NACK.", networkError);
+                    logger.error("Failed to broadcast error signal. Proceeding with local requeue.", networkError);
                 } finally {
-                    // ROBUSTNESS FIX: Guaranteed NACK execution
-                    // Ensures the RabbitMQ QoS slot is always released, preventing worker deadlocks.
-                    channel.basicNack(deliveryTag, false, true); // Re-queue for another worker to attempt
+                    // --- Republish-with-Header Pattern ---
+                    // 1. Create a mutable copy of the headers and increment the custom retry count
+                    java.util.Map<String, Object> headers = delivery.getProperties().getHeaders();
+                    if (headers == null) {
+                        headers = new java.util.HashMap<>();
+                    } else {
+                        headers = new java.util.HashMap<>(headers); // Ensure mutability
+                    }
+                    headers.put("x-custom-retry-count", deliveryCount + 1);
+
+                    AMQP.BasicProperties retryProps = new AMQP.BasicProperties.Builder()
+                            .headers(headers)
+                            .deliveryMode(2) // Ensure the retry message is persistent on disk
+                            .contentType(delivery.getProperties().getContentType())
+                            .build();
+
+                    // 2. Publish the new message to the back of the queue
+                    // Note: "" as exchange routes it directly to the queueName
+                    channel.basicPublish("", this.queueName, retryProps, rawBody);
+
+                    // 3. ACK the original failing message so it is successfully dequeued
+                    channel.basicAck(deliveryTag, false);
+                    // ------------------------------------------
                 }
             }
         } finally {
@@ -226,17 +250,21 @@ public class RabbitMqConsumer {
     }
 
     /**
-     * Extracts the delivery count from AMQP headers to support Poison Pill detection.
+     * Extracts the custom delivery count from AMQP headers to support
+     * Poison Pill detection on Classic Lazy Queues.
      *
      * @param properties The AMQP properties associated with the current delivery.
-     * @return The number of times this message has been delivered.
+     * @return The number of times this message has been locally retried.
      */
-    private long getDeliveryCount(AMQP.BasicProperties properties) {
-        Map<String, Object> headers = properties.getHeaders();
-        if (headers != null && headers.containsKey("x-delivery-count")) {
-            return ((Number) headers.get("x-delivery-count")).longValue();
+    private long getCustomDeliveryCount(AMQP.BasicProperties properties) {
+        java.util.Map<String, Object> headers = properties.getHeaders();
+        if (headers != null && headers.containsKey("x-custom-retry-count")) {
+            Object countStr = headers.get("x-custom-retry-count");
+            if (countStr instanceof Number) {
+                return ((Number) countStr).longValue();
+            }
         }
-        return 1;
+        return 1; // Default to 1 for the initial attempt
     }
 
     /**

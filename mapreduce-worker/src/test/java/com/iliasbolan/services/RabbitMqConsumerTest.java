@@ -15,6 +15,7 @@ import org.mockito.Mockito;
 
 import java.nio.charset.StandardCharsets;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.*;
@@ -36,7 +37,7 @@ import static org.mockito.Mockito.*;
  * </p>
  *
  * @author Ilias Bolanakis
- * @version 2.1
+ * @version 2.2
  * @since 2026-04-25
  * @see com.iliasbolan.services.RabbitMqConsumer
  */
@@ -133,14 +134,14 @@ class RabbitMqConsumerTest {
 
     /**
      * Validates error handling logic when a task fails during execution.
-     * Ensures that the message is re-queued for another retry and an error
-     * signal is transmitted to the Manager.
+     * Ensures that the message is republished to the back of the queue with an
+     * incremented custom header, and the original message is successfully ACKed.
      *
      * @throws Throwable If the mock execution fails to throw as expected.
      */
     @Test
     @SuppressWarnings("unchecked")
-    void testHandleDelivery_TaskExecutionFailure_IssuesNackAndErrorSignal() throws Throwable {
+    void testHandleDelivery_TaskExecutionFailure_RepublishesWithHeader() throws Throwable {
         RabbitMqConsumer consumer = new RabbitMqConsumer(mockManager, "test-queue", 5000, mockTaskExecutor, mockEventProducer);
         // Simulate a transient computational failure
         doThrow(new RuntimeException("I/O Error")).when(mockTaskExecutor).executeTask(anyString());
@@ -163,9 +164,6 @@ class RabbitMqConsumerTest {
 
         internalCallback.handle("tag", new com.rabbitmq.client.Delivery(envelope, new AMQP.BasicProperties(), body));
 
-        // Ensure NACK is issued with requeue=true for fault tolerance
-        verify(mockChannel).basicNack(eq(deliveryTag), eq(false), eq(true));
-
         // Verify error signaling includes diagnostic information and the auth token
         verify(mockEventProducer).sendErrorSignal(
                 eq("job-002"),
@@ -174,6 +172,18 @@ class RabbitMqConsumerTest {
                 eq("FAILED"),
                 eq("RuntimeException")
         );
+
+        // --- FIX: Verify Republish-with-Header pattern instead of native NACK ---
+        ArgumentCaptor<AMQP.BasicProperties> propsCaptor = ArgumentCaptor.forClass(AMQP.BasicProperties.class);
+        verify(mockChannel).basicPublish(eq(""), eq("test-queue"), propsCaptor.capture(), eq(body));
+
+        // Assert the custom retry count header was injected/incremented to 2
+        Object retryCount = propsCaptor.getValue().getHeaders().get("x-custom-retry-count");
+        assertEquals(2L, retryCount, "The custom retry header should be incremented to 2.");
+
+        // Verify the original failing message was ACKed to clear it from the front of the queue
+        verify(mockChannel).basicAck(eq(deliveryTag), eq(false));
+        // ------------------------------------------------------------------------
 
         consumer.stopConsuming();
         consumerThread.join();
@@ -207,14 +217,15 @@ class RabbitMqConsumerTest {
         byte[] body = "{\"jobId\":\"poison-pill\", \"taskId\":\"map-2\", \"jobToken\":\"token-789\"}"
                 .getBytes(StandardCharsets.UTF_8);
 
-        // Inject AMQP headers indicating this message has already been retried 5 times
+        // --- FIX: Inject the NEW custom header instead of the old quorum queue header ---
         java.util.Map<String, Object> headers = new java.util.HashMap<>();
-        headers.put("x-delivery-count", 5);
+        headers.put("x-custom-retry-count", 5);
         AMQP.BasicProperties properties = new AMQP.BasicProperties.Builder().headers(headers).build();
+        // ------------------------------------------------------------------------------
 
         internalCallback.handle("tag", new com.rabbitmq.client.Delivery(envelope, properties, body));
 
-        // Verify NACK with requeue=false to discard the poison pill
+        // Verify NACK with requeue=false to discard the poison pill to the DLX
         verify(mockChannel).basicNack(eq(deliveryTag), eq(false), eq(false));
 
         // Verify terminal failure signal

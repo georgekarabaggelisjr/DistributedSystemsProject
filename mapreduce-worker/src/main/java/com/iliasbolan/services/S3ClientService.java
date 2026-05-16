@@ -141,28 +141,24 @@ public class S3ClientService {
         return Retry.decorateCheckedSupplier(retryContext, () -> {
             logger.info(" Offset: {}, Target Length: {} bytes", offset, length);
 
-            // PERFORMANCE OPTIMIZATION: Memory Pre-allocation
-            // Assumes an average line length of 100 bytes to pre-size the array.
-            // Eliminates O(N) array copying and extreme GC pressure during massive chunk ingestion.
             int estimatedRecordCount = (int) (length / 100);
             List<String> cleanRecords = new ArrayList<>(estimatedRecordCount);
 
-            // ARCHITECTURAL FIX 1: The Hadoop Lookback Pattern.
-            // Fetch offset - 1 to check boundary alignment without dropping perfectly aligned records.
             long fetchOffset = offset > 0 ? offset - 1 : 0;
             long fetchLength = offset > 0 ? length + 1 : length;
 
-            // PERFORMANCE OPTIMIZATION: I/O Batching
-            // Wrapping the raw MinIO InputStream in a BufferedInputStream (32KB buffer)
-            // mitigates extreme network latency caused by single-byte sequential reads.
+            // --- The Stream Truncation Bug ---
+            // Removed .length(fetchLength) from the GetObjectArgs builder.
+            // This allows the stream to naturally read past the mathematical chunk boundary
+            // to finish the final word without MinIO abruptly severing the TCP connection.
             try (InputStream rawStream = minioClient.getObject(
                     GetObjectArgs.builder()
                             .bucket(bucketName)
                             .object(objectName)
                             .offset(fetchOffset)
-                            .length(fetchLength)
                             .build());
                  java.io.BufferedInputStream stream = new java.io.BufferedInputStream(rawStream, 32768)) {
+                // ----------------------------------------
 
                 long bytesProcessedInChunk = 0;
                 boolean skipFirstRecord = false;
@@ -170,13 +166,11 @@ public class S3ClientService {
                 if (offset > 0) {
                     int lookbackByte = stream.read();
                     bytesProcessedInChunk++;
-                    // If the byte directly preceding our chunk is NOT a newline, we started mid-record
                     if (lookbackByte != 0x0A) {
                         skipFirstRecord = true;
                     }
                 }
 
-                // SYNC PHASE: Discard the broken fragment if we landed mid-record
                 if (skipFirstRecord) {
                     int b;
                     while ((b = stream.read()) != -1) {
@@ -185,43 +179,47 @@ public class S3ClientService {
                     }
                 }
 
-                // EXTRACTION PHASE: Read target length + finish current line
                 ByteArrayOutputStream lineBuffer = new ByteArrayOutputStream(256);
-
-                // OOM SECURITY GUARD: Prevent infinite heap buffering on malformed data
-                final int MAX_LINE_SIZE_BYTES = 100 * 1024 * 1024; // 100MB limit
+                final int MAX_LINE_SIZE_BYTES = 100 * 1024 * 1024;
                 int b;
 
                 while ((b = stream.read()) != -1) {
                     bytesProcessedInChunk++;
                     lineBuffer.write(b);
 
-                    // Enforce the strict upper bound to protect the JVM heap
                     if (lineBuffer.size() > MAX_LINE_SIZE_BYTES) {
                         throw new IOException(
-                                String.format("Security/OOM Guard Triggered: Encountered a line exceeding %d bytes. " +
-                                        "The dataset may be malformed or missing newline delimiters.", MAX_LINE_SIZE_BYTES)
+                                String.format("Security/OOM Guard Triggered: Encountered a line exceeding %d bytes.", MAX_LINE_SIZE_BYTES)
                         );
                     }
 
-                    // UTF-8 records are separated by standard LF (0x0A)
                     if (b == 0x0A) {
-                        String line = lineBuffer.toString(StandardCharsets.UTF_8).trim();
+                        String line = lineBuffer.toString(StandardCharsets.UTF_8);
+
+                        // --- Semantic Whitespace Preservation ---
+                        // Replaces .trim() with targeted boundary character stripping.
+                        // This removes Windows (\r) and Unix (\n) line endings while safely
+                        // preserving inner tabs and spaces required by the Mapper.
+                        if (line.endsWith("\r\n")) {
+                            line = line.substring(0, line.length() - 2);
+                        } else if (line.endsWith("\n")) {
+                            line = line.substring(0, line.length() - 1);
+                        } else if (line.endsWith("\r")) {
+                            line = line.substring(0, line.length() - 1);
+                        }
+                        // -----------------------------------------------
 
                         if (!line.isEmpty()) {
                             cleanRecords.add(line);
                         }
 
-                        // ARCHITECTURAL FIX 2: Dynamic Buffer Eviction
-                        // Prevents permanent memory hoarding. If a malformed line causes the buffer
-                        // to swell massively, we drop it to the GC rather than keeping the bloated array.
-                        if (lineBuffer.size() > 1024 * 1024) { // 1MB eviction threshold
+                        if (lineBuffer.size() > 1024 * 1024) {
                             lineBuffer = new ByteArrayOutputStream(256);
                         } else {
                             lineBuffer.reset();
                         }
 
-                        // Termination condition: Quota reached AND record completed
+                        // The loop naturally terminates here, gracefully closing the streams
                         if (bytesProcessedInChunk >= fetchLength) {
                             logger.info("Fulfilled quota ({} bytes). Closing stream.", bytesProcessedInChunk);
                             break;
@@ -229,9 +227,14 @@ public class S3ClientService {
                     }
                 }
 
-                // Edge Case: Handle file trailing bytes missing a newline
+                // Handle file trailing bytes missing a newline
                 if (lineBuffer.size() > 0) {
-                    String lastLine = lineBuffer.toString(StandardCharsets.UTF_8).trim();
+                    String lastLine = lineBuffer.toString(StandardCharsets.UTF_8);
+
+                    if (lastLine.endsWith("\r")) {
+                        lastLine = lastLine.substring(0, lastLine.length() - 1);
+                    }
+
                     if (!lastLine.isEmpty()) {
                         cleanRecords.add(lastLine);
                     }
