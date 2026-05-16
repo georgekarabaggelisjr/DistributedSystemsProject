@@ -13,7 +13,12 @@ buildNumber.properties
 !.mvn/wrapper/maven-wrapper.jar
 
 ### IntelliJ IDEA ###
+# Ignore local workspace configurations
 .idea/
+
+# EXCEPT for team-wide shared code styles
+!.idea/codeStyles/
+
 *.iws
 *.iml
 *.ipr
