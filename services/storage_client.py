@@ -34,32 +34,25 @@ class StorageClient:
             use_ssl=self.endpoint.startswith('https')
         )
 
-    async def upload_file(self, bucket_name: str, file_path: str, file_stream: bytes) -> str:
+    async def upload_file(self, bucket_name: str, file_path: str, file_obj) -> str:
         """
-        Uploads data to MinIO without blocking the FastAPI event loop.
-
-        1. Starts an async client session.
-        2. Checks if bucket exists (optional/admin task) and creates it if it doesn't.
-        3. Performs 'put_object' using the binary stream.
-
-        Returns:
-            str: The internal S3 URI
+        Uploads data to MinIO using streaming (upload_fileobj).
+        'file_obj' should be a file-like object (e.g., UploadFile.file).
         """
         async with self._get_client() as client:
             try:
-                await client.head_bucket(Bucket=bucket_name) # Check if the bucket exists
+                await client.head_bucket(Bucket=bucket_name)
             except ClientError as e:
-                error_code = e.response['Error']['Code']
-                if error_code == '404':
+                if e.response['Error']['Code'] == '404':
                     logger.info(f"Bucket '{bucket_name}' not found. Creating it...")
-                    await client.create_bucket(Bucket=bucket_name) # Create the bucket
+                    await client.create_bucket(Bucket=bucket_name)
                 else:
                     raise e
 
-            # Upload the file
-            await client.put_object(Bucket=bucket_name, Key=file_path, Body=file_stream)
+            # Χρήση της upload_fileobj για streaming
+            # Αυτή η μέθοδος διαχειρίζεται αυτόματα τα chunks
+            await client.upload_fileobj(file_obj, bucket_name, file_path)
 
-            # Return the  S3 URI that we will save in the DB (DDS)
             return f"s3://{bucket_name}/{file_path}"
 
 

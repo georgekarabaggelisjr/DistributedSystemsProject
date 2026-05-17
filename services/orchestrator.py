@@ -23,11 +23,11 @@ class JobOrchestrator:
 
     async def submit_job(self,
         user_id: str,
-        data_filename: str,
+        data_file: UploadFile,
         data_bytes: bytes,
-        mapper_filename: str,
+        mapper_file: UploadFile,
         mapper_bytes: bytes,
-        reducer_filename: str,
+        reducer_file: UploadFile,
         reducer_bytes: bytes
     ) -> str:
         """
@@ -46,9 +46,9 @@ class JobOrchestrator:
         base_path = f"{user_id}/{job_id}" # Create a 'path' for this user and that job
 
         try:
-            data_uri = await self.storage.upload_file("data", f"{base_path}/{data_filename}", data_bytes)
-            mapper_uri = await self.storage.upload_file("code", f"{base_path}/{mapper_filename}", mapper_bytes)
-            reducer_uri = await self.storage.upload_file("code", f"{base_path}/{reducer_filename}", reducer_bytes)
+            data_uri = await self.storage.upload_file("data", f"{base_path}/{data_file.filename}", data_file.file)
+            mapper_uri = await self.storage.upload_file("code", f"{base_path}/{mapper_file.filename}", mapper_file.file)
+            reducer_uri = await self.storage.upload_file("code", f"{base_path}/{reducer_file.filename}", reducer_file.file)
             output_uri = f"s3://output/{base_path}/results/final_output.json"
 
             new_job = JobRecord(
@@ -56,7 +56,7 @@ class JobOrchestrator:
                 user_id=user_id,
                 status="PENDING",
                 format="JSON",
-                input_filename=data_filename,
+                input_filename=data_file.filename,
                 mapper_code_path=mapper_uri,
                 reducer_code_path=reducer_uri,
                 output_path=output_uri
@@ -65,12 +65,10 @@ class JobOrchestrator:
             self.db.add(new_job)
             await self.db.commit()
 
-            # Metadata for the Manager
+            # Metadata for the Manager (Matches ScheduleJobRequest schema)
             job_metadata = {
-                "input_uri": data_uri,
-                "mapper_uri": mapper_uri,
-                "reducer_uri": reducer_uri,
-                "output_prefix": f"s3://output/{base_path}/"
+                "s3_input_uri": data_uri,
+                "file_size": len(data_bytes)
             }
 
             # Call ManagerRouter

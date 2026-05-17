@@ -30,21 +30,13 @@ async def submit_job(
     # 1
     user_id = current_user["sub"]
 
-    data_bytes = await data_file.read()
-    mapper_bytes = await mapper_file.read()
-    reducer_bytes = await reducer_file.read()
-
     # 2
     job_id = await orchestrator.submit_job(
         user_id=user_id,
-        data_filename=data_file.filename,
-        data_bytes=data_bytes,
-        mapper_filename=mapper_file.filename,
-        mapper_bytes=mapper_bytes,
-        reducer_filename=reducer_file.filename,
-        reducer_bytes=reducer_bytes
+        data_file=data_file,
+        mapper_file=mapper_file,
+        reducer_file=reducer_file
     )
-
     # 3
     return {
         "job_id": job_id,

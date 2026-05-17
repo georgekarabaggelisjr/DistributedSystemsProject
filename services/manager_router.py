@@ -40,17 +40,16 @@ class ManagerRouter:
         """
         target_index = self._hash_job_id(job_id)
 
-        # Building the internal URL for the specific pod (Structure: pod-name.service-name.namespace.svc.cluster.local)
-        target_manager_url = f"http://manager-{target_index}.{self.manager_dns}:8001/jobs/execute"
+        target_manager_url = f"http://manager-{target_index}.{self.manager_dns}:8001/internal/schedule"
 
         logger.info(f"Routing Job {job_id} to Manager Replica {target_index} at {target_manager_url}")
 
         # Sending HTTP POST to Manager
         async with httpx.AsyncClient(timeout=10.0) as client:
             try:
-                # Send metadata (S3 URIs, Job ID, ...)
                 response = await client.post(
                     target_manager_url,
+                    headers={"idempotency-key": job_id},
                     json={
                         "job_id": job_id,
                         **job_metadata
