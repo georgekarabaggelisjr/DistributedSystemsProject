@@ -8,36 +8,36 @@ from models.schemas import JobResponse
 from services.manager_router import ManagerRouter
 from services.orchestrator import JobOrchestrator
 from services.storage_client import StorageClient
+from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, status, Request # <-- Πρόσθ
 
 router = APIRouter()
 
 
 @router.post("/", status_code=202)
 async def submit_job(
+        request: Request,  # <-- ΝΕΟ: Για να πάρουμε τα headers του HTTP
         data_file: UploadFile = File(...),
         mapper_file: UploadFile = File(...),
         reducer_file: UploadFile = File(...),
         current_user: dict = Depends(get_current_user),
         orchestrator: JobOrchestrator = Depends(get_orchestrator)
 ):
-    """
-    REST Endpoint for CLI: 'jobs submit <data> <code>'.
-
-    1. Extracts the user's id and the  binary streams from the Multipart/Form-data request.
-    2. Passes the user identity and files to the JobOrchestrator.
-    3. Returns the Job ID immediately (Asynchronous pattern).
-    """
-    # 1
     user_id = current_user["sub"]
 
-    # 2
+    # Παίρνουμε το Token ακριβώς όπως μας το έστειλε το CLI (π.χ. "Bearer eyJhbG...")
+    auth_header = request.headers.get("Authorization")
+
+    if not auth_header:
+        raise HTTPException(status_code=401, detail="Missing Authorization header")
+
     job_id = await orchestrator.submit_job(
         user_id=user_id,
+        auth_token=auth_header,  # <-- ΝΕΟ: Το περνάμε στον orchestrator
         data_file=data_file,
         mapper_file=mapper_file,
         reducer_file=reducer_file
     )
-    # 3
+
     return {
         "job_id": job_id,
         "message": "Job submitted successfully and is pending execution."
@@ -97,20 +97,20 @@ async def get_single_job_status(
 async def get_job_result(
         job_id: str,
         current_user: dict = Depends(get_current_user),
-        orchestrator: JobOrchestrator = Depends(get_orchestrator) # <--- Χρήση του Dependency
+        orchestrator: JobOrchestrator = Depends(get_orchestrator)
 ):
     """
     REST Endpoint for CLI: 'jobs result <id>'.
 
     1. Validates that the job status is 'COMPLETED'.
-    2. Validates ownership (User A cannot download User B's result unless Admin).
-    3. Returns a StreamingResponse from MinIO to avoid buffering large files in UI memory.
+    2. Validates ownership (User A cannot see User B's result unless Admin).
+    3. Returns the S3 URI/Link of the MinIO bucket folder containing the output files.
     """
     user_id = current_user["sub"]
     roles = current_user.get("realm_access", {}).get("roles", [])
     is_admin = "admin" in roles
 
-    # Check if the user has access
+    # 1. Έλεγχος αν το job υπάρχει και αν ανήκει στον χρήστη
     job = await orchestrator.get_job_status(job_id=job_id, user_id=user_id, is_admin=is_admin)
     if not job:
         raise HTTPException(
@@ -118,24 +118,23 @@ async def get_job_result(
             detail="Job not found or access denied."
         )
 
-    # Check if the job is "COMPLETED"
+    # 2. Έλεγχος αν το job έχει ολοκληρωθεί
     if str(job.status.value) != "COMPLETED" and str(job.status) != "COMPLETED":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Job result is not ready. Current status: {job.status}"
         )
 
-    # Get the data from MiniIO based on the output_path of DDS
-    try:
-        file_stream = await orchestrator.get_result_stream(job.output_path)
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error retrieving file from storage: {str(e)}"
+    # 3. Επιστροφή των πληροφοριών τοποθεσίας (JSON αντί για Streaming)
+    # Αν γνωρίζεις το external URL του MinIO Console (π.χ. από env variable),
+    # θα μπορούσες να κατασκευάσεις και ένα απευθείας HTTP Link για τον browser.
+    return {
+        "job_id": job_id,
+        "status": "COMPLETED",
+        "storage_type": "MinIO (S3-Compatible)",
+        "output_directory_uri": job.output_path,
+        "message": (
+            f"The job completed successfully. Output is fragmented into multiple files. "
+            f"You can download them from your S3 client or MinIO Browser at prefix: {job.output_path}"
         )
-
-    return StreamingResponse(
-        file_stream,
-        media_type="application/octet-stream",
-        headers={"Content-Disposition": f"attachment; filename=result_{job_id}.json"}
-    )
+    }

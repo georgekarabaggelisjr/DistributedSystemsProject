@@ -1,6 +1,8 @@
 import logging
 from uuid import uuid4
 from typing import List, Optional, AsyncGenerator
+
+from fastapi import UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
@@ -23,39 +25,27 @@ class JobOrchestrator:
 
     async def submit_job(self,
         user_id: str,
+        auth_token: str, # <-- ΝΕΟ: Δέχεται το token
         data_file: UploadFile,
-        data_bytes: bytes,
         mapper_file: UploadFile,
-        mapper_bytes: bytes,
-        reducer_file: UploadFile,
-        reducer_bytes: bytes
+        reducer_file: UploadFile
     ) -> str:
-        """
-        Executes Step 3.2 (Submit Data, Submit Code & Run Compute Job).
-
-        1. Generates a new UUID for the job.
-        2. Uploads `data_bytes` and `code_bytes` to MinIO via StorageClient.
-        3. Inserts a new record into the DDS (PostgreSQL) with status 'PENDING'.
-        4. Calls the ManagerRouter to dispatch the Job Metadata to a Manager instance.
-
-        Returns:
-            str: The newly generated job_id to be returned to the CLI (202 Accepted).
-        """
-        job_id = str(uuid4()) # Create a unique job_id
-
-        base_path = f"{user_id}/{job_id}" # Create a 'path' for this user and that job
+        job_id = str(uuid4())
+        base_path = f"{user_id}/{job_id}"
 
         try:
+            # (Τα uploads στο storage παραμένουν ως έχουν...)
             data_uri = await self.storage.upload_file("data", f"{base_path}/{data_file.filename}", data_file.file)
             mapper_uri = await self.storage.upload_file("code", f"{base_path}/{mapper_file.filename}", mapper_file.file)
             reducer_uri = await self.storage.upload_file("code", f"{base_path}/{reducer_file.filename}", reducer_file.file)
-            output_uri = f"s3://output/{base_path}/results/final_output.json"
+            output_uri = f"s3://output/{base_path}/results/"
 
+            # (Η εγγραφή στη βάση παραμένει ως έχει...)
             new_job = JobRecord(
                 id=job_id,
                 user_id=user_id,
                 status="PENDING",
-                format="JSON",
+                format="JSON", # Μπορείς να το κάνεις δυναμικό αν θες
                 input_filename=data_file.filename,
                 mapper_code_path=mapper_uri,
                 reducer_code_path=reducer_uri,
@@ -65,23 +55,25 @@ class JobOrchestrator:
             self.db.add(new_job)
             await self.db.commit()
 
-            # Metadata for the Manager (Matches ScheduleJobRequest schema)
+            # --- ΝΕΟ: Το Payload με βάση το POST_REQUEST.md ---
             job_metadata = {
-                "s3_input_uri": data_uri,
-                "file_size": len(data_bytes)
+                "jobId": job_id,
+                "format": "JSON",
+                "inputFilename": data_file.filename,
+                "fileSize": data_file.size,
+                "mapperFilename": mapper_file.filename,
+                "reducerFilename": reducer_file.filename
             }
 
-            # Call ManagerRouter
-            success = await self.router.dispatch_job(job_id, job_metadata)
+            # Περνάμε και το token στον Router
+            success = await self.router.dispatch_job(job_id, job_metadata, auth_token)
 
             if not success:
-                # Προαιρετικά: Εδώ θα μπορούσες να αλλάξεις το status σε 'FAILED' αν ο Manager δεν απαντά
                 logger.error(f"Job {job_id} saved but Manager dispatch failed.")
 
             return job_id
 
         except Exception as e:
-            # If there's a problem with MinIO or the DDS -> Rollback the transaction
             await self.db.rollback()
             logger.error(f"Failed to submit job {job_id} for user {user_id}: {str(e)}")
             raise e

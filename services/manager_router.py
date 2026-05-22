@@ -26,34 +26,27 @@ class ManagerRouter:
         hash_digest = hashlib.sha256(job_id.encode()).hexdigest()
         return int(hash_digest, 16) % self.num_replicas
 
-    async def dispatch_job(self, job_id: str, job_metadata: dict) -> bool:
+    async def dispatch_job(self, job_id: str, job_metadata: dict, auth_token: str) -> bool:
         """
         Routes the job execution request to the appropriate Manager StatefulSet replica.
-
-        Workflow:
-        1. Calculates the hash of the job_id.
-        2. Determines the target replica (e.g., 'manager-2.manager-service.default.svc.cluster.local').
-        3. Sends an HTTP POST to the internal Manager endpoint with the S3 URIs.
-
-        Returns:
-            bool: True if the Manager accepted the job.
         """
         target_index = self._hash_job_id(job_id)
 
+        # Το σωστό endpoint
         target_manager_url = f"http://manager-{target_index}.{self.manager_dns}:8001/internal/schedule"
 
         logger.info(f"Routing Job {job_id} to Manager Replica {target_index} at {target_manager_url}")
 
-        # Sending HTTP POST to Manager
         async with httpx.AsyncClient(timeout=10.0) as client:
             try:
                 response = await client.post(
                     target_manager_url,
-                    headers={"idempotency-key": job_id},
-                    json={
-                        "job_id": job_id,
-                        **job_metadata
-                    }
+                    # --- ΝΕΟ: Τα Headers ακριβώς όπως τα ζήτησε ---
+                    headers={
+                        "Idempotency-Key": job_id,
+                        "Authorization": auth_token
+                    },
+                    json=job_metadata # Το job_metadata έχει ήδη τη σωστή δομή τώρα
                 )
 
                 if response.status_code == 202:
