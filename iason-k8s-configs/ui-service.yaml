@@ -1,0 +1,58 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ui-service
+  labels:
+    app: ui-service
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: ui-service
+  template:
+    metadata:
+      labels:
+        app: ui-service
+    spec:
+      containers:
+      - name: ui-service
+        image: ui-service:latest # Απλό όνομα, χωρίς username
+        imagePullPolicy: Never
+        ports:
+        - containerPort: 8000
+        env:
+        # The values that I have at the .env of development
+        - name: DATABASE_URL
+          value: "postgresql+asyncpg://admin:DisSami26@postgres:5432/dds_db"
+        - name: KEYCLOAK_SERVER_URL
+          value: "http://keycloak:8080"
+        - name: KEYCLOAK_REALM
+          value: "myrealm"
+        - name: KEYCLOAK_ADMIN_USER
+          value: "admin"
+        - name: KEYCLOAK_ADMIN_PASSWORD
+          value: "admin"
+        - name: KEYCLOAK_PUBLIC_KEY
+          value: "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAmOrAlFzwUodXsYrYvSGV/u+gzdL+Nc3bPPYBara7rv591qLRU7H0Yt6fbWS3v0oreRxmi7T+i5NEw4CVgF18LOOFbRzFTORr6pId2TyyWoixGQLzzLp+aVU0KzFLq8hyu1g8w04xUiRij3Oqy5oiW/javKrYcFiZS5aL4wzYTDrrYEnkEYeP89m2Fwx7/c8/PSMBfjx806jPj8NI4gOo+ZLK7MBhOqk5DoQl8epFV2l2uElDqOkxI+xDez7SREsFUtqK/dEurdwXINTwzroSVqpIV/hzrCJafD67vSNrBH0ZhHweiXwnksnCzkDdlM8D33/mPApAHTnG2K5zYO/lYwIDAQAB"
+        - name: MINIO_ENDPOINT
+          value: "http://minio:9000"
+        - name: MINIO_ACCESS_KEY
+          value: "minioadmin"
+        - name: MINIO_SECRET_KEY
+          value: "minioadmin"
+        - name: RABBITMQ_URL
+          value: "amqp://guest:guest@rabbitmq:5672/"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ui-service
+spec:
+  selector:
+    app: ui-service
+  ports:
+    - protocol: TCP
+      port: 80 # Η εξωτερική θύρα (π.χ. http://ui-service/)
+      targetPort: 8000 # Η θύρα που ακούει το container
+  type: LoadBalancer # Αυτό ενεργοποιεί το Load Balancing
