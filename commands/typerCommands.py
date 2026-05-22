@@ -45,17 +45,20 @@ def status_command(
         typer.echo(f"Status: {result.get('status')}")
         typer.echo(f"Created: {result.get('created_at')}")
 
+
 @jobs_app.command("result")
 def result_command(
-    job_id: str = typer.Argument(..., help="The ID of the completed job"),
-    output: str = typer.Option("./output.txt", help="Local path to save the results")
+        job_id: str = typer.Argument(..., help="The ID of the completed job")
 ):
     """
-    Downloads the final Output File from MinIO (Requires job status to be COMPLETED).
+    Retrieves the MinIO S3 URI location for the final Output Files.
+    (Requires job status to be COMPLETED).
     """
     client = JobClient(state_manager)
-    typer.echo(f"⬇️ Λήψη αποτελεσμάτων για το job {job_id}...")
-    client.download_result(job_id, output)
+    typer.echo(f"🔍 Αναζήτηση τοποθεσίας αποτελεσμάτων για το job {job_id}...")
+
+    # Καλούμε τη νέα μέθοδο χωρίς το output path
+    client.get_result(job_id)
 
 # --- ADMIN COMMANDS ---
 

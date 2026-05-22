@@ -114,37 +114,46 @@ class JobClient:
             return {}
         pass
 
-    def download_result(self, job_id: str, output_path: str) -> None:
+    def get_result(self, job_id: str) -> None:
         """
         Executes the `jobs result <id>` workflow.
 
         Issues an HTTP GET to `/jobs/<id>/result`. The backend verifies the JWT
-        for ownership or Admin roles, ensures the status is 'FINISHED', and then
-        streams the file from MinIO.
-
-        Stream Processing:
-        This method processes the incoming Chunked Transfer-Encoding Byte Stream
-        and safely writes it to the local disk at `output_path` without loading
-        the entire file into memory.
+        for ownership or Admin roles, ensures the status is 'COMPLETED', and then
+        returns the JSON payload with the MinIO S3 URI pointing to the output folder.
 
         Args:
             job_id (str): The ID of the completed job.
-            output_path (str): The local file path where the results will be saved.
         """
         url = f"{self.base_url}/jobs/{job_id}/result"
         headers = self._get_auth_header()
 
         try:
-            with requests.get(url, headers=headers, stream=True) as r:
-                r.raise_for_status()
+            # Κάνουμε απλό GET, όχι streaming πλέον
+            response = requests.get(url, headers=headers)
 
-                # Άνοιγμα τοπικού αρχείου για εγγραφή των bytes
-                with open(output_path, 'wb') as f:
-                    for chunk in r.iter_content(chunk_size=8192):
-                        if chunk:  # φιλτράρισμα keep-alive chunks
-                            f.write(chunk)
+            # Αν το backend επιστρέψει HTTP 400 (π.χ. Job not COMPLETED) ή 404,
+            # το raise_for_status() θα πετάξει exception που θα πιάσουμε παρακάτω.
+            response.raise_for_status()
 
-            typer.secho(f"Result saved at: {output_path}", fg=typer.colors.GREEN)
+            # Παίρνουμε το JSON με τις πληροφορίες της τοποθεσίας
+            data = response.json()
+
+            # Εμφανίζουμε τα αποτελέσματα με όμορφα χρώματα
+            typer.secho("\n Job Completed Successfully!", fg=typer.colors.GREEN, bold=True)
+            typer.secho(f" Storage Type: {data.get('storage_type')}", fg=typer.colors.CYAN)
+            typer.secho(f" Location (S3 URI): {data.get('output_directory_uri')}", fg=typer.colors.YELLOW, bold=True)
+            typer.secho(f"\n  Message:\n{data.get('message')}\n", fg=typer.colors.WHITE)
 
         except requests.exceptions.RequestException as e:
-            typer.secho(f"Error during saving the result: {e}", fg=typer.colors.RED)
+            # Προσπαθούμε να βρούμε το "detail" από το FastAPI HTTPException (π.χ. "Job result is not ready.")
+            if e.response is not None:
+                try:
+                    error_data = e.response.json()
+                    error_detail = error_data.get("detail", str(e))
+                    typer.secho(f" Error: {error_detail}", fg=typer.colors.RED)
+                except ValueError:
+                    # Αν η απάντηση δεν είναι JSON
+                    typer.secho(f" Error: {e.response.text}", fg=typer.colors.RED)
+            else:
+                typer.secho(f" Connection Error: {e}", fg=typer.colors.RED)

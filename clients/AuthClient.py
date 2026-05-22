@@ -31,8 +31,6 @@ class AuthClient:
                 self.state_manager.save_token(token_data.get("access_token"))
                 return True
             else:
-                # ΔΕΣ ΕΔΩ: Εκτύπωσε την απάντηση του Keycloak για να ξέρουμε γιατί αρνείται
-                print(f"DEBUG: Keycloak responded with {response.status_code}: {response.text}")
                 return False
         except Exception as e:
             print(f"Connection error: {e}")
