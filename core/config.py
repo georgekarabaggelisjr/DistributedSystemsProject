@@ -4,8 +4,7 @@ class Settings(BaseSettings):
     # FastAPI
     PROJECT_NAME: str = "MapReduce UI Gateway"
 
-    # PostgreSQL (DDS)
-    DATABASE_URL: str
+    # Η DATABASE_URL αφαιρέθηκε πλήρως από εδώ, το UI Service είναι πλέον 100% Stateless!
 
     # Keycloak Auth
     KEYCLOAK_SERVER_URL: str
