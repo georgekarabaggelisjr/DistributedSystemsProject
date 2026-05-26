@@ -1,0 +1,32 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: manager-api
+  namespace: default
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: manager-api
+  template:
+    metadata:
+      labels:
+        app: manager-api
+    spec:
+      serviceAccountName: manager-service-account # <--- ADD THIS LINE HERE
+      containers:
+      - name: manager
+        image: mapreduce-manager:v1
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8000
+        env:
+        # --- Internal Kubernetes DNS Routing ---
+        - name: DATABASE_URL
+          value: "postgresql://postgres:DisSami2026!@postgres-service.default.svc.cluster.local:5432/dds_db"
+        - name: RABBITMQ_URL
+          value: "amqp://guest:guest@rabbitmq-service.default.svc.cluster.local:5672/"
+        - name: REDIS_URL
+          value: "redis://redis-service.default.svc.cluster.local:6379/0"
+        - name: MINIO_ENDPOINT
+          value: "minio-service.default.svc.cluster.local:9000"

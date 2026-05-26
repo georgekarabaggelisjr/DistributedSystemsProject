@@ -1,0 +1,106 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: external-shuffle-service
+  namespace: default
+  labels:
+    app: ess
+    tier: infrastructure
+    component: shuffle-service
+spec:
+  selector:
+    matchLabels:
+      app: ess
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1 # Ensures only one node's ESS is down at a time during updates
+  template:
+    metadata:
+      labels:
+        app: ess
+        tier: infrastructure
+    spec:
+      # --- EVICTION PROTECTION ---
+      priorityClassName: system-cluster-critical
+
+      # --- PERFORMANCE OPTIMIZATION: Zero-Hop Network I/O ---
+      # Bypasses the Kubernetes SDN overlay (Flannel/Calico).
+      # Binds the ESS directly to the physical Node's NIC for bare-metal P2P transfer speeds.
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet # Required to resolve K8s services when using hostNetwork
+
+      containers:
+      - name: ess-container
+        image: mapreduce-ess:v2
+        imagePullPolicy: IfNotPresent
+
+        ports:
+        - containerPort: 7337
+          hostPort: 7337 # Binds directly to the physical K8s Node's IP
+          protocol: TCP
+
+        # --- SELF-HEALING PROBES ---
+        # Readiness: Ensures the gRPC port is open before allowing Reducer connections.
+        readinessProbe:
+          tcpSocket:
+            port: 7337
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        # Liveness: Restarts the pod if the gRPC server stops responding.
+        livenessProbe:
+          tcpSocket:
+            port: 7337
+          initialDelaySeconds: 15
+          periodSeconds: 20
+
+        # --- GUARANTEED QoS ---
+        # The CPU and Memory requests ensure the DaemonSet is prioritized by the scheduler.
+        # CPU/Memory limits have been intentionally removed. This allows the ESS to burst
+        # and utilize idle host resources during highly contentious MapReduce shuffle phases,
+        # preventing gRPC connection drops and false Lineage Recovery triggers.
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "1Gi"
+          limits:
+            memory: "4Gi" # Optional memory limit to prevent OOM issues, but no CPU limit
+
+        env:
+        # --- HOT TIER CONFIGURATION (Local NVMe/SSD) ---
+        - name: SHUFFLE_DIR
+          value: "/mnt/mapreduce-shuffle"
+        - name: ESS_PORT
+          value: "7337"
+        - name: ESS_SECRET_KEY
+          value: "dev-insecure-shared-secret"
+
+        # --- COLD TIER CONFIGURATION (Tiered Storage / S3 Overflow) ---
+        # Provides infinite retention by autonomously spilling data to MinIO
+        # when the physical disk breaches the High-Watermark (85%).
+        - name: MINIO_ENDPOINT
+          value: "http://minio.default.svc.cluster.local:9000" # Internal Kubernetes DNS for the MinIO service
+        - name: MINIO_ACCESS_KEY
+          value: "minioadmin" # Replace with K8s Secret injection for production
+        - name: MINIO_SECRET_KEY
+          value: "minioadmin" # Replace with K8s Secret injection for production
+        - name: MINIO_SHUFFLE_BUCKET
+          value: "mapreduce-shuffle-overflow"
+
+        volumeMounts:
+        - name: physical-disk
+          mountPath: /mnt/mapreduce-shuffle
+          readOnly: false
+
+      volumes:
+      - name: physical-disk
+        hostPath:
+          path: /var/lib/mapreduce/shuffle-data
+          type: DirectoryOrCreate
+
+      # Allow the daemon to run on master/control-plane nodes if needed
+      tolerations:
+      - operator: Exists
+        effect: NoSchedule
+
+      terminationGracePeriodSeconds: 30

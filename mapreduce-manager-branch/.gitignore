@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+.venv/
+*.pyc
+.pytest_cache/
+
+# Java
+target/
+*.class
+
+# Environment/Secrets
+.env
+
+# IDEs
+.idea/
+.vscode/

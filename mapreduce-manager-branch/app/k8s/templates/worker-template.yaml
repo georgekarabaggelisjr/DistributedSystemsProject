@@ -1,0 +1,124 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ JOB_NAME }}
+  namespace: {{ K8S_NAMESPACE }}
+  labels:
+    app: worker-node
+    job_id: "{{ JOB_ID }}"
+    tier: compute
+spec:
+  parallelism: {{ REPLICAS }}
+  completions: {{ REPLICAS }}
+  backoffLimit: 4 # Number of retries before marking the job as failed
+  template:
+    metadata:
+      labels:
+        app: worker-node
+        job_id: "{{ JOB_ID }}"
+        tier: compute
+    spec:
+      # --- DATA LOCALITY SCHEDULING ---
+      # Upgraded to use soft nodeAffinity (preferredDuringScheduling) instead of a strict
+      # nodeSelector. This prevents cluster deadlocks if the target physical node is cordoned,
+      # out of resources, or experiencing disk pressure.
+      {% if TARGET_NODE %}
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/hostname
+                operator: In
+                values:
+                - "{{ TARGET_NODE }}"
+      {% endif %}
+
+      containers:
+      - name: worker
+        image: mapreduce-worker:v10
+        imagePullPolicy: IfNotPresent
+
+        ports:
+          - name: health-port
+            containerPort: 8080
+            protocol: TCP
+
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: health-port
+          initialDelaySeconds: 10
+          periodSeconds: 5
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: health-port
+          initialDelaySeconds: 20
+          periodSeconds: 15
+
+        env:
+          # --- PERFORMANCE OPTIMIZATION: JVM Batch Tuning ---
+          # 1. UseParallelGC maximizes raw processing throughput (MB/s) for batch workloads.
+          # 2. MaxDirectMemorySize=256m strictly caps off-heap NIO allocations during shuffle
+          #    fetches to prevent the K8s container from hitting OOMKilled over the 2Gi limit.
+          - name: JAVA_OPTS
+            value: "-Xms512m -Xmx1536m -XX:+UseParallelGC -XX:MaxDirectMemorySize=256m"
+
+          - name: RABBITMQ_HOST
+            value: "{{ RABBITMQ_HOST }}"
+          - name: RABBITMQ_QUEUE
+            value: "{{ PHASE }}_tasks_{{ JOB_ID }}"
+          - name: EVENT_QUEUE
+            value: "job_events_queue"
+
+          - name: MINIO_ENDPOINT
+            value: "http://{{ MINIO_ENDPOINT }}"
+          - name: MINIO_ROOT_USER
+            value: "{{ MINIO_ACCESS_KEY }}"
+          - name: MINIO_ROOT_PASSWORD
+            value: "{{ MINIO_SECRET_KEY }}"
+
+          - name: SHUFFLE_DIR
+            value: "/mnt/mapreduce-shuffle"
+
+          # --- Downward API: Identity Injection ---
+          - name: NODE_IP
+            valueFrom:
+              fieldRef:
+                fieldPath: status.hostIP
+
+          # VITAL FOR LOCALITY: Allows the worker to report its physical host back to the Manager
+          - name: NODE_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: spec.nodeName
+
+          - name: JOB_ID
+            value: "{{ JOB_ID }}"
+          - name: PHASE
+            value: "{{ PHASE }}"
+          - name: IDLE_TIMEOUT_MILLIS
+            value: "10000"
+
+        resources:
+          requests:
+            cpu: "250m"
+            memory: "1Gi"
+          limits:
+            cpu: "1000m"
+            memory: "2Gi"
+
+        volumeMounts:
+        - name: physical-disk
+          mountPath: /mnt/mapreduce-shuffle
+
+      volumes:
+      - name: physical-disk
+        hostPath:
+          path: /var/lib/mapreduce/shuffle-data
+          type: DirectoryOrCreate
+
+      restartPolicy: OnFailure
+      terminationGracePeriodSeconds: 30
