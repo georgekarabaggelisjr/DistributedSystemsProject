@@ -24,22 +24,17 @@ class JobFormat(str, enum.Enum):
 # --- Job Schemas ---
 
 class JobResponse(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
+    model_config = ConfigDict(
+        from_attributes=True,
+        populate_by_name=True
+    )
 
-    id: UUID
+    id: UUID = Field(..., validation_alias="jobId")
     status: JobStatus
-    completed_map_chunks: int
-    completed_reduce_chunks: int
-    created_at: datetime
-    updated_at: datetime
-
-    # Αυτά τα πεδία γίνονται Optional με default None, επειδή ο Manager
-    # δεν τα επιστρέφει στο status payload του βάσει του API Contract.
-    user_id: Optional[UUID] = None
-    format: Optional[JobFormat] = None
-    input_filename: Optional[str] = None
-    total_chunks: Optional[int] = None
-    output_path: Optional[str] = None
+    completed_map_chunks: int = Field(..., validation_alias="completedMapChunks")
+    completed_reduce_chunks: int = Field(..., validation_alias="completedReduceChunks")
+    created_at: datetime = Field(..., validation_alias="createdAt")
+    updated_at: datetime = Field(..., validation_alias="updatedAt")
 
 
 # --- Admin & Config Schemas ---
