@@ -97,7 +97,6 @@ class JobClient:
         Returns:
             dict: A JSON-compatible dictionary containing job statuses.
         """
-
         if job_id:
             url = f"{self.base_url}/jobs/{job_id}/status"
         else:
@@ -110,9 +109,18 @@ class JobClient:
             response.raise_for_status()
             return response.json()
         except requests.exceptions.RequestException as e:
-            typer.secho(f"Σφάλμα κατά την ανάκτηση κατάστασης: {e}", fg=typer.colors.RED)
-            return {}
-        pass
+            # Αν ο server απαντήσει με σφάλμα (π.χ. 422 ή 404), εμφανίζουμε το detail μήνυμα
+            if e.response is not None:
+                try:
+                    error_detail = e.response.json().get("detail", str(e))
+                    typer.secho(f"❌ Σφάλμα Backend: {error_detail}", fg=typer.colors.RED)
+                except ValueError:
+                    typer.secho(f"❌ Σφάλμα Backend: {e.response.text}", fg=typer.colors.RED)
+            else:
+                typer.secho(f"❌ Σφάλμα Σύνδεσης: {e}", fg=typer.colors.RED)
+
+            # Σημαντικό: Διακόπτουμε την εκτέλεση του CLI εδώ!
+            raise typer.Exit(code=1)
 
     def get_result(self, job_id: str) -> None:
         """
